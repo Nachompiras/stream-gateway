@@ -139,6 +139,8 @@ pub fn spawn_udp_input_with_stats(
         let mut window_pkts   = 0u64;
         let mut window_start  = Instant::now();
         let mut is_connected  = false; // Track connection state
+        let mut last_packet_time = Instant::now(); // Track last packet received
+        const IDLE_TIMEOUT: Duration = Duration::from_secs(10); // Timeout to go back to listening
 
         loop {
             // Use timeout to make recv responsive to cancellation
@@ -147,6 +149,9 @@ pub fn spawn_udp_input_with_stats(
                     let _ = tx_for_task.send(Bytes::copy_from_slice(&buf[..n]));
                     total_bytes += n as u64;
                     total_packets += 1;
+
+                    // Update last packet time
+                    last_packet_time = Instant::now();
 
                     // Transition to Connected state on first packet
                     if !is_connected {
@@ -185,12 +190,19 @@ pub fn spawn_udp_input_with_stats(
                     break;
                 }
                 Err(_) => {
-                    // Timeout - check if we should continue
-                    if tx_for_task.receiver_count() == 0 {
-                        println!("UDP input {listen_port}: no receivers, stopping");
-                        break;
+                    // Timeout - check if we should transition back to listening
+                    if is_connected && last_packet_time.elapsed() >= IDLE_TIMEOUT {
+                        is_connected = false;
+                        if let Some(ref tx) = state_tx_task {
+                            let _ = tx.send(StateChange::InputStateChanged {
+                                input_id: id,
+                                new_status: StreamStatus::Listening,
+                                connected_at: None,
+                            });
+                        }
+                        println!("UDP input {}: transitioned back to listening due to inactivity", listen_port);
                     }
-                    // Continue loop if there are still receivers
+                    // Continue listening for packets regardless
                 }
             }
         }
