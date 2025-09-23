@@ -16,6 +16,7 @@ env_logger = "0.11.8"
 log = "0.4.27"
 futures = "0.3" # Para StreamExt
 srt-rs = { git = "https://github.com/Nachompiras/srt-rs", branch = "master" }
+mpegts_inspector = { git = "https://github.com/Nachompiras/mpegts_inspector", branch = "main" }
 thiserror = "2.0.16"
 async-trait = "0.1.89"
 sqlx = { version = "0.8.6", features = ["sqlite", "runtime-tokio-native-tls", "macros", "chrono"] }

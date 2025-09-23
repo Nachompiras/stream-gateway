@@ -9,8 +9,10 @@ use crate::srt_stream::{
     create_srt_output,
 };
 use crate::models::*;
-use crate::database::{self, check_output_exists, check_port_conflict, get_input_by_id, get_output_by_id, get_outputs_by_input_id};
+use crate::database::{self, check_output_exists, check_port_conflict, get_input_by_id, get_output_by_id};
 use crate::ACTIVE_STREAMS;
+use crate::analysis;
+use sqlx::types::chrono;
 
 pub type InputsMap = std::collections::HashMap<i64, InputInfo>;
 
@@ -91,7 +93,13 @@ pub async fn delete_input(
             output_info.abort_handle.abort();
         }
 
-        // 3. Remove from database
+        // 3. Abortar explícitamente las tareas de análisis asociadas
+        for (analysis_id, analysis_info) in input_info.analysis_tasks {
+            info!("[{}] Abortando analysis task [{}]", input_id, analysis_id);
+            analysis_info.task_handle.abort();
+        }
+
+        // 4. Remove from database
         if let Err(e) = database::delete_input_from_db(&state.pool, input_id).await {
             error!("Error deleting input from database: {}", e);
             // Continue anyway - we already removed from memory
@@ -686,13 +694,131 @@ fn spawn_input(req: CreateInputRequest, id: i64, name: Option<String>, details: 
             println!("Input SRT '{id}' creado con detalles: {details}");
             Ok(InputInfo {
                 id,
-                name, 
-                details, 
+                name,
+                details,
                 packet_tx: sender.tx,
                 stats: sender.stats,
-                task_handle: sender.handle,                
+                task_handle: sender.handle,
                 output_tasks: HashMap::new(),
+                analysis_tasks: HashMap::new(),
             })
+        }
+    }
+}
+
+// ==================== Analysis Endpoints ====================
+
+#[actix_web::post("/inputs/{id}/analysis/{analysis_type}/start")]
+pub async fn start_analysis(
+    path: web::Path<(i64, String)>,
+) -> ActixResult<impl Responder> {
+    let (input_id, analysis_type_str) = path.into_inner();
+
+    info!("Starting {} analysis for input {}", analysis_type_str, input_id);
+
+    // Parse analysis type
+    let analysis_type = match analysis_type_str.parse::<AnalysisType>() {
+        Ok(t) => t,
+        Err(e) => {
+            error!("Invalid analysis type '{}': {}", analysis_type_str, e);
+            return Err(ErrorInternalServerError(format!("Invalid analysis type: {}", e)));
+        }
+    };
+
+    // Start the analysis
+    match analysis::start_analysis(input_id, analysis_type).await {
+        Ok(analysis_id) => {
+            info!("Analysis started with ID: {}", analysis_id);
+            Ok(HttpResponse::Created().json(serde_json::json!({
+                "message": "Analysis started successfully",
+                "analysis_id": analysis_id,
+                "input_id": input_id,
+                "analysis_type": analysis_type_str
+            })))
+        }
+        Err(e) => {
+            error!("Failed to start analysis: {}", e);
+            Err(ErrorInternalServerError(format!("Failed to start analysis: {}", e)))
+        }
+    }
+}
+
+#[actix_web::post("/inputs/{id}/analysis/{analysis_type}/stop")]
+pub async fn stop_analysis(
+    path: web::Path<(i64, String)>,
+) -> ActixResult<impl Responder> {
+    let (input_id, analysis_type_str) = path.into_inner();
+
+    info!("Stopping {} analysis for input {}", analysis_type_str, input_id);
+
+    // Parse analysis type
+    let analysis_type = match analysis_type_str.parse::<AnalysisType>() {
+        Ok(t) => t,
+        Err(e) => {
+            error!("Invalid analysis type '{}': {}", analysis_type_str, e);
+            return Err(ErrorInternalServerError(format!("Invalid analysis type: {}", e)));
+        }
+    };
+
+    // Stop the analysis
+    match analysis::stop_analysis(input_id, analysis_type).await {
+        Ok(()) => {
+            info!("Analysis stopped successfully");
+            Ok(HttpResponse::Ok().json(serde_json::json!({
+                "message": "Analysis stopped successfully",
+                "input_id": input_id,
+                "analysis_type": analysis_type_str
+            })))
+        }
+        Err(e) => {
+            error!("Failed to stop analysis: {}", e);
+            Err(ErrorInternalServerError(format!("Failed to stop analysis: {}", e)))
+        }
+    }
+}
+
+#[actix_web::get("/inputs/{id}/analysis")]
+pub async fn get_analysis_status(
+    path: web::Path<i64>,
+) -> ActixResult<impl Responder> {
+    let input_id = path.into_inner();
+
+    match analysis::get_active_analyses(input_id).await {
+        Ok(analyses) => {
+            let mut active_analyses = Vec::new();
+
+            for (id, analysis_type, created_at) in analyses {
+                // Convert SystemTime to ISO 8601 string
+                let created_at_str = match created_at.duration_since(std::time::UNIX_EPOCH) {
+                    Ok(duration) => {
+                        let secs = duration.as_secs();
+                        let nanos = duration.subsec_nanos();
+                        chrono::DateTime::from_timestamp(secs as i64, nanos)
+                            .unwrap_or_default()
+                            .to_rfc3339()
+                    }
+                    Err(_) => "unknown".to_string(),
+                };
+
+                active_analyses.push(AnalysisStatusResponse {
+                    id,
+                    analysis_type: analysis_type.to_string(),
+                    input_id,
+                    status: "running".to_string(),
+                    created_at: created_at_str,
+                });
+            }
+
+            let response = AnalysisListResponse {
+                input_id,
+                active_analyses,
+            };
+
+            Ok(HttpResponse::Ok().json(response))
+        }
+        Err(e) => {
+            error!("Failed to get analysis status: {}", e);
+            Err(ErrorInternalServerError(format!("Failed to get analysis status: {}", e)))
         }
     }
 }

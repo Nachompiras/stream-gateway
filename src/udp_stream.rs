@@ -160,6 +160,7 @@ pub fn spawn_udp_input_with_stats(
         packet_tx: tx,
         task_handle: handle,
         output_tasks: std::collections::HashMap::new(),
+        analysis_tasks: std::collections::HashMap::new(),
         stats,
     })
 }

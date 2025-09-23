@@ -25,6 +25,7 @@ pub struct InputInfo {
     pub stats:            StatsCell,
     pub task_handle:      JoinHandle<()>,
     pub output_tasks:     HashMap<i64, OutputInfo>,
+    pub analysis_tasks:   HashMap<String, AnalysisInfo>,
 }
 
 #[derive(Debug, Clone)]
@@ -316,4 +317,57 @@ pub fn input_type_display_string(kind: &str) -> &'static str {
         "srt_caller" => "SRT Caller",
         _ => "Unknown",
     }
+}
+
+// MPEG-TS Analysis types and structures
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum AnalysisType {
+    Mux,
+    Tr101,
+}
+
+impl fmt::Display for AnalysisType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AnalysisType::Mux => write!(f, "mux"),
+            AnalysisType::Tr101 => write!(f, "tr101"),
+        }
+    }
+}
+
+impl std::str::FromStr for AnalysisType {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "mux" => Ok(AnalysisType::Mux),
+            "tr101" => Ok(AnalysisType::Tr101),
+            _ => Err(format!("Invalid analysis type: {}", s)),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct AnalysisInfo {
+    pub id: String, // Unique identifier for this analysis
+    pub analysis_type: AnalysisType,
+    pub input_id: i64,
+    pub task_handle: JoinHandle<()>,
+    pub created_at: std::time::SystemTime,
+}
+
+// API request/response models for analysis endpoints
+#[derive(Serialize)]
+pub struct AnalysisStatusResponse {
+    pub id: String,
+    pub analysis_type: String,
+    pub input_id: i64,
+    pub status: String, // "running", "stopped", "error"
+    pub created_at: String, // ISO 8601 format
+}
+
+#[derive(Serialize)]
+pub struct AnalysisListResponse {
+    pub input_id: i64,
+    pub active_analyses: Vec<AnalysisStatusResponse>,
 }

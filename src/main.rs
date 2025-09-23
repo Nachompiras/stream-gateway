@@ -2,6 +2,7 @@
 use srt_rs::{startup,cleanup};
 use actix_web::{web, App, HttpServer};
 use tokio::signal;
+mod analysis;
 mod api;
 mod udp_stream;
 mod models;
@@ -63,6 +64,10 @@ async fn main() -> std::io::Result<()> {
             .service(list_outputs)
             .service(get_output)
             .service(get_input_outputs)
+            // Analysis endpoints
+            .service(start_analysis)
+            .service(stop_analysis)
+            .service(get_analysis_status)
             // General status
             .service(get_status)
     })
@@ -102,6 +107,10 @@ async fn main() -> std::io::Result<()> {
             for (output_id, output_info) in input_info.output_tasks {
                 println!("Cerrando output {} del input {}", output_id, input_id);
                 output_info.abort_handle.abort();
+            }
+            for (analysis_id, analysis_info) in input_info.analysis_tasks {
+                println!("Cerrando análisis {} del input {}", analysis_id, input_id);
+                analysis_info.task_handle.abort();
             }
         }
     }
