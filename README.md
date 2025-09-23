@@ -348,7 +348,6 @@ This project is licensed under the Apache License - see the [LICENSE](LICENSE) f
 
 - **Documentation**: Check this README and inline code documentation
 - **Issues**: Report bugs and request features via GitHub Issues
-- **Discussions**: Join discussions for questions and ideas
 
 ## 🏢 Enterprise Use Cases
 
