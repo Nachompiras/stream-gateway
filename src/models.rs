@@ -4,7 +4,7 @@ use srt_rs::{self as srt, SrtAsyncStream, SrtStream};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
-use tokio::sync::{broadcast, RwLock}; // Agregamos mpsc
+use tokio::sync::{broadcast, RwLock, mpsc}; // Agregamos mpsc
 use async_trait::async_trait;          // 1-liner: macro para traits async
 use std::io;
 use sqlx::FromRow;
@@ -30,6 +30,9 @@ pub struct InputInfo {
     pub stopped_outputs:  HashMap<i64, CreateOutputRequest>, // Stopped outputs config
     pub analysis_tasks:   HashMap<String, AnalysisInfo>,
     pub paused_analysis:  Vec<AnalysisType>,       // Analysis that were active when input stopped
+    pub started_at:       Option<std::time::SystemTime>, // When stream started, None when stopped
+    pub connected_at:     Option<std::time::SystemTime>, // When stream connected, None when not connected
+    pub state_tx:         Option<StateChangeSender>, // Channel to notify state changes
 }
 
 #[derive(Debug, Clone)]
@@ -43,6 +46,9 @@ pub struct OutputInfo {
     pub destination:  String,
     pub abort_handle: Option<AbortHandle>,      // None when stopped
     pub config:       CreateOutputRequest,     // Store config to restart
+    pub started_at:   Option<std::time::SystemTime>, // When stream started, None when stopped
+    pub connected_at: Option<std::time::SystemTime>, // When stream connected, None when not connected
+    pub state_tx:     Option<StateChangeSender>, // Channel to notify state changes
 }
 
 
@@ -177,6 +183,7 @@ pub struct InputResponse {
     pub details: String,
     pub status: String,
     pub outputs: Vec<OutputResponse>, // Lista de outputs asociados
+    pub uptime_seconds: Option<u64>, // Uptime in seconds, None if stopped
 }
 
 #[derive(Serialize)]
@@ -187,6 +194,7 @@ pub struct OutputResponse {
     pub destination: String,
     pub output_type: String, // "UDP" o "SRT Caller"
     pub status: String,
+    pub uptime_seconds: Option<u64>, // Uptime in seconds, None if stopped
 }
 
 // New response models for CRUD endpoints
@@ -198,6 +206,7 @@ pub struct InputListResponse {
     pub input_type: String, // "UDP", "SRT Listener", "SRT Caller"
     pub status: String,
     pub output_count: usize, // Número de outputs asociados
+    pub uptime_seconds: Option<u64>, // Uptime in seconds, None if stopped
 }
 
 #[derive(Serialize)]
@@ -208,6 +217,7 @@ pub struct InputDetailResponse {
     pub input_type: String,
     pub status: String,
     pub outputs: Vec<OutputDetailResponse>,
+    pub uptime_seconds: Option<u64>, // Uptime in seconds, None if stopped
 }
 
 #[derive(Serialize)]
@@ -219,6 +229,7 @@ pub struct OutputDetailResponse {
     pub output_type: String,
     pub status: String,
     pub config: Option<String>, // JSON config if needed
+    pub uptime_seconds: Option<u64>, // Uptime in seconds, None if stopped
 }
 
 #[derive(Serialize)]
@@ -230,6 +241,7 @@ pub struct OutputListResponse {
     pub destination: String,
     pub output_type: String,
     pub status: String,
+    pub uptime_seconds: Option<u64>, // Uptime in seconds, None if stopped
 }
 
 /* SRT models */
@@ -333,18 +345,26 @@ pub fn input_type_display_string(kind: &str) -> &'static str {
     }
 }
 
-// Stream status for start/stop control
+// Stream connection status with granular states
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StreamStatus {
-    Running,
-    Stopped,
+    Stopped,      // Stream detenido manualmente
+    Listening,    // UDP bound / SRT Listener esperando conexiones
+    Connecting,   // SRT Caller intentando conectar
+    Connected,    // Conexión establecida y funcionando
+    Reconnecting, // SRT perdió conexión, reintentando
+    Error,        // Error irrecuperable
 }
 
 impl fmt::Display for StreamStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            StreamStatus::Running => write!(f, "running"),
             StreamStatus::Stopped => write!(f, "stopped"),
+            StreamStatus::Listening => write!(f, "listening"),
+            StreamStatus::Connecting => write!(f, "connecting"),
+            StreamStatus::Connected => write!(f, "connected"),
+            StreamStatus::Reconnecting => write!(f, "reconnecting"),
+            StreamStatus::Error => write!(f, "error"),
         }
     }
 }
@@ -354,12 +374,53 @@ impl std::str::FromStr for StreamStatus {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
-            "running" => Ok(StreamStatus::Running),
             "stopped" => Ok(StreamStatus::Stopped),
+            "listening" => Ok(StreamStatus::Listening),
+            "connecting" => Ok(StreamStatus::Connecting),
+            "connected" => Ok(StreamStatus::Connected),
+            "reconnecting" => Ok(StreamStatus::Reconnecting),
+            "error" => Ok(StreamStatus::Error),
+            // Backward compatibility
+            "running" => Ok(StreamStatus::Connected),
             _ => Err(format!("Invalid stream status: {}", s)),
         }
     }
 }
+
+impl StreamStatus {
+    /// Returns true if the stream is in a connected state where uptime should be counted
+    pub fn is_connected(&self) -> bool {
+        matches!(self, StreamStatus::Connected)
+    }
+
+    /// Returns true if the stream is active (not stopped or error)
+    pub fn is_active(&self) -> bool {
+        matches!(
+            self,
+            StreamStatus::Listening | StreamStatus::Connecting | StreamStatus::Connected | StreamStatus::Reconnecting
+        )
+    }
+}
+
+// State notification system
+#[derive(Debug, Clone)]
+pub enum StateChange {
+    InputStateChanged {
+        input_id: i64,
+        new_status: StreamStatus,
+        connected_at: Option<std::time::SystemTime>
+    },
+    OutputStateChanged {
+        input_id: i64,
+        output_id: i64,
+        new_status: StreamStatus,
+        connected_at: Option<std::time::SystemTime>
+    },
+}
+
+// Type alias for the state change sender
+pub type StateChangeSender = mpsc::UnboundedSender<StateChange>;
+pub type StateChangeReceiver = mpsc::UnboundedReceiver<StateChange>;
 
 // MPEG-TS Analysis types and structures
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

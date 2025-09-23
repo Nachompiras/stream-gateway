@@ -4,7 +4,7 @@ use tokio::{io::AsyncReadExt, sync::{broadcast::{self}, RwLock}, task::JoinHandl
 use futures::{stream::{AbortHandle, Abortable}, FutureExt};
 use bytes::Bytes;
 use crate::models::*;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use tokio::time::sleep;
 use async_trait::async_trait;          // 1-liner: macro para traits async
 use std::io;
@@ -58,6 +58,7 @@ pub fn create_srt_output(
     input:         &InputInfo,
     output_id:      i64,
     name:           Option<String>,
+    state_tx:       Option<StateChangeSender>,
 ) -> actix_web::Result<OutputInfo> {
 
     println!("Creando output SRT con config: {:?}", cfg);
@@ -84,7 +85,7 @@ pub fn create_srt_output(
             SrtOutputConfig::Caller { .. }   => OutputKind::SrtCaller,
             SrtOutputConfig::Listener { .. } => OutputKind::SrtListener,
         },
-        status: StreamStatus::Running,
+        status: StreamStatus::Connecting, // SRT outputs start in connecting state
         destination,
         stats: Arc::new(RwLock::new(None)),
         abort_handle: Some(abort_handle),
@@ -93,10 +94,85 @@ pub fn create_srt_output(
             name: final_name,
             config: cfg,
         },
+        started_at: Some(std::time::SystemTime::now()),
+        connected_at: None, // Will be set when connection is established
+        state_tx,
     };
 
     println!("Output creado: {:?}", info);
     Ok(info)
+}
+
+// Wrapper to know the SRT type for state notifications
+pub struct SrtSourceWithState {
+    pub config: SrtInputConfig,
+    pub input_id: i64,
+    pub state_tx: Option<StateChangeSender>,
+}
+
+#[async_trait]
+impl SrtSource for SrtSourceWithState {
+    async fn get_socket(&mut self) -> io::Result<SrtAsyncStream> {
+        match &self.config {
+            //-------------------------------------------------- LISTENER
+            SrtInputConfig::Listener { listen_port, common } => {
+                // Notify listening state
+                if let Some(ref tx) = self.state_tx {
+                    let _ = tx.send(StateChange::InputStateChanged {
+                        input_id: self.input_id,
+                        new_status: StreamStatus::Listening,
+                        connected_at: None,
+                    });
+                }
+
+                let addr = format!("0.0.0.0:{listen_port}");
+                println!("SRT listener ► esperando conexiones en {addr}");
+
+                // 1) builder asíncrono  (¡no bloquea!)
+                let listener = common
+                    .async_builder()// <───
+                    .listen(&addr, 2, None)   // callback = None
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
+
+                // 2) await sobre el future `accept()`
+                //    – si pulsas Ctrl-C y cancelas la tarea, este await
+                //      se despierta con Err(Interrupted) y sale enseguida.
+                let (stream_async, peer) = listener
+                    .accept()
+                    .await?;                  // <───  100 % async
+
+                println!("SRT listener: aceptada conexión de {peer}");
+
+                // 3) si tu código necesita la versión síncrona
+                //    conviértela (o trabaja directamente con la async)
+                Ok(stream_async)
+            }
+
+            //-------------------------------------------------- CALLER
+            // (caller podía quedarse como estaba – ya no bloquea)
+            SrtInputConfig::Caller { target_addr, common } => {
+                // Notify connecting state for callers
+                if let Some(ref tx) = self.state_tx {
+                    let _ = tx.send(StateChange::InputStateChanged {
+                        input_id: self.input_id,
+                        new_status: StreamStatus::Connecting,
+                        connected_at: None,
+                    });
+                }
+
+                let addr = target_addr.clone();
+                let stream_async = common
+                    .async_builder()
+                    .connect(&addr)?
+                    .await
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
+                println!("Caller: conectado a {addr}");
+                Ok(stream_async)
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -111,9 +187,9 @@ impl SrtSource for SrtInputConfig {
                 // 1) builder asíncrono  (¡no bloquea!)
                 let listener = common
                     .async_builder()// <───
-                    .listen(&addr, 2, None)   // callback = None                    
+                    .listen(&addr, 2, None)   // callback = None
                     .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-                
+
 
                 // 2) await sobre el future `accept()`
                 //    – si pulsas Ctrl-C y cancelas la tarea, este await
@@ -196,6 +272,8 @@ impl Forwarder {
     pub fn spawn_with_stats(
         mut source: Box<dyn SrtSource>,
         reconnect_delay: Duration,
+        input_id: i64,
+        state_tx: Option<StateChangeSender>,
     ) -> ForwardHandle {
         // 1) canal de salida
         let (tx, _rx_dummy) = broadcast::channel::<Bytes>(BROADCAST_CAPACITY);
@@ -206,18 +284,39 @@ impl Forwarder {
         // 3) tarea principal
         let tx_clone     = tx.clone();
         let stats_clone  = stats_cell.clone();
+        let state_tx_clone = state_tx.clone();
 
         let handle: JoinHandle<()> = tokio::spawn(async move {
             let mut buf = vec![0u8; 2048]; // buffer de lectura
 
-            loop {                            
+            loop {
                 // --------------------------------------------------------
                 // intentar conseguir un socket SRT
                 // --------------------------------------------------------
+                // No need to notify state here - the get_socket() implementation will handle it
+
                 let mut sock = match source.get_socket().await {
-                    Ok(s)  => s,
+                    Ok(s)  => {
+                        // Notify connected state
+                        if let Some(ref tx) = state_tx_clone {
+                            let _ = tx.send(StateChange::InputStateChanged {
+                                input_id,
+                                new_status: StreamStatus::Connected,
+                                connected_at: Some(SystemTime::now()),
+                            });
+                        }
+                        s
+                    },
                     Err(e) => {
                         eprintln!("Forwarder: get_socket() error: {e}");
+                        // Notify error or reconnecting state
+                        if let Some(ref tx) = state_tx_clone {
+                            let _ = tx.send(StateChange::InputStateChanged {
+                                input_id,
+                                new_status: StreamStatus::Error,
+                                connected_at: None,
+                            });
+                        }
                         sleep(reconnect_delay).await;
                         continue;
                     }
@@ -259,10 +358,19 @@ impl Forwarder {
                         }
                     }                }
 
+                // Notify reconnecting state when connection breaks
+                if let Some(ref tx) = state_tx_clone {
+                    let _ = tx.send(StateChange::InputStateChanged {
+                        input_id,
+                        new_status: StreamStatus::Reconnecting,
+                        connected_at: None,
+                    });
+                }
+
                 println!(
                     "Forwarder: reconectando en {:?}…",
                     reconnect_delay
-                );                
+                );
                 sleep(reconnect_delay).await;
                 println!("Forwarder: sesión SRT cerrada ❌");
             }

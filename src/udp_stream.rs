@@ -7,6 +7,7 @@ use tokio::{net::UdpSocket, sync::{broadcast::{self, Receiver}, RwLock}};
 use futures::stream::{AbortHandle, Abortable};
 use log::{info};
 use crate::models::*;
+use std::time::SystemTime;
 
 // --- Tareas Asíncronas ---
 // Tarea que escucha en un socket UDP y transmite los paquetes recibidos
@@ -51,6 +52,7 @@ pub async fn create_udp_output(
     input: &InputInfo,
     output_id: i64,
     name: Option<String>,
+    state_tx: Option<StateChangeSender>,
 ) -> Result<OutputInfo, actix_web::Error> {
     // Resolver la dirección una sola vez
     let dest_addr = tokio::net::lookup_host(&destination_addr)
@@ -70,7 +72,7 @@ pub async fn create_udp_output(
         input_id,
         destination: destination_addr.clone(),
         kind: OutputKind::Udp,
-        status: StreamStatus::Running,
+        status: StreamStatus::Connected, // UDP outputs are immediately connected
         stats: Arc::new(RwLock::new(None)),
         abort_handle: Some(abort_handle),
         config: CreateOutputRequest::Udp {
@@ -78,6 +80,9 @@ pub async fn create_udp_output(
             destination_addr,
             name: final_name,
         },
+        started_at: Some(std::time::SystemTime::now()),
+        connected_at: Some(std::time::SystemTime::now()), // UDP outputs are immediately connected
+        state_tx,
     })
 }
 
@@ -86,6 +91,7 @@ pub fn spawn_udp_input_with_stats(
     name: Option<String>,
     details: String,
     listen_port: u16,
+    state_tx: Option<StateChangeSender>,
 ) -> Result<InputInfo, actix_web::Error> {
     // canal interno
     let (tx, _rx) = broadcast::channel::<Bytes>(1024);
@@ -93,6 +99,7 @@ pub fn spawn_udp_input_with_stats(
 
     let tx_for_task = tx.clone();
     let stats_task = stats.clone();
+    let state_tx_task = state_tx.clone();
 
     // tarea: leer de UDP y publicar en broadcast
     let handle = tokio::spawn(async move {
@@ -100,9 +107,27 @@ pub fn spawn_udp_input_with_stats(
         use tokio::time::timeout;
 
         let sock = match UdpSocket::bind(("0.0.0.0", listen_port)).await {
-            Ok(s) => s,
+            Ok(s) => {
+                // Notify listening state
+                if let Some(ref tx) = state_tx_task {
+                    let _ = tx.send(StateChange::InputStateChanged {
+                        input_id: id,
+                        new_status: StreamStatus::Listening,
+                        connected_at: None,
+                    });
+                }
+                s
+            },
             Err(e) => {
                 eprintln!("Error binding UDP socket on port {}: {}", listen_port, e);
+                // Notify error state
+                if let Some(ref tx) = state_tx_task {
+                    let _ = tx.send(StateChange::InputStateChanged {
+                        input_id: id,
+                        new_status: StreamStatus::Error,
+                        connected_at: None,
+                    });
+                }
                 return;
             }
         };
@@ -113,6 +138,7 @@ pub fn spawn_udp_input_with_stats(
         let mut window_bytes  = 0u64;
         let mut window_pkts   = 0u64;
         let mut window_start  = Instant::now();
+        let mut is_connected  = false; // Track connection state
 
         loop {
             // Use timeout to make recv responsive to cancellation
@@ -121,6 +147,18 @@ pub fn spawn_udp_input_with_stats(
                     let _ = tx_for_task.send(Bytes::copy_from_slice(&buf[..n]));
                     total_bytes += n as u64;
                     total_packets += 1;
+
+                    // Transition to Connected state on first packet
+                    if !is_connected {
+                        is_connected = true;
+                        if let Some(ref tx) = state_tx_task {
+                            let _ = tx.send(StateChange::InputStateChanged {
+                                input_id: id,
+                                new_status: StreamStatus::Connected,
+                                connected_at: Some(SystemTime::now()),
+                            });
+                        }
+                    }
                     window_bytes += n as u64;
                     window_pkts += 1;
                     /* actualizar stats cada segundo */
@@ -163,7 +201,7 @@ pub fn spawn_udp_input_with_stats(
         id,
         name: name.clone(),
         details,
-        status: StreamStatus::Running,
+        status: StreamStatus::Listening, // Start in listening state, will change to connected on first packet
         packet_tx: tx,
         stats,
         task_handle: Some(handle),
@@ -172,5 +210,8 @@ pub fn spawn_udp_input_with_stats(
         stopped_outputs: std::collections::HashMap::new(),
         analysis_tasks: std::collections::HashMap::new(),
         paused_analysis: Vec::new(),
+        started_at: Some(std::time::SystemTime::now()),
+        connected_at: None, // Will be set when first packet arrives
+        state_tx,
     })
 }

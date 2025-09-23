@@ -15,12 +15,17 @@ use once_cell::sync::Lazy;
 use api::*;
 use api::{AppState, InputsMap};
 use tokio_util::sync::CancellationToken;
+use models::{StateChange, StateChangeSender, StateChangeReceiver};
+use tokio::sync::mpsc;
 
 use crate::database::init_database;
 
 // Estado global compartido para todos los inputs/outputs
 pub static ACTIVE_STREAMS: Lazy<Arc<Mutex<InputsMap>>> = Lazy::new(|| Arc::new(Mutex::new(HashMap::new())));
 pub static GLOBAL_CANCEL_TOKEN: std::sync::LazyLock<CancellationToken> = std::sync::LazyLock::new(CancellationToken::new);
+
+// Global state change notification system
+pub static STATE_CHANGE_TX: Lazy<Arc<Mutex<Option<StateChangeSender>>>> = Lazy::new(|| Arc::new(Mutex::new(None)));
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
@@ -29,11 +34,19 @@ async fn main() -> std::io::Result<()> {
     //console_subscriber::init(); // Commented out - requires tokio_unstable
     
     let _ = startup();
+
+    // Initialize state change notification system
+    let (state_tx, mut state_rx) = mpsc::unbounded_channel::<StateChange>();
+    {
+        let mut tx_guard = STATE_CHANGE_TX.lock().await;
+        *tx_guard = Some(state_tx);
+    }
+
     // Crear o conectar a la base de datos SQLite
     let pool = init_database()
         .await
         .expect("error creando/conectando a la base de datos");
-    
+
     // GLOBAL_INPUTS is already initialized via Lazy and does not need to be set again
     
     /* 3. Construir AppState e hidratar inputs desde la BD */
@@ -43,6 +56,42 @@ async fn main() -> std::io::Result<()> {
     load_from_db(&state)
         .await
         .expect("error cargando inputs/outputs desde BD");
+
+    // Start the state change processor task
+    tokio::spawn(async move {
+        println!("State change processor started");
+        while let Some(change) = state_rx.recv().await {
+            match change {
+                StateChange::InputStateChanged { input_id, new_status, connected_at } => {
+                    println!("Input {} state changed to: {}", input_id, new_status);
+                    let mut streams = ACTIVE_STREAMS.lock().await;
+                    if let Some(input_info) = streams.get_mut(&input_id) {
+                        input_info.status = new_status.clone();
+                        if new_status.is_connected() {
+                            input_info.connected_at = connected_at;
+                        } else if !new_status.is_active() {
+                            input_info.connected_at = None;
+                        }
+                    }
+                }
+                StateChange::OutputStateChanged { input_id, output_id, new_status, connected_at } => {
+                    println!("Output {} (input {}) state changed to: {}", output_id, input_id, new_status);
+                    let mut streams = ACTIVE_STREAMS.lock().await;
+                    if let Some(input_info) = streams.get_mut(&input_id) {
+                        if let Some(output_info) = input_info.output_tasks.get_mut(&output_id) {
+                            output_info.status = new_status.clone();
+                            if new_status.is_connected() {
+                                output_info.connected_at = connected_at;
+                            } else if !new_status.is_active() {
+                                output_info.connected_at = None;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        println!("State change processor ended");
+    });
 
     let app_state = web::Data::new(state);
     let app_state_for_server = app_state.clone();

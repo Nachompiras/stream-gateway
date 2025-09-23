@@ -1,12 +1,12 @@
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use anyhow::{Result, anyhow};
 use log::{info, warn, error};
 
 use crate::models::*;
-use crate::ACTIVE_STREAMS;
+use crate::{ACTIVE_STREAMS, STATE_CHANGE_TX};
 use crate::udp_stream::{spawn_udp_input_with_stats, create_udp_output};
-use crate::srt_stream::create_srt_output;
+use crate::srt_stream::{create_srt_output, SrtSourceWithState};
 use crate::analysis;
 
 /// Start a stopped input stream
@@ -17,36 +17,67 @@ pub async fn start_input(input_id: i64) -> Result<()> {
     let input_info = guard.get_mut(&input_id)
         .ok_or_else(|| anyhow!("Input {} not found", input_id))?;
 
-    if input_info.status == StreamStatus::Running {
+    if input_info.status.is_active() {
         return Err(anyhow!("Input {} is already running", input_id));
     }
 
     // Recreate the input task based on the stored config
     match &input_info.config {
         CreateInputRequest::Udp { listen_port, .. } => {
+            let state_tx = input_info.state_tx.clone().or_else(|| {
+                // If no state_tx, try to get the global one
+                tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(async {
+                        STATE_CHANGE_TX.lock().await.clone()
+                    })
+                })
+            });
+
             let new_input_info = spawn_udp_input_with_stats(
                 input_info.id,
                 input_info.name.clone(),
                 input_info.details.clone(),
                 *listen_port,
+                state_tx,
             ).map_err(|e| anyhow::anyhow!("Failed to spawn UDP input: {}", e))?;
 
             // Update the existing InputInfo with new task and sender
             input_info.task_handle = new_input_info.task_handle;
             input_info.packet_tx = new_input_info.packet_tx;
             input_info.stats = new_input_info.stats;
-            input_info.status = StreamStatus::Running;
+            input_info.status = StreamStatus::Listening; // UDP starts listening
+            input_info.started_at = Some(SystemTime::now());
         },
         CreateInputRequest::Srt { config, .. } => {
+            let state_tx = input_info.state_tx.clone().or_else(|| {
+                // If no state_tx, try to get the global one
+                tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(async {
+                        STATE_CHANGE_TX.lock().await.clone()
+                    })
+                })
+            });
+
+            let source_with_state = SrtSourceWithState {
+                config: config.clone(),
+                input_id: input_info.id,
+                state_tx: state_tx.clone(),
+            };
             let sender = Forwarder::spawn_with_stats(
-                Box::new(config.clone()),
-                Duration::from_secs(1)
+                Box::new(source_with_state),
+                Duration::from_secs(1),
+                input_info.id,
+                state_tx,
             );
 
             input_info.task_handle = Some(sender.handle);
             input_info.packet_tx = sender.tx;
             input_info.stats = sender.stats;
-            input_info.status = StreamStatus::Running;
+            input_info.status = match config {
+                SrtInputConfig::Listener { .. } => StreamStatus::Listening,
+                SrtInputConfig::Caller { .. } => StreamStatus::Connecting,
+            };
+            input_info.started_at = Some(SystemTime::now());
         }
     }
 
@@ -96,12 +127,13 @@ pub async fn stop_input(input_id: i64) -> Result<()> {
     // Move running outputs to stopped_outputs and abort their tasks
     let mut outputs_to_stop = HashMap::new();
     for (output_id, mut output_info) in input_info.output_tasks.drain() {
-        if output_info.status == StreamStatus::Running {
+        if output_info.status.is_active() {
             // Stop the output task
             if let Some(handle) = output_info.abort_handle.take() {
                 handle.abort();
             }
             output_info.status = StreamStatus::Stopped;
+            output_info.started_at = None;
 
             // Store the config to restart later
             outputs_to_stop.insert(output_id, output_info.config.clone());
@@ -124,6 +156,7 @@ pub async fn stop_input(input_id: i64) -> Result<()> {
     }
 
     input_info.status = StreamStatus::Stopped;
+    input_info.started_at = None;
     info!("Input {} stopped successfully", input_id);
     Ok(())
 }
@@ -170,6 +203,7 @@ pub async fn stop_output(input_id: i64, output_id: i64) -> Result<()> {
         }
 
         output_info.status = StreamStatus::Stopped;
+        output_info.started_at = None;
 
         // Move to stopped_outputs for later restart
         input_info.stopped_outputs.insert(output_id, output_info.config.clone());
@@ -196,6 +230,11 @@ async fn start_output_internal(input_info: &mut InputInfo, output_id: i64, outpu
                 input_info,
                 output_id,
                 name.clone(),
+                tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(async {
+                        STATE_CHANGE_TX.lock().await.clone()
+                    })
+                }),
             ).await.map_err(|e| anyhow::anyhow!("Failed to create UDP output: {}", e))?
         },
         CreateOutputRequest::Srt { config, name, input_id, .. } => {
@@ -205,6 +244,11 @@ async fn start_output_internal(input_info: &mut InputInfo, output_id: i64, outpu
                 input_info,
                 output_id,
                 name.clone(),
+                tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(async {
+                        STATE_CHANGE_TX.lock().await.clone()
+                    })
+                }),
             ).map_err(|e| anyhow::anyhow!("Failed to create SRT output: {}", e))?
         }
     };

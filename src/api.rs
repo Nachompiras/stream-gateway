@@ -6,16 +6,17 @@ use anyhow::Result;
 
 use crate::udp_stream::{create_udp_output, spawn_udp_input_with_stats};
 use crate::srt_stream::{
-    create_srt_output,
+    create_srt_output, SrtSourceWithState,
 };
 use crate::models::*;
 use crate::database::{self, check_output_exists, check_port_conflict, get_input_by_id, get_output_by_id, update_input_status_in_db, update_output_status_in_db, get_input_id_for_output};
-use crate::ACTIVE_STREAMS;
+use crate::{ACTIVE_STREAMS, STATE_CHANGE_TX};
 use crate::analysis;
 use crate::stream_control;
 use sqlx::types::chrono;
 use tokio::sync::{broadcast, RwLock};
 use std::sync::Arc;
+use std::time::SystemTime;
 
 pub type InputsMap = std::collections::HashMap<i64, InputInfo>;
 
@@ -47,7 +48,7 @@ async fn create_input(
     println!("Input '{}' guardado en la base de datos con ID: {}", name.as_deref().unwrap_or("sin nombre"), id);
 
     // Now spawn the input tasks
-    match spawn_input(req.clone(), id, name.clone(), details.clone()) {
+    match spawn_input(req.clone(), id, name.clone(), details.clone()).await {
         Ok(info) => {
             println!("Input creado con ID: {}", info.id);
             
@@ -232,10 +233,10 @@ pub async fn create_output(
     // Create the output with the generated ID
     let output_info = match &req_val {
         CreateOutputRequest::Udp { destination_addr, name: user_name, .. } =>
-            create_udp_output(input_id, destination_addr.clone(), input, output_id, user_name.clone()).await?,
+            create_udp_output(input_id, destination_addr.clone(), input, output_id, user_name.clone(), get_state_change_sender().await).await?,
 
         CreateOutputRequest::Srt { config, name: user_name, .. } =>
-            create_srt_output(input_id, config.clone(), input, output_id, user_name.clone())?,
+            create_srt_output(input_id, config.clone(), input, output_id, user_name.clone(), get_state_change_sender().await)?,
     };
 
     // Insertamos el output en el Input correspondiente
@@ -276,6 +277,7 @@ pub async fn list_inputs(state: web::Data<AppState>) -> ActixResult<impl Respond
             input_type,
             status: input_info.status.to_string(),
             output_count: input_info.output_tasks.len(),
+            uptime_seconds: calculate_connection_uptime(&input_info.status, input_info.connected_at),
         });
     }
 
@@ -315,6 +317,7 @@ pub async fn get_input(
                 output_type: output_kind_string(&output_info.kind).to_string(),
                 status: output_info.status.to_string(),
                 config,
+                uptime_seconds: calculate_connection_uptime(&output_info.status, output_info.connected_at),
             });
         }
 
@@ -325,6 +328,7 @@ pub async fn get_input(
             input_type,
             status: input_info.status.to_string(),
             outputs,
+            uptime_seconds: calculate_connection_uptime(&input_info.status, input_info.connected_at),
         };
 
         Ok(HttpResponse::Ok().json(response))
@@ -348,6 +352,7 @@ pub async fn list_outputs(_state: web::Data<AppState>) -> ActixResult<impl Respo
                 destination: output_info.destination.clone(),
                 output_type: output_kind_string(&output_info.kind).to_string(),
                 status: output_info.status.to_string(),
+                uptime_seconds: calculate_connection_uptime(&output_info.status, output_info.connected_at),
             });
         }
     }
@@ -381,6 +386,7 @@ pub async fn get_output(
                 output_type: output_kind_string(&output_info.kind).to_string(),
                 status: output_info.status.to_string(),
                 config,
+                uptime_seconds: calculate_connection_uptime(&output_info.status, output_info.connected_at),
             };
 
             return Ok(HttpResponse::Ok().json(response));
@@ -416,6 +422,7 @@ pub async fn get_input_outputs(
                 output_type: output_kind_string(&output_info.kind).to_string(),
                 status: output_info.status.to_string(),
                 config,
+                uptime_seconds: calculate_connection_uptime(&output_info.status, output_info.connected_at),
             });
         }
 
@@ -480,6 +487,7 @@ pub async fn get_status(_state: web::Data<AppState>) -> ActixResult<impl Respond
                 destination: output_info.destination.clone(),
                 output_type: o_type.to_string(),
                 status: output_info.status.to_string(),
+                uptime_seconds: calculate_connection_uptime(&output_info.status, output_info.connected_at),
             });
         }
 
@@ -489,12 +497,36 @@ pub async fn get_status(_state: web::Data<AppState>) -> ActixResult<impl Respond
             details: input_info.details.clone(),
             status: input_info.status.to_string(),
             outputs: outputs_resp,
+            uptime_seconds: calculate_connection_uptime(&input_info.status, input_info.connected_at),
         });
     }
 
     Ok(HttpResponse::Ok().json(response))
 }
 
+// Helper function to calculate uptime from connected_at timestamp
+fn calculate_uptime_seconds(connected_at: Option<SystemTime>) -> Option<u64> {
+    connected_at.and_then(|connect_time| {
+        SystemTime::now()
+            .duration_since(connect_time)
+            .ok()
+            .map(|duration| duration.as_secs())
+    })
+}
+
+// Helper function to calculate connection uptime only for connected streams
+fn calculate_connection_uptime(status: &StreamStatus, connected_at: Option<SystemTime>) -> Option<u64> {
+    if status.is_connected() {
+        calculate_uptime_seconds(connected_at)
+    } else {
+        None
+    }
+}
+
+// Helper function to get global state change sender
+async fn get_state_change_sender() -> Option<StateChangeSender> {
+    STATE_CHANGE_TX.lock().await.clone()
+}
 
 #[actix_web::get("/inputs/{id}/stats")]
 async fn input_stats(
@@ -530,9 +562,9 @@ pub async fn load_from_db(state: &AppState) -> anyhow::Result<()> {
     for r in rows {
         println!("Procesando input ID {} de tipo {} con status {}", r.id, r.kind, r.status);
 
-        // Solo recrear inputs que están marcados como "running"
+        // Solo recrear inputs que están activos (not stopped)
         // Para inputs "stopped", crear InputInfo en estado stopped
-        if r.status != "running" {
+        if r.status == "stopped" {
             println!("Input {} está en status '{}', creando entrada stopped en memoria", r.id, r.status);
 
             // Recrear CreateInputRequest para store en memoria
@@ -570,6 +602,9 @@ pub async fn load_from_db(state: &AppState) -> anyhow::Result<()> {
                 stopped_outputs: HashMap::new(),
                 analysis_tasks: HashMap::new(),
                 paused_analysis: Vec::new(),
+                started_at: None, // Not started when stopped
+                connected_at: None, // Not connected when stopped
+                state_tx: None, // No state channel for stopped streams
             };
 
             loaded_inputs.insert(r.id, stopped_input_info);
@@ -601,7 +636,7 @@ pub async fn load_from_db(state: &AppState) -> anyhow::Result<()> {
             },
         };
 
-        match spawn_input(create_req, r.id, r.name.clone(), r.details.clone()) {
+        match spawn_input(create_req, r.id, r.name.clone(), r.details.clone()).await {
             Ok(info) => {
                 println!("Input {} recreado exitosamente", r.id);
                 loaded_inputs.insert(r.id, info);
@@ -639,8 +674,8 @@ pub async fn load_from_db(state: &AppState) -> anyhow::Result<()> {
                     None => String::new(),
                 };            
 
-                // Solo recrear outputs que están marcados como "running"
-                if o.status != "running" {
+                // Solo recrear outputs que están activos (not stopped)
+                if o.status == "stopped" {
                     println!("Output {} está en status '{}', agregando a stopped_outputs", o.id, o.status);
 
                     // Recrear CreateOutputRequest para store en stopped_outputs
@@ -690,7 +725,7 @@ pub async fn load_from_db(state: &AppState) -> anyhow::Result<()> {
                     "udp" => {
                         if let Ok(_dest) = destination.parse::<std::net::SocketAddr>() {
                             // Use create_udp_output to properly handle names
-                            match create_udp_output(input_id, destination.clone(), input, o.id, o.name.clone()).await {
+                            match create_udp_output(input_id, destination.clone(), input, o.id, o.name.clone(), get_state_change_sender().await).await {
                                 Ok(output_info) => {
                                     input.output_tasks.insert(o.id, output_info);
                                     Ok(())
@@ -706,7 +741,7 @@ pub async fn load_from_db(state: &AppState) -> anyhow::Result<()> {
                             o.config_json.as_deref().unwrap_or("{}")
                         )?;
                         let output_config = SrtOutputConfig::Caller { destination_addr: destination.clone(), common: cfg };
-                        match create_srt_output(input_id, output_config, input, o.id, o.name.clone()) {
+                        match create_srt_output(input_id, output_config, input, o.id, o.name.clone(), get_state_change_sender().await) {
                             Ok(output_info) => {
                                 input.output_tasks.insert(o.id, output_info);
                                 Ok(())
@@ -726,7 +761,7 @@ pub async fn load_from_db(state: &AppState) -> anyhow::Result<()> {
 
                         let output_config = SrtOutputConfig::Listener { listen_port, common: cfg };
 
-                        let output_info = match create_srt_output(input_id, output_config, input, o.id, o.name.clone()) {
+                        let output_info = match create_srt_output(input_id, output_config, input, o.id, o.name.clone(), get_state_change_sender().await) {
                             Ok(_) => {
                                 println!("Output SRT Listener {} creado para input {}", o.id, input_id);
                                 Ok(())
@@ -788,25 +823,34 @@ fn generate_input_name_and_details(req: &CreateInputRequest) -> (Option<String>,
     }
 }
 
-fn spawn_input(req: CreateInputRequest, id: i64, name: Option<String>, details: String) -> Result<InputInfo, actix_web::Error> {
+async fn spawn_input(req: CreateInputRequest, id: i64, name: Option<String>, details: String) -> Result<InputInfo, actix_web::Error> {
     match req {
         /* ----------------------------- UDP ----------------------------- */
         CreateInputRequest::Udp { listen_port, .. } => {
-            spawn_udp_input_with_stats(id, name, details, listen_port)
+            spawn_udp_input_with_stats(id, name, details, listen_port, get_state_change_sender().await)
         }
 
         /* ----------------------- SRT  (caller o listener) -------------- */
         CreateInputRequest::Srt { ref config, .. } => {            
             // Lanza el forwarder (con reconexión automática)
+            let state_tx = get_state_change_sender().await;
+            let source_with_state = SrtSourceWithState {
+                config: config.clone(),
+                input_id: id,
+                state_tx: state_tx.clone(),
+            };
             let sender =
-                Forwarder::spawn_with_stats(Box::new(config.clone()), Duration::from_secs(1));
+                Forwarder::spawn_with_stats(Box::new(source_with_state), Duration::from_secs(1), id, state_tx);
 
             println!("Input SRT '{id}' creado con detalles: {details}");
             Ok(InputInfo {
                 id,
                 name,
                 details,
-                status: StreamStatus::Running,
+                status: match config {
+                    SrtInputConfig::Listener { .. } => StreamStatus::Listening,
+                    SrtInputConfig::Caller { .. } => StreamStatus::Connecting,
+                },
                 packet_tx: sender.tx,
                 stats: sender.stats,
                 task_handle: Some(sender.handle),
@@ -815,6 +859,9 @@ fn spawn_input(req: CreateInputRequest, id: i64, name: Option<String>, details: 
                 stopped_outputs: HashMap::new(),
                 analysis_tasks: HashMap::new(),
                 paused_analysis: Vec::new(),
+                started_at: Some(SystemTime::now()),
+                connected_at: None, // Will be set when connection is established
+                state_tx: get_state_change_sender().await, // Use global state channel
             })
         }
     }

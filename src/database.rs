@@ -38,7 +38,7 @@ pub async fn save_input_to_db(
     let config_json = serde_json::to_string(request)?;
     
     let result = sqlx::query(
-        "INSERT INTO inputs (name, kind, config_json, details, status) VALUES (?, ?, ?, ?, 'running')"
+        "INSERT INTO inputs (name, kind, config_json, details, status) VALUES (?, ?, ?, ?, 'listening')"
     )
     .bind(name)
     .bind(kind)
@@ -76,7 +76,7 @@ pub async fn save_output_to_db(
     listen_port: Option<u16>,
 ) -> Result<i64> {
     let result = sqlx::query(
-        "INSERT INTO outputs (name, input_id, kind, destination, config_json, listen_port, status) VALUES (?, ?, ?, ?, ?, ?, 'running')"
+        "INSERT INTO outputs (name, input_id, kind, destination, config_json, listen_port, status) VALUES (?, ?, ?, ?, ?, ?, 'connecting')"
     )
     .bind(name)
     .bind(input_id)
