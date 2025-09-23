@@ -7,6 +7,7 @@ mod api;
 mod udp_stream;
 mod models;
 mod srt_stream;
+mod stream_control;
 mod database;
 use tokio::sync::Mutex;
 use std::{collections::HashMap, sync::Arc};
@@ -68,6 +69,11 @@ async fn main() -> std::io::Result<()> {
             .service(start_analysis)
             .service(stop_analysis)
             .service(get_analysis_status)
+            // Stream control endpoints
+            .service(start_input_endpoint)
+            .service(stop_input_endpoint)
+            .service(start_output_endpoint)
+            .service(stop_output_endpoint)
             // General status
             .service(get_status)
     })
@@ -103,10 +109,14 @@ async fn main() -> std::io::Result<()> {
         let mut inputs = ACTIVE_STREAMS.lock().await;
         for (input_id, input_info) in inputs.drain() {
             println!("Cerrando input {}", input_id);
-            input_info.task_handle.abort();            
+            if let Some(handle) = input_info.task_handle {
+                handle.abort();
+            }
             for (output_id, output_info) in input_info.output_tasks {
                 println!("Cerrando output {} del input {}", output_id, input_id);
-                output_info.abort_handle.abort();
+                if let Some(handle) = output_info.abort_handle {
+                    handle.abort();
+                }
             }
             for (analysis_id, analysis_info) in input_info.analysis_tasks {
                 println!("Cerrando análisis {} del input {}", analysis_id, input_id);

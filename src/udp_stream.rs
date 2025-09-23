@@ -66,12 +66,18 @@ pub async fn create_udp_output(
     let final_name = name.or(Some(format!("UDP Output to {}", destination_addr)));
     Ok(OutputInfo {
         id: output_id,
-        name: final_name,
+        name: final_name.clone(),
         input_id,
-        destination: destination_addr,
+        destination: destination_addr.clone(),
         kind: OutputKind::Udp,
+        status: StreamStatus::Running,
         stats: Arc::new(RwLock::new(None)),
-        abort_handle,
+        abort_handle: Some(abort_handle),
+        config: CreateOutputRequest::Udp {
+            input_id,
+            destination_addr,
+            name: final_name,
+        },
     })
 }
 
@@ -155,12 +161,16 @@ pub fn spawn_udp_input_with_stats(
 
     Ok(InputInfo {
         id,
-        name,
+        name: name.clone(),
         details,
+        status: StreamStatus::Running,
         packet_tx: tx,
-        task_handle: handle,
-        output_tasks: std::collections::HashMap::new(),
-        analysis_tasks: std::collections::HashMap::new(),
         stats,
+        task_handle: Some(handle),
+        config: CreateInputRequest::Udp { listen_port, name },
+        output_tasks: std::collections::HashMap::new(),
+        stopped_outputs: std::collections::HashMap::new(),
+        analysis_tasks: std::collections::HashMap::new(),
+        paused_analysis: Vec::new(),
     })
 }

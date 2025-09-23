@@ -38,7 +38,7 @@ pub async fn save_input_to_db(
     let config_json = serde_json::to_string(request)?;
     
     let result = sqlx::query(
-        "INSERT INTO inputs (name, kind, config_json, details) VALUES (?, ?, ?, ?)"
+        "INSERT INTO inputs (name, kind, config_json, details, status) VALUES (?, ?, ?, ?, 'running')"
     )
     .bind(name)
     .bind(kind)
@@ -76,7 +76,7 @@ pub async fn save_output_to_db(
     listen_port: Option<u16>,
 ) -> Result<i64> {
     let result = sqlx::query(
-        "INSERT INTO outputs (name, input_id, kind, destination, config_json, listen_port) VALUES (?, ?, ?, ?, ?, ?)"
+        "INSERT INTO outputs (name, input_id, kind, destination, config_json, listen_port, status) VALUES (?, ?, ?, ?, ?, ?, 'running')"
     )
     .bind(name)
     .bind(input_id)
@@ -100,17 +100,17 @@ pub async fn delete_output_from_db(pool: &SqlitePool, id: i64) -> Result<()> {
 }
 
 pub async fn get_all_inputs(pool: &SqlitePool) -> Result<Vec<InputRow>> {
-    let rows = sqlx::query_as::<_, InputRow>("SELECT id, name, kind, config_json, details FROM inputs")
+    let rows = sqlx::query_as::<_, InputRow>("SELECT id, name, kind, config_json, details, status FROM inputs")
         .fetch_all(pool)
         .await?;
-    
+
     Ok(rows)
 }
 
 pub async fn get_all_outputs(pool: &SqlitePool) -> Result<Vec<OutputRow>> {
     println!("Consultando todos los outputs en la base de datos...");
     let rows = sqlx::query_as::<_, OutputRow>(
-        "SELECT id, name, input_id, kind, destination, config_json, listen_port FROM outputs"
+        "SELECT id, name, input_id, kind, destination, config_json, listen_port, status FROM outputs"
     )
     .fetch_all(pool)
     .await?;
@@ -172,7 +172,7 @@ pub async fn get_input_by_id(pool: &SqlitePool, input_id: i64) -> Result<Option<
 
 pub async fn get_output_by_id(pool: &SqlitePool, output_id: i64) -> Result<Option<OutputRow>> {
     let row = sqlx::query_as::<_, OutputRow>(
-        "SELECT id, name, input_id, kind, destination, config_json, listen_port FROM outputs WHERE id = ?"
+        "SELECT id, name, input_id, kind, destination, config_json, listen_port, status FROM outputs WHERE id = ?"
     )
     .bind(output_id)
     .fetch_optional(pool)
@@ -183,11 +183,41 @@ pub async fn get_output_by_id(pool: &SqlitePool, output_id: i64) -> Result<Optio
 
 pub async fn get_outputs_by_input_id(pool: &SqlitePool, input_id: i64) -> Result<Vec<OutputRow>> {
     let rows = sqlx::query_as::<_, OutputRow>(
-        "SELECT id, name, input_id, kind, destination, config_json, listen_port FROM outputs WHERE input_id = ?"
+        "SELECT id, name, input_id, kind, destination, config_json, listen_port, status FROM outputs WHERE input_id = ?"
     )
     .bind(input_id)
     .fetch_all(pool)
     .await?;
 
     Ok(rows)
+}
+
+// Status update functions
+pub async fn update_input_status_in_db(pool: &SqlitePool, input_id: i64, status: &str) -> Result<()> {
+    sqlx::query("UPDATE inputs SET status = ? WHERE id = ?")
+        .bind(status)
+        .bind(input_id)
+        .execute(pool)
+        .await?;
+
+    Ok(())
+}
+
+pub async fn update_output_status_in_db(pool: &SqlitePool, output_id: i64, status: &str) -> Result<()> {
+    sqlx::query("UPDATE outputs SET status = ? WHERE id = ?")
+        .bind(status)
+        .bind(output_id)
+        .execute(pool)
+        .await?;
+
+    Ok(())
+}
+
+pub async fn get_input_id_for_output(pool: &SqlitePool, output_id: i64) -> Result<i64> {
+    let row: (i64,) = sqlx::query_as("SELECT input_id FROM outputs WHERE id = ?")
+        .bind(output_id)
+        .fetch_one(pool)
+        .await?;
+
+    Ok(row.0)
 }

@@ -78,15 +78,21 @@ pub fn create_srt_output(
 
     let info = OutputInfo {
         id: output_id,
-        name: final_name,
+        name: final_name.clone(),
         input_id,
         kind: match cfg {
             SrtOutputConfig::Caller { .. }   => OutputKind::SrtCaller,
             SrtOutputConfig::Listener { .. } => OutputKind::SrtListener,
         },
+        status: StreamStatus::Running,
         destination,
         stats: Arc::new(RwLock::new(None)),
-        abort_handle,
+        abort_handle: Some(abort_handle),
+        config: CreateOutputRequest::Srt {
+            input_id,
+            name: final_name,
+            config: cfg,
+        },
     };
 
     println!("Output creado: {:?}", info);

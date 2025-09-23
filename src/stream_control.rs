@@ -1,0 +1,214 @@
+use std::collections::HashMap;
+use std::time::Duration;
+use anyhow::{Result, anyhow};
+use log::{info, warn, error};
+
+use crate::models::*;
+use crate::ACTIVE_STREAMS;
+use crate::udp_stream::{spawn_udp_input_with_stats, create_udp_output};
+use crate::srt_stream::create_srt_output;
+use crate::analysis;
+
+/// Start a stopped input stream
+pub async fn start_input(input_id: i64) -> Result<()> {
+    info!("Starting input {}", input_id);
+
+    let mut guard = ACTIVE_STREAMS.lock().await;
+    let input_info = guard.get_mut(&input_id)
+        .ok_or_else(|| anyhow!("Input {} not found", input_id))?;
+
+    if input_info.status == StreamStatus::Running {
+        return Err(anyhow!("Input {} is already running", input_id));
+    }
+
+    // Recreate the input task based on the stored config
+    match &input_info.config {
+        CreateInputRequest::Udp { listen_port, .. } => {
+            let new_input_info = spawn_udp_input_with_stats(
+                input_info.id,
+                input_info.name.clone(),
+                input_info.details.clone(),
+                *listen_port,
+            ).map_err(|e| anyhow::anyhow!("Failed to spawn UDP input: {}", e))?;
+
+            // Update the existing InputInfo with new task and sender
+            input_info.task_handle = new_input_info.task_handle;
+            input_info.packet_tx = new_input_info.packet_tx;
+            input_info.stats = new_input_info.stats;
+            input_info.status = StreamStatus::Running;
+        },
+        CreateInputRequest::Srt { config, .. } => {
+            let sender = Forwarder::spawn_with_stats(
+                Box::new(config.clone()),
+                Duration::from_secs(1)
+            );
+
+            input_info.task_handle = Some(sender.handle);
+            input_info.packet_tx = sender.tx;
+            input_info.stats = sender.stats;
+            input_info.status = StreamStatus::Running;
+        }
+    }
+
+    // Restart running outputs that were stopped when input was stopped
+    let mut outputs_to_start = Vec::new();
+    for (output_id, output_config) in input_info.stopped_outputs.drain() {
+        outputs_to_start.push((output_id, output_config));
+    }
+
+    for (output_id, output_config) in outputs_to_start {
+        if let Err(e) = start_output_internal(input_info, output_id, output_config).await {
+            error!("Failed to restart output {}: {}", output_id, e);
+        }
+    }
+
+    // Restart paused analysis
+    let paused_analysis: Vec<AnalysisType> = input_info.paused_analysis.drain(..).collect();
+    for analysis_type in paused_analysis {
+        if let Err(e) = analysis::start_analysis(input_id, analysis_type.clone()).await {
+            error!("Failed to restart {} analysis for input {}: {}", analysis_type, input_id, e);
+            // Add back to paused list if failed
+            input_info.paused_analysis.push(analysis_type);
+        }
+    }
+
+    info!("Input {} started successfully", input_id);
+    Ok(())
+}
+
+/// Stop a running input stream
+pub async fn stop_input(input_id: i64) -> Result<()> {
+    info!("Stopping input {}", input_id);
+
+    let mut guard = ACTIVE_STREAMS.lock().await;
+    let input_info = guard.get_mut(&input_id)
+        .ok_or_else(|| anyhow!("Input {} not found", input_id))?;
+
+    if input_info.status == StreamStatus::Stopped {
+        return Err(anyhow!("Input {} is already stopped", input_id));
+    }
+
+    // Stop the main input task
+    if let Some(handle) = input_info.task_handle.take() {
+        handle.abort();
+    }
+
+    // Move running outputs to stopped_outputs and abort their tasks
+    let mut outputs_to_stop = HashMap::new();
+    for (output_id, mut output_info) in input_info.output_tasks.drain() {
+        if output_info.status == StreamStatus::Running {
+            // Stop the output task
+            if let Some(handle) = output_info.abort_handle.take() {
+                handle.abort();
+            }
+            output_info.status = StreamStatus::Stopped;
+
+            // Store the config to restart later
+            outputs_to_stop.insert(output_id, output_info.config.clone());
+        }
+        // Note: We're not putting the output back in output_tasks since it's stopped
+    }
+    input_info.stopped_outputs.extend(outputs_to_stop);
+
+    // Pause active analysis
+    let active_analysis: Vec<AnalysisType> = input_info.analysis_tasks.iter()
+        .map(|(_, info)| info.analysis_type.clone())
+        .collect();
+
+    for analysis_type in active_analysis {
+        if let Err(e) = analysis::stop_analysis(input_id, analysis_type.clone()).await {
+            error!("Failed to pause {} analysis for input {}: {}", analysis_type, input_id, e);
+        } else {
+            input_info.paused_analysis.push(analysis_type);
+        }
+    }
+
+    input_info.status = StreamStatus::Stopped;
+    info!("Input {} stopped successfully", input_id);
+    Ok(())
+}
+
+/// Start a stopped output stream
+pub async fn start_output(input_id: i64, output_id: i64) -> Result<()> {
+    info!("Starting output {} for input {}", output_id, input_id);
+
+    let mut guard = ACTIVE_STREAMS.lock().await;
+    let input_info = guard.get_mut(&input_id)
+        .ok_or_else(|| anyhow!("Input {} not found", input_id))?;
+
+    if input_info.status == StreamStatus::Stopped {
+        return Err(anyhow!("Cannot start output {} because input {} is stopped", output_id, input_id));
+    }
+
+    // Check if output is in stopped_outputs
+    if let Some(output_config) = input_info.stopped_outputs.remove(&output_id) {
+        start_output_internal(input_info, output_id, output_config).await?;
+        info!("Output {} started successfully", output_id);
+        Ok(())
+    } else {
+        // Check if it's already running
+        if input_info.output_tasks.contains_key(&output_id) {
+            return Err(anyhow!("Output {} is already running", output_id));
+        } else {
+            return Err(anyhow!("Output {} not found in input {}", output_id, input_id));
+        }
+    }
+}
+
+/// Stop a running output stream
+pub async fn stop_output(input_id: i64, output_id: i64) -> Result<()> {
+    info!("Stopping output {} for input {}", output_id, input_id);
+
+    let mut guard = ACTIVE_STREAMS.lock().await;
+    let input_info = guard.get_mut(&input_id)
+        .ok_or_else(|| anyhow!("Input {} not found", input_id))?;
+
+    if let Some(mut output_info) = input_info.output_tasks.remove(&output_id) {
+        // Stop the output task
+        if let Some(handle) = output_info.abort_handle.take() {
+            handle.abort();
+        }
+
+        output_info.status = StreamStatus::Stopped;
+
+        // Move to stopped_outputs for later restart
+        input_info.stopped_outputs.insert(output_id, output_info.config.clone());
+
+        info!("Output {} stopped successfully", output_id);
+        Ok(())
+    } else {
+        // Check if it's already stopped
+        if input_info.stopped_outputs.contains_key(&output_id) {
+            return Err(anyhow!("Output {} is already stopped", output_id));
+        } else {
+            return Err(anyhow!("Output {} not found in input {}", output_id, input_id));
+        }
+    }
+}
+
+/// Internal helper to start an output with given config
+async fn start_output_internal(input_info: &mut InputInfo, output_id: i64, output_config: CreateOutputRequest) -> Result<()> {
+    let output_info = match &output_config {
+        CreateOutputRequest::Udp { destination_addr, name, input_id, .. } => {
+            create_udp_output(
+                *input_id,
+                destination_addr.clone(),
+                input_info,
+                output_id,
+                name.clone(),
+            ).await.map_err(|e| anyhow::anyhow!("Failed to create UDP output: {}", e))?
+        },
+        CreateOutputRequest::Srt { config, name, input_id, .. } => {
+            create_srt_output(
+                *input_id,
+                config.clone(),
+                input_info,
+                output_id,
+                name.clone(),
+            ).map_err(|e| anyhow::anyhow!("Failed to create SRT output: {}", e))?
+        }
+    };
+
+    input_info.output_tasks.insert(output_id, output_info);
+    Ok(())
+}

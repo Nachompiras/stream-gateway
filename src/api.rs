@@ -9,10 +9,13 @@ use crate::srt_stream::{
     create_srt_output,
 };
 use crate::models::*;
-use crate::database::{self, check_output_exists, check_port_conflict, get_input_by_id, get_output_by_id};
+use crate::database::{self, check_output_exists, check_port_conflict, get_input_by_id, get_output_by_id, update_input_status_in_db, update_output_status_in_db, get_input_id_for_output};
 use crate::ACTIVE_STREAMS;
 use crate::analysis;
+use crate::stream_control;
 use sqlx::types::chrono;
+use tokio::sync::{broadcast, RwLock};
+use std::sync::Arc;
 
 pub type InputsMap = std::collections::HashMap<i64, InputInfo>;
 
@@ -78,19 +81,23 @@ pub async fn delete_input(
     let input_id = req.input_id;
     let mut state_guard = ACTIVE_STREAMS.lock().await;
 
-    if let Some(input_info) = state_guard.remove(&input_id) {
+    if let Some(mut input_info) = state_guard.remove(&input_id) {
         info!("Iniciando cierre del Input '{}'", input_id);
 
         // 1. Abortar la tarea principal del Input
         info!("[{}] Abortando tarea principal del Input", input_id);
-        input_info.task_handle.abort();
+        if let Some(handle) = input_info.task_handle.take() {
+            handle.abort();
+        }
         // El drop del broadcast::Sender (input_info.packet_tx) ocurrirá cuando input_info salga del scope.
         // Esto hará que los receivers de los outputs obtengan RecvError::Closed.
 
         // 2. Abortar explícitamente las tareas de output asociadas
         for (output_id, output_info) in input_info.output_tasks {
             info!("[{}] Abortando output task [{}]", input_id, output_id);
-            output_info.abort_handle.abort();
+            if let Some(handle) = output_info.abort_handle {
+                handle.abort();
+            }
         }
 
         // 3. Abortar explícitamente las tareas de análisis asociadas
@@ -267,6 +274,7 @@ pub async fn list_inputs(state: web::Data<AppState>) -> ActixResult<impl Respond
             name: input_info.name.clone(),
             details: input_info.details.clone(),
             input_type,
+            status: input_info.status.to_string(),
             output_count: input_info.output_tasks.len(),
         });
     }
@@ -305,6 +313,7 @@ pub async fn get_input(
                 input_id,
                 destination: output_info.destination.clone(),
                 output_type: output_kind_string(&output_info.kind).to_string(),
+                status: output_info.status.to_string(),
                 config,
             });
         }
@@ -314,6 +323,7 @@ pub async fn get_input(
             name: input_info.name.clone(),
             details: input_info.details.clone(),
             input_type,
+            status: input_info.status.to_string(),
             outputs,
         };
 
@@ -337,6 +347,7 @@ pub async fn list_outputs(_state: web::Data<AppState>) -> ActixResult<impl Respo
                 input_name: input_info.name.clone(),
                 destination: output_info.destination.clone(),
                 output_type: output_kind_string(&output_info.kind).to_string(),
+                status: output_info.status.to_string(),
             });
         }
     }
@@ -368,6 +379,7 @@ pub async fn get_output(
                 input_id: *input_id,
                 destination: output_info.destination.clone(),
                 output_type: output_kind_string(&output_info.kind).to_string(),
+                status: output_info.status.to_string(),
                 config,
             };
 
@@ -402,6 +414,7 @@ pub async fn get_input_outputs(
                 input_id,
                 destination: output_info.destination.clone(),
                 output_type: output_kind_string(&output_info.kind).to_string(),
+                status: output_info.status.to_string(),
                 config,
             });
         }
@@ -425,7 +438,9 @@ pub async fn delete_output(
     if let Some(input_info) = state_guard.get_mut(&input_id) {
         if let Some(output_info) = input_info.output_tasks.remove(&output_id) {
             // Abortar la tarea de envío
-            output_info.abort_handle.abort();
+            if let Some(handle) = output_info.abort_handle {
+                handle.abort();
+            }
 
             // Remove from database
             if let Err(e) = database::delete_output_from_db(&state.pool, output_id).await {
@@ -464,6 +479,7 @@ pub async fn get_status(_state: web::Data<AppState>) -> ActixResult<impl Respond
                 input_id: *input_id,
                 destination: output_info.destination.clone(),
                 output_type: o_type.to_string(),
+                status: output_info.status.to_string(),
             });
         }
 
@@ -471,6 +487,7 @@ pub async fn get_status(_state: web::Data<AppState>) -> ActixResult<impl Respond
             id: *input_id,
             name: input_info.name.clone(),
             details: input_info.details.clone(),
+            status: input_info.status.to_string(),
             outputs: outputs_resp,
         });
     }
@@ -511,8 +528,54 @@ pub async fn load_from_db(state: &AppState) -> anyhow::Result<()> {
     let mut loaded_inputs = HashMap::new();
     
     for r in rows {
-        println!("Recreando input ID {} de tipo {}", r.id, r.kind);
-        
+        println!("Procesando input ID {} de tipo {} con status {}", r.id, r.kind, r.status);
+
+        // Solo recrear inputs que están marcados como "running"
+        // Para inputs "stopped", crear InputInfo en estado stopped
+        if r.status != "running" {
+            println!("Input {} está en status '{}', creando entrada stopped en memoria", r.id, r.status);
+
+            // Recrear CreateInputRequest para store en memoria
+            let create_req = match r.kind.as_str() {
+                "udp" => {
+                    let json_val: serde_json::Value = serde_json::from_str(&r.config_json)?;
+                    let listen_port = json_val["listen_port"]
+                        .as_u64()
+                        .ok_or_else(|| anyhow::anyhow!("Missing listen_port in UDP config"))?
+                        as u16;
+                    CreateInputRequest::Udp { listen_port, name: r.name.clone() }
+                },
+                "srt_listener" | "srt_caller" => CreateInputRequest::Srt {
+                    name: r.name.clone(),
+                    config: serde_json::from_str(&r.config_json)?
+                },
+                _ => {
+                    println!("Tipo de input desconocido: {}, saltando", r.kind);
+                    continue;
+                },
+            };
+
+            // Crear InputInfo en estado stopped
+            let (tx, _) = broadcast::channel(BROADCAST_CAPACITY);
+            let stopped_input_info = InputInfo {
+                id: r.id,
+                name: r.name,
+                details: r.details,
+                status: StreamStatus::Stopped,
+                packet_tx: tx,
+                stats: Arc::new(RwLock::new(None)),
+                task_handle: None, // No task when stopped
+                config: create_req,
+                output_tasks: HashMap::new(),
+                stopped_outputs: HashMap::new(),
+                analysis_tasks: HashMap::new(),
+                paused_analysis: Vec::new(),
+            };
+
+            loaded_inputs.insert(r.id, stopped_input_info);
+            continue;
+        }
+
         // recrear el Input según su tipo
         let create_req = match r.kind.as_str() {
             "udp" => {
@@ -575,6 +638,53 @@ pub async fn load_from_db(state: &AppState) -> anyhow::Result<()> {
                     Some(ref d) => d.clone(),
                     None => String::new(),
                 };            
+
+                // Solo recrear outputs que están marcados como "running"
+                if o.status != "running" {
+                    println!("Output {} está en status '{}', agregando a stopped_outputs", o.id, o.status);
+
+                    // Recrear CreateOutputRequest para store en stopped_outputs
+                    let output_config = match o.kind.as_str() {
+                        "udp" => CreateOutputRequest::Udp {
+                            input_id,
+                            destination_addr: destination.clone(),
+                            name: o.name.clone(),
+                        },
+                        "srt_caller" => {
+                            let config_json = o.config_json.unwrap_or_default();
+                            let config: SrtOutputConfig = serde_json::from_str(&config_json)
+                                .unwrap_or(SrtOutputConfig::Caller {
+                                    destination_addr: destination.clone(),
+                                    common: SrtCommonConfig::default()
+                                });
+                            CreateOutputRequest::Srt {
+                                input_id,
+                                name: o.name.clone(),
+                                config,
+                            }
+                        },
+                        "srt_listener" => {
+                            let config_json = o.config_json.unwrap_or_default();
+                            let config: SrtOutputConfig = serde_json::from_str(&config_json)
+                                .unwrap_or(SrtOutputConfig::Listener {
+                                    listen_port: o.listen_port.unwrap_or(8000),
+                                    common: SrtCommonConfig::default()
+                                });
+                            CreateOutputRequest::Srt {
+                                input_id,
+                                name: o.name.clone(),
+                                config,
+                            }
+                        },
+                        _ => {
+                            println!("Tipo de output desconocido: {}, saltando", o.kind);
+                            continue;
+                        }
+                    };
+
+                    input.stopped_outputs.insert(o.id, output_config);
+                    continue;
+                }
 
                 let result = match o.kind.as_str() {
                     "udp" => {
@@ -696,11 +806,15 @@ fn spawn_input(req: CreateInputRequest, id: i64, name: Option<String>, details: 
                 id,
                 name,
                 details,
+                status: StreamStatus::Running,
                 packet_tx: sender.tx,
                 stats: sender.stats,
-                task_handle: sender.handle,
+                task_handle: Some(sender.handle),
+                config: req,
                 output_tasks: HashMap::new(),
+                stopped_outputs: HashMap::new(),
                 analysis_tasks: HashMap::new(),
+                paused_analysis: Vec::new(),
             })
         }
     }
@@ -819,6 +933,152 @@ pub async fn get_analysis_status(
         Err(e) => {
             error!("Failed to get analysis status: {}", e);
             Err(ErrorInternalServerError(format!("Failed to get analysis status: {}", e)))
+        }
+    }
+}
+
+// ==================== Stream Control Endpoints ====================
+
+#[actix_web::put("/inputs/{id}/start")]
+pub async fn start_input_endpoint(
+    path: web::Path<i64>,
+    state: web::Data<AppState>,
+) -> ActixResult<impl Responder> {
+    let input_id = path.into_inner();
+
+    info!("Request to start input {}", input_id);
+
+    match stream_control::start_input(input_id).await {
+        Ok(()) => {
+            // Update database status
+            if let Err(e) = update_input_status_in_db(&state.pool, input_id, "running").await {
+                error!("Failed to update input status in database: {}", e);
+                // Continue anyway - the stream is started in memory
+            }
+
+            info!("Input {} started successfully", input_id);
+            Ok(HttpResponse::Ok().json(serde_json::json!({
+                "message": "Input started successfully",
+                "input_id": input_id,
+                "status": "running"
+            })))
+        }
+        Err(e) => {
+            error!("Failed to start input {}: {}", input_id, e);
+            Err(ErrorInternalServerError(format!("Failed to start input: {}", e)))
+        }
+    }
+}
+
+#[actix_web::put("/inputs/{id}/stop")]
+pub async fn stop_input_endpoint(
+    path: web::Path<i64>,
+    state: web::Data<AppState>,
+) -> ActixResult<impl Responder> {
+    let input_id = path.into_inner();
+
+    info!("Request to stop input {}", input_id);
+
+    match stream_control::stop_input(input_id).await {
+        Ok(()) => {
+            // Update database status
+            if let Err(e) = update_input_status_in_db(&state.pool, input_id, "stopped").await {
+                error!("Failed to update input status in database: {}", e);
+                // Continue anyway - the stream is stopped in memory
+            }
+
+            info!("Input {} stopped successfully", input_id);
+            Ok(HttpResponse::Ok().json(serde_json::json!({
+                "message": "Input stopped successfully",
+                "input_id": input_id,
+                "status": "stopped"
+            })))
+        }
+        Err(e) => {
+            error!("Failed to stop input {}: {}", input_id, e);
+            Err(ErrorInternalServerError(format!("Failed to stop input: {}", e)))
+        }
+    }
+}
+
+#[actix_web::put("/outputs/{id}/start")]
+pub async fn start_output_endpoint(
+    path: web::Path<i64>,
+    state: web::Data<AppState>,
+) -> ActixResult<impl Responder> {
+    let output_id = path.into_inner();
+
+    info!("Request to start output {}", output_id);
+
+    // First get the input_id for this output from database
+    let input_id = match get_input_id_for_output(&state.pool, output_id).await {
+        Ok(id) => id,
+        Err(e) => {
+            error!("Failed to find input for output {}: {}", output_id, e);
+            return Err(ErrorInternalServerError(format!("Failed to find input for output: {}", e)));
+        }
+    };
+
+    match stream_control::start_output(input_id, output_id).await {
+        Ok(()) => {
+            // Update database status
+            if let Err(e) = update_output_status_in_db(&state.pool, output_id, "running").await {
+                error!("Failed to update output status in database: {}", e);
+                // Continue anyway - the stream is started in memory
+            }
+
+            info!("Output {} started successfully", output_id);
+            Ok(HttpResponse::Ok().json(serde_json::json!({
+                "message": "Output started successfully",
+                "output_id": output_id,
+                "input_id": input_id,
+                "status": "running"
+            })))
+        }
+        Err(e) => {
+            error!("Failed to start output {}: {}", output_id, e);
+            Err(ErrorInternalServerError(format!("Failed to start output: {}", e)))
+        }
+    }
+}
+
+#[actix_web::put("/outputs/{id}/stop")]
+pub async fn stop_output_endpoint(
+    path: web::Path<i64>,
+    state: web::Data<AppState>,
+) -> ActixResult<impl Responder> {
+    let output_id = path.into_inner();
+
+    info!("Request to stop output {}", output_id);
+
+    // First get the input_id for this output from database
+    let input_id = match get_input_id_for_output(&state.pool, output_id).await {
+        Ok(id) => id,
+        Err(e) => {
+            error!("Failed to find input for output {}: {}", output_id, e);
+            return Err(ErrorInternalServerError(format!("Failed to find input for output: {}", e)));
+        }
+    };
+
+    match stream_control::stop_output(input_id, output_id).await {
+        Ok(()) => {
+            // Update database status
+            if let Err(e) = update_output_status_in_db(&state.pool, output_id, "stopped").await {
+                error!("Failed to update output status in database: {}", e);
+                // Continue anyway - the stream is stopped in memory
+            }
+
+            info!("Output {} stopped successfully", output_id);
+            Ok(HttpResponse::Ok().json(serde_json::json!({
+                "message": "Output stopped successfully",
+                "output_id": output_id,
+                "input_id": input_id,
+                "status": "stopped"
+            })))
+        }
+        Err(e) => {
+            error!("Failed to stop output {}: {}", output_id, e);
+            Err(ErrorInternalServerError(format!("Failed to stop output: {}", e)))
         }
     }
 }

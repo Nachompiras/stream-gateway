@@ -21,11 +21,15 @@ pub struct InputInfo {
     pub id:               i64,
     pub name:             Option<String>,
     pub details:          String,
+    pub status:           StreamStatus,
     pub packet_tx:        broadcast::Sender<Bytes>,
     pub stats:            StatsCell,
-    pub task_handle:      JoinHandle<()>,
+    pub task_handle:      Option<JoinHandle<()>>,  // None when stopped
+    pub config:           CreateInputRequest,      // Store config to restart
     pub output_tasks:     HashMap<i64, OutputInfo>,
+    pub stopped_outputs:  HashMap<i64, CreateOutputRequest>, // Stopped outputs config
     pub analysis_tasks:   HashMap<String, AnalysisInfo>,
+    pub paused_analysis:  Vec<AnalysisType>,       // Analysis that were active when input stopped
 }
 
 #[derive(Debug, Clone)]
@@ -34,9 +38,11 @@ pub struct OutputInfo {
     pub name:         Option<String>,
     pub input_id:     i64,
     pub kind:         OutputKind,
-    pub stats:       StatsCell,
+    pub status:       StreamStatus,
+    pub stats:        StatsCell,
     pub destination:  String,
-    pub abort_handle: AbortHandle,
+    pub abort_handle: Option<AbortHandle>,      // None when stopped
+    pub config:       CreateOutputRequest,     // Store config to restart
 }
 
 
@@ -118,7 +124,7 @@ pub enum SrtInputConfig {
     },
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Clone)]
 #[serde(tag = "type")]
 pub enum CreateOutputRequest {
     #[serde(rename = "udp")]
@@ -169,6 +175,7 @@ pub struct InputResponse {
     pub id: i64,
     pub name: Option<String>,
     pub details: String,
+    pub status: String,
     pub outputs: Vec<OutputResponse>, // Lista de outputs asociados
 }
 
@@ -179,6 +186,7 @@ pub struct OutputResponse {
     pub input_id: i64,
     pub destination: String,
     pub output_type: String, // "UDP" o "SRT Caller"
+    pub status: String,
 }
 
 // New response models for CRUD endpoints
@@ -188,6 +196,7 @@ pub struct InputListResponse {
     pub name: Option<String>,
     pub details: String,
     pub input_type: String, // "UDP", "SRT Listener", "SRT Caller"
+    pub status: String,
     pub output_count: usize, // Número de outputs asociados
 }
 
@@ -197,6 +206,7 @@ pub struct InputDetailResponse {
     pub name: Option<String>,
     pub details: String,
     pub input_type: String,
+    pub status: String,
     pub outputs: Vec<OutputDetailResponse>,
 }
 
@@ -207,6 +217,7 @@ pub struct OutputDetailResponse {
     pub input_id: i64,
     pub destination: String,
     pub output_type: String,
+    pub status: String,
     pub config: Option<String>, // JSON config if needed
 }
 
@@ -218,6 +229,7 @@ pub struct OutputListResponse {
     pub input_name: Option<String>, // Para contexto en la lista
     pub destination: String,
     pub output_type: String,
+    pub status: String,
 }
 
 /* SRT models */
@@ -279,6 +291,7 @@ pub struct InputRow {
     pub kind:        String,     // "udp", "srt_listener", "srt_caller"
     pub config_json: String,
     pub details:     String,
+    pub status:      String,     // "running", "stopped"
 }
 
 #[derive(Serialize, Deserialize, FromRow)]
@@ -290,6 +303,7 @@ pub struct OutputRow {
     pub destination: Option<String>,
     pub listen_port: Option<u16>,
     pub config_json: Option<String>,
+    pub status:      String,     // "running", "stopped"
 }
 
 pub fn output_kind_string(k: &OutputKind) -> &'static str {
@@ -316,6 +330,34 @@ pub fn input_type_display_string(kind: &str) -> &'static str {
         "srt_listener" => "SRT Listener",
         "srt_caller" => "SRT Caller",
         _ => "Unknown",
+    }
+}
+
+// Stream status for start/stop control
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StreamStatus {
+    Running,
+    Stopped,
+}
+
+impl fmt::Display for StreamStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            StreamStatus::Running => write!(f, "running"),
+            StreamStatus::Stopped => write!(f, "stopped"),
+        }
+    }
+}
+
+impl std::str::FromStr for StreamStatus {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "running" => Ok(StreamStatus::Running),
+            "stopped" => Ok(StreamStatus::Stopped),
+            _ => Err(format!("Invalid stream status: {}", s)),
+        }
     }
 }
 
