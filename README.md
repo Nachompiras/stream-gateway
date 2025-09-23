@@ -81,8 +81,8 @@ The SRT Gateway is built with a modern, scalable architecture:
 
 ### **Installation**
 ```bash
-git clone https://github.com/Nachompiras/srt-gateway-rust.git
-cd srt-gateway-rust
+git clone https://github.com/Nachompiras/stream-gateway.git
+cd stream-gateway
 cargo build --release
 ```
 
