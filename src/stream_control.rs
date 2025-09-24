@@ -37,7 +37,6 @@ pub async fn start_input(input_id: i64) -> Result<()> {
             let new_input_info = spawn_udp_input_with_stats(
                 input_info.id,
                 input_info.name.clone(),
-                input_info.details.clone(),
                 port,
                 state_tx,
             ).map_err(|e| anyhow::anyhow!("Failed to spawn UDP input: {}", e))?;

@@ -32,23 +32,53 @@ async fn create_input(
 
     println!("Petición para crear input: {:?}", req);
 
-    // Generate name and details for the input
-    let (auto_name, details) = generate_input_name_and_details(&req);
+    // Generate name for the input
+    let auto_name = generate_input_name(&req);
     let name = get_name_from_request(&req).or(auto_name);
 
-    // Save to database FIRST to get auto-generated ID
-    let id = match database::save_input_to_db(&state.pool, name.as_deref(), &req, &details).await {
+    // Handle automatic port assignment by modifying the request configuration
+    let mut final_req = req.clone();
+    let assigned_port = if req.is_automatic_port() {
+        let port = crate::port_utils::find_available_port(&state.pool, None).await
+            .map_err(|e| ErrorInternalServerError(format!("Failed to find available port: {e}")))?;
+
+        // Modify the configuration to include the assigned port
+        match &mut final_req {
+            CreateInputRequest::Udp { bind_port, listen_port, automatic_port, .. } => {
+                *bind_port = Some(port);
+                *listen_port = Some(port); // For backward compatibility
+                *automatic_port = None; // Remove the automatic_port flag from saved config
+            },
+            CreateInputRequest::Srt { config, .. } => {
+                match config {
+                    SrtInputConfig::Listener { bind_port, listen_port, automatic_port, .. } => {
+                        *bind_port = Some(port);
+                        *listen_port = Some(port); // For backward compatibility
+                        *automatic_port = None; // Remove the automatic_port flag from saved config
+                    },
+                    _ => {} // Callers don't need auto port assignment
+                }
+            }
+        }
+
+        Some(port)
+    } else {
+        None
+    };
+
+    // Save to database with the modified configuration
+    let id = match database::save_input_to_db(&state.pool, name.as_deref(), &final_req).await {
         Ok(id) => id,
         Err(e) => {
             error!("Error saving input to database: {}", e);
             return Err(ErrorInternalServerError(format!("Database error: {e}")));
         }
     };
-    
+
     println!("Input '{}' guardado en la base de datos con ID: {}", name.as_deref().unwrap_or("sin nombre"), id);
 
-    // Now spawn the input tasks
-    match spawn_input(req.clone(), id, name.clone(), details.clone()).await {
+    // Now spawn the input tasks using the modified configuration
+    match spawn_input(final_req, id, name.clone(), None).await {
         Ok(info) => {
             println!("Input creado con ID: {}", info.id);
             
@@ -56,12 +86,16 @@ async fn create_input(
             guard.insert(info.id, info);            
 
             println!("Input '{}' añadido al estado compartido", id);
-            Ok(HttpResponse::Created().json(
-                serde_json::json!({ 
-                    "id": id,
-                    "name": name
-                })
-            ))
+            let mut response = serde_json::json!({
+                "id": id,
+                "name": name
+            });
+
+            if let Some(port) = assigned_port {
+                response["assigned_port"] = serde_json::json!(port);
+            }
+
+            Ok(HttpResponse::Created().json(response))
         }
         Err(e) => {
             // If spawning fails, we should clean up the database entry
@@ -151,12 +185,41 @@ pub async fn create_output(
         }
     };
 
-    // Validation logic - build destination string using new helper methods
-    let (destination_addr, listen_port) = match &req_val {
+    // Handle automatic port assignment by modifying the request configuration
+    let mut final_req = req_val.clone();
+    let assigned_port = if req_val.is_automatic_port() {
+        let port = crate::port_utils::find_available_port(&state.pool, None).await
+            .map_err(|e| ErrorInternalServerError(format!("Failed to find available port: {e}")))?;
+
+        // Modify the configuration to include the assigned port
+        match &mut final_req {
+            CreateOutputRequest::Udp { remote_port, automatic_port, .. } => {
+                *remote_port = Some(port);
+                *automatic_port = None; // Remove the automatic_port flag from saved config
+            },
+            CreateOutputRequest::Srt { config, .. } => {
+                match config {
+                    SrtOutputConfig::Listener { bind_port, listen_port, automatic_port, .. } => {
+                        *bind_port = Some(port);
+                        *listen_port = Some(port); // For backward compatibility
+                        *automatic_port = None; // Remove the automatic_port flag from saved config
+                    },
+                    _ => {} // Callers don't need auto port assignment
+                }
+            }
+        }
+
+        Some(port)
+    } else {
+        None
+    };
+
+    // Validation logic - build destination string using the modified request
+    let (destination_addr, listen_port) = match &final_req {
         CreateOutputRequest::Udp { .. } => {
             // Use helper methods to get host and port, with fallbacks for legacy fields
-            let host = req_val.get_remote_host().unwrap_or_else(|| "127.0.0.1".to_string());
-            let port = req_val.get_remote_port().unwrap_or(8000);
+            let host = final_req.get_remote_host().unwrap_or_else(|| "127.0.0.1".to_string());
+            let port = final_req.get_remote_port().unwrap_or(8000);
             (format!("{}:{}", host, port), None)
         },
         CreateOutputRequest::Srt { config, .. } => {
@@ -205,8 +268,8 @@ pub async fn create_output(
         }
     }
 
-    // Save to database first to get auto-generated ID
-    let (name, kind, config_json) = match &req_val {
+    // Save to database first to get auto-generated ID using final request
+    let (name, kind, config_json) = match &final_req {
         CreateOutputRequest::Udp { name: user_name, .. } => {
             let auto_name = Some(format!("UDP Output to {}", destination_addr));
             let final_name = user_name.clone().or(auto_name);
@@ -247,8 +310,8 @@ pub async fn create_output(
     .await
     .map_err(|e| ErrorInternalServerError(format!("Database error: {e}")))?;
 
-    // Create the output with the generated ID
-    let output_info = match &req_val {
+    // Create the output with the generated ID using the final request
+    let output_info = match &final_req {
         CreateOutputRequest::Udp { name: user_name, .. } => {
             // Use the already computed destination_addr string
             create_udp_output(input_id, destination_addr.clone(), input, output_id, user_name.clone(), get_state_change_sender().await).await?
@@ -265,13 +328,17 @@ pub async fn create_output(
         .output_tasks
         .insert(output_info.id, output_info.clone());
 
-    let response = serde_json::json!({
+    let mut response = serde_json::json!({
         "message": "Output creado",
         "output_id": output_info.id,
         "input_id": output_info.input_id,
         "destination": output_info.destination,
         "type": output_info.kind.to_string(),
     });
+
+    if let Some(port) = assigned_port {
+        response["assigned_port"] = serde_json::json!(port);
+    }
 
     Ok(HttpResponse::Created().json(response))
 }
@@ -289,12 +356,14 @@ pub async fn list_inputs(state: web::Data<AppState>) -> ActixResult<impl Respond
             "Unknown".to_string()
         };
 
+        let assigned_port = input_info.config.extract_assigned_port();
+
         response.push(InputListResponse {
             id: *input_id,
             name: input_info.name.clone(),
-            details: input_info.details.clone(),
             input_type,
             status: input_info.status.to_string(),
+            assigned_port,
             output_count: input_info.output_tasks.len(),
             uptime_seconds: calculate_connection_uptime(&input_info.status, input_info.connected_at),
         });
@@ -322,10 +391,20 @@ pub async fn get_input(
         // Build outputs list with detailed information
         let mut outputs: Vec<OutputDetailResponse> = Vec::new();
         for (output_id, output_info) in input_info.output_tasks.iter() {
-            let config = if let Ok(Some(db_output)) = get_output_by_id(&state.pool, *output_id).await {
-                db_output.config_json
+            let (config, assigned_port) = if let Ok(Some(db_output)) = get_output_by_id(&state.pool, *output_id).await {
+                let port = if let Some(config_json) = &db_output.config_json {
+                    // Extract port from configuration JSON
+                    if let Ok(config) = serde_json::from_str::<CreateOutputRequest>(config_json) {
+                        config.extract_assigned_port()
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                (db_output.config_json, port)
             } else {
-                None
+                (None, None)
             };
 
             outputs.push(OutputDetailResponse {
@@ -335,17 +414,29 @@ pub async fn get_input(
                 destination: output_info.destination.clone(),
                 output_type: output_kind_string(&output_info.kind).to_string(),
                 status: output_info.status.to_string(),
+                assigned_port,
                 config,
                 uptime_seconds: calculate_connection_uptime(&output_info.status, output_info.connected_at),
             });
         }
 
+        let input_assigned_port = if let Ok(Some(db_input)) = get_input_by_id(&state.pool, input_id).await {
+            // Extract port from configuration JSON
+            if let Ok(config) = serde_json::from_str::<CreateInputRequest>(&db_input.config_json) {
+                config.extract_assigned_port()
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         let response = InputDetailResponse {
             id: input_id,
             name: input_info.name.clone(),
-            details: input_info.details.clone(),
             input_type,
             status: input_info.status.to_string(),
+            assigned_port: input_assigned_port,
             outputs,
             uptime_seconds: calculate_connection_uptime(&input_info.status, input_info.connected_at),
         };
@@ -371,6 +462,7 @@ pub async fn list_outputs(_state: web::Data<AppState>) -> ActixResult<impl Respo
                 destination: output_info.destination.clone(),
                 output_type: output_kind_string(&output_info.kind).to_string(),
                 status: output_info.status.to_string(),
+                assigned_port: output_info.config.extract_assigned_port(),
                 uptime_seconds: calculate_connection_uptime(&output_info.status, output_info.connected_at),
             });
         }
@@ -391,10 +483,20 @@ pub async fn get_output(
     for (input_id, input_info) in state_guard.iter() {
         if let Some(output_info) = input_info.output_tasks.get(&output_id) {
             // Get additional config from database
-            let config = if let Ok(Some(db_output)) = database::get_output_by_id(&state.pool, output_id).await {
-                db_output.config_json
+            let (config, assigned_port) = if let Ok(Some(db_output)) = database::get_output_by_id(&state.pool, output_id).await {
+                let port = if let Some(config_json) = &db_output.config_json {
+                    // Extract port from configuration JSON
+                    if let Ok(config) = serde_json::from_str::<CreateOutputRequest>(config_json) {
+                        config.extract_assigned_port()
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                (db_output.config_json, port)
             } else {
-                None
+                (None, None)
             };
 
             let response = OutputDetailResponse {
@@ -404,6 +506,7 @@ pub async fn get_output(
                 destination: output_info.destination.clone(),
                 output_type: output_kind_string(&output_info.kind).to_string(),
                 status: output_info.status.to_string(),
+                assigned_port,
                 config,
                 uptime_seconds: calculate_connection_uptime(&output_info.status, output_info.connected_at),
             };
@@ -427,10 +530,20 @@ pub async fn get_input_outputs(
         let mut outputs: Vec<OutputDetailResponse> = Vec::new();
 
         for (output_id, output_info) in input_info.output_tasks.iter() {
-            let config = if let Ok(Some(db_output)) = database::get_output_by_id(&state.pool, *output_id).await {
-                db_output.config_json
+            let (config, assigned_port) = if let Ok(Some(db_output)) = database::get_output_by_id(&state.pool, *output_id).await {
+                let port = if let Some(config_json) = &db_output.config_json {
+                    // Extract port from configuration JSON
+                    if let Ok(config) = serde_json::from_str::<CreateOutputRequest>(config_json) {
+                        config.extract_assigned_port()
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                (db_output.config_json, port)
             } else {
-                None
+                (None, None)
             };
 
             outputs.push(OutputDetailResponse {
@@ -440,6 +553,7 @@ pub async fn get_input_outputs(
                 destination: output_info.destination.clone(),
                 output_type: output_kind_string(&output_info.kind).to_string(),
                 status: output_info.status.to_string(),
+                assigned_port,
                 config,
                 uptime_seconds: calculate_connection_uptime(&output_info.status, output_info.connected_at),
             });
@@ -506,6 +620,7 @@ pub async fn get_status(_state: web::Data<AppState>) -> ActixResult<impl Respond
                 destination: output_info.destination.clone(),
                 output_type: o_type.to_string(),
                 status: output_info.status.to_string(),
+                assigned_port: output_info.config.extract_assigned_port(),
                 uptime_seconds: calculate_connection_uptime(&output_info.status, output_info.connected_at),
             });
         }
@@ -513,8 +628,8 @@ pub async fn get_status(_state: web::Data<AppState>) -> ActixResult<impl Respond
         response.push(InputResponse {
             id: *input_id,
             name: input_info.name.clone(),
-            details: input_info.details.clone(),
             status: input_info.status.to_string(),
+            assigned_port: input_info.config.extract_assigned_port(),
             outputs: outputs_resp,
             uptime_seconds: calculate_connection_uptime(&input_info.status, input_info.connected_at),
         });
@@ -589,17 +704,8 @@ pub async fn load_from_db(state: &AppState) -> anyhow::Result<()> {
             // Recrear CreateInputRequest para store en memoria
             let create_req = match r.kind.as_str() {
                 "udp" => {
-                    let json_val: serde_json::Value = serde_json::from_str(&r.config_json)?;
-                    let listen_port = json_val["listen_port"]
-                        .as_u64()
-                        .ok_or_else(|| anyhow::anyhow!("Missing listen_port in UDP config"))?
-                        as u16;
-                    CreateInputRequest::Udp { 
-                        bind_host: None,
-                        bind_port: None,
-                        name: r.name.clone(),
-                        listen_port: Some(listen_port) // Legacy compatibility
-                    }
+                    // Simply deserialize the stored configuration - it already contains the correct port
+                    serde_json::from_str(&r.config_json)?
                 },
                 "srt_listener" | "srt_caller" => CreateInputRequest::Srt {
                     name: r.name.clone(),
@@ -616,7 +722,6 @@ pub async fn load_from_db(state: &AppState) -> anyhow::Result<()> {
             let stopped_input_info = InputInfo {
                 id: r.id,
                 name: r.name,
-                details: r.details,
                 status: StreamStatus::Stopped,
                 packet_tx: tx,
                 stats: Arc::new(RwLock::new(None)),
@@ -638,18 +743,9 @@ pub async fn load_from_db(state: &AppState) -> anyhow::Result<()> {
         // recrear el Input según su tipo
         let create_req = match r.kind.as_str() {
             "udp" => {
-                let json_val: serde_json::Value = serde_json::from_str(&r.config_json)?;
-                println!("Configuración UDP: {:?}", json_val);
-                let listen_port = json_val["listen_port"]
-                    .as_u64()
-                    .ok_or_else(|| anyhow::anyhow!("Missing listen_port in UDP config"))?
-                    as u16;
-                CreateInputRequest::Udp { 
-                    bind_host: None,
-                    bind_port: None,
-                    name: None,
-                    listen_port: Some(listen_port) // Legacy compatibility
-                }
+                println!("Configuración UDP: {}", r.config_json);
+                // Simply deserialize the stored configuration - it already contains the correct port
+                serde_json::from_str(&r.config_json)?
             },
             "srt_listener" => CreateInputRequest::Srt {
                 name: None,
@@ -665,7 +761,7 @@ pub async fn load_from_db(state: &AppState) -> anyhow::Result<()> {
             },
         };
 
-        match spawn_input(create_req, r.id, r.name.clone(), r.details.clone()).await {
+        match spawn_input(create_req, r.id, r.name.clone(), None).await {
             Ok(info) => {
                 println!("Input {} recreado exitosamente", r.id);
                 loaded_inputs.insert(r.id, info);
@@ -713,6 +809,7 @@ pub async fn load_from_db(state: &AppState) -> anyhow::Result<()> {
                             input_id,
                             remote_host: None,
                             remote_port: None,
+                            automatic_port: None,
                             name: o.name.clone(),
                             destination_addr: Some(destination.clone()), // Legacy compatibility
                         },
@@ -737,6 +834,7 @@ pub async fn load_from_db(state: &AppState) -> anyhow::Result<()> {
                                 .unwrap_or(SrtOutputConfig::Listener {
                                     bind_host: None,
                                     bind_port: None,
+                                    automatic_port: None,
                                     listen_port: Some(o.listen_port.unwrap_or(8000)), // Legacy compatibility
                                     common: SrtCommonConfig::default()
                                 });
@@ -799,11 +897,12 @@ pub async fn load_from_db(state: &AppState) -> anyhow::Result<()> {
                             None => return Err(anyhow::anyhow!("Missing listen_port for SRT Listener output {}", o.id)),
                         };
 
-                        let output_config = SrtOutputConfig::Listener { 
+                        let output_config = SrtOutputConfig::Listener {
                             bind_host: None,
                             bind_port: None,
+                            automatic_port: None,
                             listen_port: Some(listen_port), // Legacy compatibility
-                            common: cfg 
+                            common: cfg
                         };
 
                         let output_info = match create_srt_output(input_id, output_config, input, o.id, o.name.clone(), get_state_change_sender().await) {
@@ -851,11 +950,11 @@ fn get_name_from_request(req: &CreateInputRequest) -> Option<String> {
     }
 }
 
-fn generate_input_name_and_details(req: &CreateInputRequest) -> (Option<String>, String) {
+fn generate_input_name(req: &CreateInputRequest) -> Option<String> {
     match req {
         CreateInputRequest::Udp { .. } => {
             let port = req.get_bind_port();
-            (Some(format!("UDP Listener {port}")), format!("UDP Listener on port {port}"))
+            Some(format!("UDP Listener {port}"))
         }
         CreateInputRequest::Srt { config, .. } => {
             let name = match config {
@@ -869,17 +968,17 @@ fn generate_input_name_and_details(req: &CreateInputRequest) -> (Option<String>,
                     format!("SRT Caller {}:{}", host, port)
                 },
             };
-            (Some(name), format!("{:?}", config))
+            Some(name)
         }
     }
 }
 
-async fn spawn_input(req: CreateInputRequest, id: i64, name: Option<String>, details: String) -> Result<InputInfo, actix_web::Error> {
+async fn spawn_input(req: CreateInputRequest, id: i64, name: Option<String>, _assigned_port: Option<u16>) -> Result<InputInfo, actix_web::Error> {
     match req {
         /* ----------------------------- UDP ----------------------------- */
         CreateInputRequest::Udp { .. } => {
             let port = req.get_bind_port();
-            spawn_udp_input_with_stats(id, name, details, port, get_state_change_sender().await)
+            spawn_udp_input_with_stats(id, name, port, get_state_change_sender().await)
         }
 
         /* ----------------------- SRT  (caller o listener) -------------- */
@@ -894,11 +993,10 @@ async fn spawn_input(req: CreateInputRequest, id: i64, name: Option<String>, det
             let sender =
                 Forwarder::spawn_with_stats(Box::new(source_with_state), Duration::from_secs(1), id, state_tx);
 
-            println!("Input SRT '{id}' creado con detalles: {details}");
+            println!("Input SRT '{id}' creado");
             Ok(InputInfo {
                 id,
                 name,
-                details,
                 status: match config {
                     SrtInputConfig::Listener { .. } => StreamStatus::Listening,
                     SrtInputConfig::Caller { .. } => StreamStatus::Connecting,

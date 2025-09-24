@@ -20,7 +20,6 @@ pub const BROADCAST_CAPACITY: usize = 1024; // Capacidad del buffer del canal br
 pub struct InputInfo {
     pub id:               i64,
     pub name:             Option<String>,
-    pub details:          String,
     pub status:           StreamStatus,
     pub packet_tx:        broadcast::Sender<Bytes>,
     pub stats:            StatsCell,
@@ -107,8 +106,10 @@ pub enum CreateInputRequest {
         bind_host: Option<String>,  // Optional, defaults to "0.0.0.0"
         #[serde(default)]
         bind_port: Option<u16>,     // New field
+        #[serde(default)]
+        automatic_port: Option<bool>, // If true, automatically assign an available port
         name: Option<String>,
-        
+
         // Legacy fields for backward compatibility
         #[serde(skip_serializing_if = "Option::is_none")]
         listen_port: Option<u16>,  // Deprecated, use bind_port
@@ -128,12 +129,14 @@ pub enum SrtInputConfig {
     Listener {
         // New naming scheme
         #[serde(default)]
-        bind_host: Option<String>,  // Optional, defaults to "0.0.0.0" 
+        bind_host: Option<String>,  // Optional, defaults to "0.0.0.0"
         #[serde(default)]
         bind_port: Option<u16>,     // New field
+        #[serde(default)]
+        automatic_port: Option<bool>, // If true, automatically assign an available port
         #[serde(flatten)]
         common: SrtCommonConfig,
-        
+
         // Legacy fields for backward compatibility
         #[serde(skip_serializing_if = "Option::is_none")]
         listen_port: Option<u16>,  // Deprecated, use bind_port
@@ -165,8 +168,10 @@ pub enum CreateOutputRequest {
         remote_host: Option<String>, // New field
         #[serde(default)]
         remote_port: Option<u16>,    // New field
+        #[serde(default)]
+        automatic_port: Option<bool>, // If true, automatically assign an available port
         name: Option<String>,
-        
+
         // Legacy fields for backward compatibility
         #[serde(skip_serializing_if = "Option::is_none")]
         destination_addr: Option<String>, // Deprecated, use remote_host:remote_port
@@ -190,9 +195,11 @@ pub enum SrtOutputConfig {
         bind_host: Option<String>,  // Optional, defaults to "0.0.0.0"
         #[serde(default)]
         bind_port: Option<u16>,     // New field
+        #[serde(default)]
+        automatic_port: Option<bool>, // If true, automatically assign an available port
         #[serde(flatten)]
         common: SrtCommonConfig,
-        
+
         // Legacy fields for backward compatibility
         #[serde(skip_serializing_if = "Option::is_none")]
         listen_port: Option<u16>,  // Deprecated, use bind_port
@@ -228,8 +235,8 @@ pub struct DeleteOutputRequest {
 pub struct InputResponse {
     pub id: i64,
     pub name: Option<String>,
-    pub details: String,
     pub status: String,
+    pub assigned_port: Option<u16>, // Port assigned automatically or specified
     pub outputs: Vec<OutputResponse>, // Lista de outputs asociados
     pub uptime_seconds: Option<u64>, // Uptime in seconds, None if stopped
 }
@@ -242,6 +249,7 @@ pub struct OutputResponse {
     pub destination: String,
     pub output_type: String, // "UDP" o "SRT Caller"
     pub status: String,
+    pub assigned_port: Option<u16>, // Port assigned automatically or specified
     pub uptime_seconds: Option<u64>, // Uptime in seconds, None if stopped
 }
 
@@ -250,9 +258,9 @@ pub struct OutputResponse {
 pub struct InputListResponse {
     pub id: i64,
     pub name: Option<String>,
-    pub details: String,
     pub input_type: String, // "UDP", "SRT Listener", "SRT Caller"
     pub status: String,
+    pub assigned_port: Option<u16>, // Port assigned automatically or specified
     pub output_count: usize, // Número de outputs asociados
     pub uptime_seconds: Option<u64>, // Uptime in seconds, None if stopped
 }
@@ -261,9 +269,9 @@ pub struct InputListResponse {
 pub struct InputDetailResponse {
     pub id: i64,
     pub name: Option<String>,
-    pub details: String,
     pub input_type: String,
     pub status: String,
+    pub assigned_port: Option<u16>, // Port assigned automatically or specified
     pub outputs: Vec<OutputDetailResponse>,
     pub uptime_seconds: Option<u64>, // Uptime in seconds, None if stopped
 }
@@ -276,6 +284,7 @@ pub struct OutputDetailResponse {
     pub destination: String,
     pub output_type: String,
     pub status: String,
+    pub assigned_port: Option<u16>, // Port assigned automatically or specified
     pub config: Option<String>, // JSON config if needed
     pub uptime_seconds: Option<u64>, // Uptime in seconds, None if stopped
 }
@@ -289,6 +298,7 @@ pub struct OutputListResponse {
     pub destination: String,
     pub output_type: String,
     pub status: String,
+    pub assigned_port: Option<u16>, // Port assigned automatically or specified
     pub uptime_seconds: Option<u64>, // Uptime in seconds, None if stopped
 }
 
@@ -351,7 +361,6 @@ pub struct InputRow {
     pub name:        Option<String>,
     pub kind:        String,     // "udp", "srt_listener", "srt_caller"
     pub config_json: String,
-    pub details:     String,
     pub status:      String,     // "running", "stopped"
 }
 
@@ -397,6 +406,25 @@ pub fn input_type_display_string(kind: &str) -> &'static str {
 // Helper functions for backward compatibility and field extraction
 
 impl CreateInputRequest {
+    /// Check if automatic port assignment is requested
+    pub fn is_automatic_port(&self) -> bool {
+        match self {
+            CreateInputRequest::Udp { automatic_port, bind_port, listen_port, .. } => {
+                // If automatic_port is explicitly set to true, use auto port
+                if automatic_port == &Some(true) {
+                    return true;
+                }
+                // If automatic_port is explicitly false, use specified ports
+                if automatic_port == &Some(false) {
+                    return false;
+                }
+                // If automatic_port is None, check port values (0 or None means auto)
+                crate::port_utils::should_use_auto_port_input(*bind_port, *listen_port)
+            },
+            CreateInputRequest::Srt { config, .. } => config.is_automatic_port(),
+        }
+    }
+
     /// Get the effective bind port, handling backward compatibility
     pub fn get_bind_port(&self) -> u16 {
         match self {
@@ -436,6 +464,25 @@ impl CreateInputRequest {
 }
 
 impl SrtInputConfig {
+    /// Check if automatic port assignment is requested
+    pub fn is_automatic_port(&self) -> bool {
+        match self {
+            SrtInputConfig::Listener { automatic_port, bind_port, listen_port, .. } => {
+                // If automatic_port is explicitly set to true, use auto port
+                if automatic_port == &Some(true) {
+                    return true;
+                }
+                // If automatic_port is explicitly false, use specified ports
+                if automatic_port == &Some(false) {
+                    return false;
+                }
+                // If automatic_port is None, check port values (0 or None means auto)
+                crate::port_utils::should_use_auto_port_input(*bind_port, *listen_port)
+            },
+            SrtInputConfig::Caller { .. } => false, // Callers never need auto port assignment
+        }
+    }
+
     /// Get the effective bind port for SRT config
     pub fn get_bind_port(&self) -> u16 {
         match self {
@@ -503,6 +550,25 @@ impl SrtInputConfig {
 }
 
 impl CreateOutputRequest {
+    /// Check if automatic port assignment is requested
+    pub fn is_automatic_port(&self) -> bool {
+        match self {
+            CreateOutputRequest::Udp { automatic_port, remote_port, destination_addr, .. } => {
+                // If automatic_port is explicitly set to true, use auto port
+                if automatic_port == &Some(true) {
+                    return true;
+                }
+                // If automatic_port is explicitly false, use specified ports
+                if automatic_port == &Some(false) {
+                    return false;
+                }
+                // If automatic_port is None, check port values
+                crate::port_utils::should_use_auto_port_output(*remote_port, None, destination_addr.as_ref())
+            },
+            CreateOutputRequest::Srt { config, .. } => config.is_automatic_port(),
+        }
+    }
+
     /// Get the effective remote host
     pub fn get_remote_host(&self) -> Option<String> {
         match self {
@@ -563,6 +629,26 @@ impl CreateOutputRequest {
 }
 
 impl SrtOutputConfig {
+    /// Check if automatic port assignment is requested
+    pub fn is_automatic_port(&self) -> bool {
+        match self {
+            SrtOutputConfig::Listener { automatic_port, bind_port, listen_port, .. } => {
+                // If automatic_port is explicitly set to true, use auto port
+                if automatic_port == &Some(true) {
+                    return true;
+                }
+                // If automatic_port is explicitly false, use specified ports
+                if automatic_port == &Some(false) {
+                    return false;
+                }
+                // If automatic_port is None, check port values
+                crate::port_utils::should_use_auto_port_output(None, *bind_port, None) ||
+                crate::port_utils::should_use_auto_port_input(*bind_port, *listen_port)
+            },
+            SrtOutputConfig::Caller { .. } => false, // Callers connect to existing listeners, don't need auto port
+        }
+    }
+
     /// Get remote host for SRT output
     pub fn get_remote_host(&self) -> Option<String> {
         match self {
@@ -703,6 +789,62 @@ pub enum StateChange {
 // Type alias for the state change sender
 pub type StateChangeSender = mpsc::UnboundedSender<StateChange>;
 pub type StateChangeReceiver = mpsc::UnboundedReceiver<StateChange>;
+
+// Helper functions to extract ports from configuration JSON
+impl CreateInputRequest {
+    /// Extract the assigned port from a stored input configuration
+    pub fn extract_assigned_port(&self) -> Option<u16> {
+        match self {
+            CreateInputRequest::Udp { bind_port, listen_port, .. } => {
+                // Prefer listen_port for backward compatibility, then bind_port
+                listen_port.or(*bind_port).filter(|&p| p != 0)
+            },
+            CreateInputRequest::Srt { config, .. } => config.extract_assigned_port(),
+        }
+    }
+}
+
+impl SrtInputConfig {
+    /// Extract the assigned port from SRT input configuration
+    pub fn extract_assigned_port(&self) -> Option<u16> {
+        match self {
+            SrtInputConfig::Listener { bind_port, listen_port, .. } => {
+                // Prefer listen_port for backward compatibility, then bind_port
+                listen_port.or(*bind_port).filter(|&p| p != 0)
+            },
+            SrtInputConfig::Caller { .. } => None, // Callers don't bind ports
+        }
+    }
+}
+
+impl CreateOutputRequest {
+    /// Extract the assigned port from a stored output configuration
+    pub fn extract_assigned_port(&self) -> Option<u16> {
+        match self {
+            CreateOutputRequest::Udp { remote_port, .. } => {
+                // UDP outputs use remote port
+                remote_port.filter(|&p| p != 0)
+            },
+            CreateOutputRequest::Srt { config, .. } => config.extract_assigned_port(),
+        }
+    }
+}
+
+impl SrtOutputConfig {
+    /// Extract the assigned port from SRT output configuration
+    pub fn extract_assigned_port(&self) -> Option<u16> {
+        match self {
+            SrtOutputConfig::Listener { bind_port, listen_port, .. } => {
+                // SRT listener outputs bind to ports
+                listen_port.or(*bind_port).filter(|&p| p != 0)
+            },
+            SrtOutputConfig::Caller { remote_port, .. } => {
+                // SRT caller outputs connect to remote ports
+                remote_port.filter(|&p| p != 0)
+            },
+        }
+    }
+}
 
 // MPEG-TS Analysis types and structures
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

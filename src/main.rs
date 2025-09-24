@@ -4,6 +4,8 @@ use actix_web::{web, App, HttpServer};
 use tokio::signal;
 mod analysis;
 mod api;
+mod config;
+mod port_utils;
 mod udp_stream;
 mod models;
 mod srt_stream;

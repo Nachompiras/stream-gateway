@@ -78,6 +78,7 @@ pub async fn create_udp_output(
             input_id,
             remote_host: None,
             remote_port: None,
+            automatic_port: None,
             name: final_name,
             destination_addr: Some(destination_addr),
         },
@@ -90,7 +91,6 @@ pub async fn create_udp_output(
 pub fn spawn_udp_input_with_stats(
     id: i64,
     name: Option<String>,
-    details: String,
     listen_port: u16,
     state_tx: Option<StateChangeSender>,
 ) -> Result<InputInfo, actix_web::Error> {
@@ -213,14 +213,14 @@ pub fn spawn_udp_input_with_stats(
     Ok(InputInfo {
         id,
         name: name.clone(),
-        details,
         status: StreamStatus::Listening, // Start in listening state, will change to connected on first packet
         packet_tx: tx,
         stats,
         task_handle: Some(handle),
-        config: CreateInputRequest::Udp { 
+        config: CreateInputRequest::Udp {
             bind_host: None,
             bind_port: None,
+            automatic_port: None,
             name,
             listen_port: Some(listen_port)
         },

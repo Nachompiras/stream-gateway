@@ -32,21 +32,19 @@ pub async fn save_input_to_db(
     pool: &SqlitePool,
     name: Option<&str>,
     request: &CreateInputRequest,
-    details: &str,
 ) -> Result<i64> {
     let kind = input_kind_string(request);
     let config_json = serde_json::to_string(request)?;
-    
+
     let result = sqlx::query(
-        "INSERT INTO inputs (name, kind, config_json, details, status) VALUES (?, ?, ?, ?, 'listening')"
+        "INSERT INTO inputs (name, kind, config_json, status) VALUES (?, ?, ?, 'listening')"
     )
     .bind(name)
     .bind(kind)
     .bind(config_json)
-    .bind(details)
     .execute(pool)
     .await?;
-    
+
     Ok(result.last_insert_rowid())
 }
 
@@ -100,7 +98,7 @@ pub async fn delete_output_from_db(pool: &SqlitePool, id: i64) -> Result<()> {
 }
 
 pub async fn get_all_inputs(pool: &SqlitePool) -> Result<Vec<InputRow>> {
-    let rows = sqlx::query_as::<_, InputRow>("SELECT id, name, kind, config_json, details, status FROM inputs")
+    let rows = sqlx::query_as::<_, InputRow>("SELECT id, name, kind, config_json, status FROM inputs")
         .fetch_all(pool)
         .await?;
 
@@ -161,7 +159,7 @@ pub async fn check_port_conflict(
 
 pub async fn get_input_by_id(pool: &SqlitePool, input_id: i64) -> Result<Option<InputRow>> {
     let row = sqlx::query_as::<_, InputRow>(
-        "SELECT id, name, kind, config_json, details FROM inputs WHERE id = ?"
+        "SELECT id, name, kind, config_json, status FROM inputs WHERE id = ?"
     )
     .bind(input_id)
     .fetch_optional(pool)
