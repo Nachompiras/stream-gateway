@@ -12,10 +12,14 @@ use std::io;
 pub fn spawn_srt_output(
     mut sink: Box<dyn SrtSink>,
     mut rx:   broadcast::Receiver<Bytes>,
-) -> (AbortHandle, JoinHandle<()>) {
+) -> (AbortHandle, JoinHandle<()>, StatsCell) {
 
     // (abort_handle, reg) para poder cancelar desde la API
     let (abort_handle, reg) = AbortHandle::new_pair();
+
+    let stats_cell: StatsCell = Arc::new(RwLock::new(None));
+
+    let stats_clone  = stats_cell.clone();
 
     let handle = tokio::spawn(
         Abortable::new(async move {
@@ -29,6 +33,9 @@ pub fn spawn_srt_output(
                         continue;
                     }
                 };
+                
+                // para refrescar stats cada segundo sin segunda tarea
+                let mut next_stats = Instant::now();
 
                 // 2) Bucle de envío
                 loop {
@@ -42,6 +49,14 @@ pub fn spawn_srt_output(
                         Err(broadcast::error::RecvError::Closed) => return,
                         Err(broadcast::error::RecvError::Lagged(_)) => continue,
                     }
+
+                    if next_stats.elapsed() >= Duration::from_secs(1) {
+                        if let Ok(s) = sock.socket.srt_bistats(0, 1) {
+                            println!("Output: SRT stats: {s:?}");
+                            *stats_clone.write().await = Some(InputStats::Srt(Box::new(s)));
+                        }
+                        next_stats = Instant::now();
+                    }
                 }
                 sleep(Duration::from_secs(2)).await;
             }
@@ -49,7 +64,7 @@ pub fn spawn_srt_output(
         .map(|_| ())
     );
 
-    (abort_handle, handle)
+    (abort_handle, handle, stats_cell)
 }
 
 pub fn create_srt_output(
@@ -64,15 +79,20 @@ pub fn create_srt_output(
     println!("Creando output SRT con config: {:?}", cfg);
 
     let rx = input.packet_tx.subscribe();
-    let (abort_handle, _) = spawn_srt_output(Box::new(cfg.clone()), rx);
+    let (abort_handle, _, stats) = spawn_srt_output(Box::new(cfg.clone()), rx);
 
     println!("Output SRT creado con config: {:?}", cfg);
 
     let (auto_name, destination) = match &cfg {
-        SrtOutputConfig::Caller { destination_addr, .. } =>
-            (Some(format!("SRT Caller to {}", destination_addr)), destination_addr.clone()),
-        SrtOutputConfig::Listener { listen_port, .. } =>
-            (Some(format!("SRT Listener on {}", listen_port)), format!(":{}", listen_port)),
+        SrtOutputConfig::Caller { .. } => {
+            let host = cfg.get_remote_host().unwrap_or_else(|| "unknown".to_string());
+            let port = cfg.get_remote_port().unwrap_or(0);
+            (Some(format!("SRT Caller to {}:{}", host, port)), format!("{}:{}", host, port))
+        },
+        SrtOutputConfig::Listener { .. } => {
+            let port = cfg.get_bind_port().unwrap_or(0);
+            (Some(format!("SRT Listener on {}", port)), format!(":{}", port))
+        },
     };
     let final_name = name.or(auto_name);
     println!("Output SRT destino: {}", destination);
@@ -87,7 +107,7 @@ pub fn create_srt_output(
         },
         status: StreamStatus::Connecting, // SRT outputs start in connecting state
         destination,
-        stats: Arc::new(RwLock::new(None)),
+        stats,
         abort_handle: Some(abort_handle),
         config: CreateOutputRequest::Srt {
             input_id,
@@ -115,7 +135,7 @@ impl SrtSource for SrtSourceWithState {
     async fn get_socket(&mut self) -> io::Result<SrtAsyncStream> {
         match &self.config {
             //-------------------------------------------------- LISTENER
-            SrtInputConfig::Listener { listen_port, common } => {
+            SrtInputConfig::Listener { common, .. } => {
                 // Notify listening state
                 if let Some(ref tx) = self.state_tx {
                     let _ = tx.send(StateChange::InputStateChanged {
@@ -125,7 +145,9 @@ impl SrtSource for SrtSourceWithState {
                     });
                 }
 
-                let addr = format!("0.0.0.0:{listen_port}");
+                let host = self.config.get_bind_host();
+                let port = self.config.get_bind_port();
+                let addr = format!("{}:{}", host, port);
                 println!("SRT listener ► esperando conexiones en {addr}");
 
                 // 1) builder asíncrono  (¡no bloquea!)
@@ -151,7 +173,7 @@ impl SrtSource for SrtSourceWithState {
 
             //-------------------------------------------------- CALLER
             // (caller podía quedarse como estaba – ya no bloquea)
-            SrtInputConfig::Caller { target_addr, common } => {
+            SrtInputConfig::Caller { common, .. } => {
                 // Notify connecting state for callers
                 if let Some(ref tx) = self.state_tx {
                     let _ = tx.send(StateChange::InputStateChanged {
@@ -161,7 +183,9 @@ impl SrtSource for SrtSourceWithState {
                     });
                 }
 
-                let addr = target_addr.clone();
+                let host = self.config.get_remote_host().unwrap_or_else(|| "127.0.0.1".to_string());
+                let port = self.config.get_remote_port().unwrap_or(8000);
+                let addr = format!("{}:{}", host, port);
                 let stream_async = common
                     .async_builder()
                     .connect(&addr)?
@@ -180,12 +204,17 @@ impl SrtSource for SrtInputConfig {
     async fn get_socket(&mut self) -> io::Result<SrtAsyncStream> {
         match self {
             //-------------------------------------------------- LISTENER
-            SrtInputConfig::Listener { listen_port, common } => {
-                let addr = format!("0.0.0.0:{listen_port}");
+            SrtInputConfig::Listener { .. } => {
+                let host = self.get_bind_host();
+                let port = self.get_bind_port();
+                let addr = format!("{}:{}", host, port);
                 println!("SRT listener ► esperando conexiones en {addr}");
 
                 // 1) builder asíncrono  (¡no bloquea!)
-                let listener = common
+                let listener = match self {
+                    SrtInputConfig::Listener { common, .. } => common,
+                    _ => unreachable!(),
+                }
                     .async_builder()// <───
                     .listen(&addr, 2, None)   // callback = None
                     .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
@@ -207,9 +236,14 @@ impl SrtSource for SrtInputConfig {
 
             //-------------------------------------------------- CALLER
             // (caller podía quedarse como estaba – ya no bloquea)
-            SrtInputConfig::Caller { target_addr, common } => {
-                let addr = target_addr.clone();
-                let stream_async = common
+            SrtInputConfig::Caller { .. } => {
+                let host = self.get_remote_host().unwrap_or_else(|| "127.0.0.1".to_string());
+                let port = self.get_remote_port().unwrap_or(8000);
+                let addr = format!("{}:{}", host, port);
+                let stream_async = match self {
+                    SrtInputConfig::Caller { common, .. } => common,
+                    _ => unreachable!(),
+                }
                     .async_builder()
                     .connect(&addr)?
                     .await
@@ -227,12 +261,17 @@ impl SrtSink for SrtOutputConfig {
     async fn get_socket(&mut self) -> io::Result<SrtStream> {
         match self {
             /* ---------------- SRT CALLER ---------------- */
-            SrtOutputConfig::Caller { destination_addr, common, .. } => {
+            SrtOutputConfig::Caller { .. } => {
                 // connect() es sincrónico → spawn_blocking
-                let addr = destination_addr.clone();
-                let common = common.clone();
+                let host = self.get_remote_host().unwrap_or_else(|| "127.0.0.1".to_string());
+                let port = self.get_remote_port().unwrap_or(8000);
+                let addr = format!("{}:{}", host, port);
+                let common_clone = match self {
+                    SrtOutputConfig::Caller { common, .. } => common.clone(),
+                    _ => unreachable!(),
+                };
                 tokio::task::spawn_blocking(move || {
-                    let builder = common.builder();
+                    let builder = common_clone.builder();
                     let caller = builder
                             .connect(&addr)
                             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
@@ -244,8 +283,10 @@ impl SrtSink for SrtOutputConfig {
             }
 
             /* --------------- SRT LISTENER ---------------- */
-            SrtOutputConfig::Listener { listen_port, common, .. } => {
-                let bind = format!("0.0.0.0:{listen_port}");
+            SrtOutputConfig::Listener { .. } => {
+                let host = self.get_bind_host().unwrap_or_else(|| "0.0.0.0".to_string());
+                let port = self.get_bind_port().unwrap_or(8000);
+                let bind = format!("{}:{}", host, port);
                 // Creas (o reutilizas) un listener y aceptas 1 peer.
                 // Guardamos el listener en Option para re-usar el puerto.
                 // if common.__listener.is_none() {
@@ -256,7 +297,10 @@ impl SrtSink for SrtOutputConfig {
                 // // accept() es async (ya no bloquea hilo)
                 // let (s, peer) = common.__listener.as_ref().unwrap()
                 //                    .accept().await?;
-                let builder = common.builder();
+                let builder = match self {
+                    SrtOutputConfig::Listener { common, .. } => common,
+                    _ => unreachable!(),
+                }.builder();
                 let lst = builder.listen(&bind, 2)
                             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
                 println!("output listener ► esperando conexiones en {}", bind);
@@ -337,7 +381,7 @@ impl Forwarder {
                     if next_stats.elapsed() >= Duration::from_secs(1) {
                         if let Ok(s) = sock.socket.srt_bistats(0, 1) {
                             //println!("Forwarder: SRT stats: {s:?}");
-                            *stats_clone.write().await = Some(InputStats::Srt(s));
+                            *stats_clone.write().await = Some(InputStats::Srt(Box::new(s)));
                         }
                         next_stats = Instant::now();
                     }
@@ -356,7 +400,8 @@ impl Forwarder {
                             println!("Forwarder: error recv(): {e}");
                             break;
                         }
-                    }                }
+                    }                
+                }
 
                 // Notify reconnecting state when connection breaks
                 if let Some(ref tx) = state_tx_clone {

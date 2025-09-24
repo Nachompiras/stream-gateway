@@ -95,7 +95,19 @@ The HTTP server will start on `http://127.0.0.1:8080`
 
 ### **Basic Usage Example**
 
-1. **Create an SRT Listener Input**:
+1. **Create an SRT Listener Input (New Format)**:
+```bash
+curl -X POST -H "Content-Type: application/json" \
+  -d '{
+    "type": "srt",
+    "mode": "listener",
+    "bind_port": 9000,
+    "latency_ms": 120,
+    "name": "TV Channel 1"
+  }' http://127.0.0.1:8080/inputs
+```
+
+1b. **Create an SRT Listener Input (Legacy Format - Still Works)**:
 ```bash
 curl -X POST -H "Content-Type: application/json" \
   -d '{
@@ -107,7 +119,19 @@ curl -X POST -H "Content-Type: application/json" \
   }' http://127.0.0.1:8080/inputs
 ```
 
-2. **Create a UDP Output for the Input**:
+2. **Create a UDP Output for the Input (New Format)**:
+```bash
+curl -X POST -H "Content-Type: application/json" \
+  -d '{
+    "type": "udp",
+    "input_id": 1,
+    "remote_host": "127.0.0.1",
+    "remote_port": 5002,
+    "name": "TV Channel 1 Backup"
+  }' http://127.0.0.1:8080/outputs
+```
+
+2b. **Create a UDP Output for the Input (Legacy Format - Still Works)**:
 ```bash
 curl -X POST -H "Content-Type: application/json" \
   -d '{
@@ -134,8 +158,19 @@ curl http://127.0.0.1:8080/status
 - `latency_ms`: SRT latency in milliseconds
 - `stream_id`: SRT stream identifier
 - `passphrase`: SRT encryption passphrase
-- `listen_port`: Port for SRT listener mode
-- `target_addr`: Target address for SRT caller mode
+
+#### **New Consistent Naming (Recommended)**
+- `bind_host`: Host address to bind to for listeners (optional, defaults to "0.0.0.0")
+- `bind_port`: Port to bind to for listeners
+- `remote_host`: Target host address for callers
+- `remote_port`: Target port for callers
+
+#### **Legacy Naming (Still Supported)**
+- `listen_port`: Port for SRT listener mode (use `bind_port` instead)
+- `target_addr`: Target address for SRT caller mode in "host:port" format (use `remote_host` + `remote_port` instead)
+- `destination_addr`: Destination address for outputs in "host:port" format (use `remote_host` + `remote_port` instead)
+
+> **Migration Note**: The API now supports consistent `host` + `port` naming for better clarity and flexibility. All legacy field names continue to work for backward compatibility. The system automatically handles both formats through the compatibility layer.
 
 ## 📊 Stream Types
 
@@ -223,6 +258,18 @@ cargo audit
 All inputs and outputs support optional custom naming for better organization:
 
 ### **Named UDP Input Example**
+
+**New Format (Recommended):**
+```bash
+curl -X POST -H "Content-Type: application/json" \
+  -d '{
+    "type": "udp",
+    "bind_port": 5000,
+    "name": "TV mas"
+  }' http://127.0.0.1:8080/inputs
+```
+
+**Legacy Format (Still Supported):**
 ```bash
 curl -X POST -H "Content-Type: application/json" \
   -d '{
@@ -233,6 +280,31 @@ curl -X POST -H "Content-Type: application/json" \
 ```
 
 ### **Named Outputs Example**
+
+**New Format (Recommended):**
+```bash
+# Primary output
+curl -X POST -H "Content-Type: application/json" \
+  -d '{
+    "type": "udp",
+    "input_id": 1,
+    "remote_host": "127.0.0.1",
+    "remote_port": 8001,
+    "name": "TV mas principal"
+  }' http://127.0.0.1:8080/outputs
+
+# Backup output
+curl -X POST -H "Content-Type: application/json" \
+  -d '{
+    "type": "udp",
+    "input_id": 1,
+    "remote_host": "127.0.0.1",
+    "remote_port": 8002,
+    "name": "TV mas backup"
+  }' http://127.0.0.1:8080/outputs
+```
+
+**Legacy Format (Still Supported):**
 ```bash
 # Primary output
 curl -X POST -H "Content-Type: application/json" \
@@ -290,6 +362,23 @@ curl http://127.0.0.1:8080/status
 ## 📝 API Examples
 
 ### **Create SRT Caller Input**
+
+**New Format (Recommended):**
+```bash
+curl -X POST -H "Content-Type: application/json" \
+  -d '{
+    "type": "srt",
+    "mode": "caller",
+    "remote_host": "192.168.1.100",
+    "remote_port": 9000,
+    "stream_id": "live_stream",
+    "latency_ms": 200,
+    "passphrase": "secret_key",
+    "name": "Remote Studio Feed"
+  }' http://127.0.0.1:8080/inputs
+```
+
+**Legacy Format (Still Supported):**
 ```bash
 curl -X POST -H "Content-Type: application/json" \
   -d '{
@@ -304,6 +393,21 @@ curl -X POST -H "Content-Type: application/json" \
 ```
 
 ### **Create SRT Listener Output**
+
+**New Format (Recommended):**
+```bash
+curl -X POST -H "Content-Type: application/json" \
+  -d '{
+    "type": "srt",
+    "mode": "listener",
+    "input_id": 1,
+    "bind_port": 8000,
+    "latency_ms": 120,
+    "name": "Primary Distribution"
+  }' http://127.0.0.1:8080/outputs
+```
+
+**Legacy Format (Still Supported):**
 ```bash
 curl -X POST -H "Content-Type: application/json" \
   -d '{

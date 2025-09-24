@@ -26,11 +26,10 @@ pub fn spawn_output_sender(
         let sock = UdpSocket::bind("0.0.0.0:0")
             .await
             .expect("bind local udp"); // no debería fallar
-        let mut buf = Bytes::new();
         loop {
             match packet_rx.recv().await {
                 Ok(bytes) => {
-                    buf = bytes;
+                    let buf = bytes;
                     let _ = sock.send_to(&buf, dest_addr).await;
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
@@ -77,8 +76,10 @@ pub async fn create_udp_output(
         abort_handle: Some(abort_handle),
         config: CreateOutputRequest::Udp {
             input_id,
-            destination_addr,
+            remote_host: None,
+            remote_port: None,
             name: final_name,
+            destination_addr: Some(destination_addr),
         },
         started_at: Some(std::time::SystemTime::now()),
         connected_at: Some(std::time::SystemTime::now()), // UDP outputs are immediately connected
@@ -217,7 +218,12 @@ pub fn spawn_udp_input_with_stats(
         packet_tx: tx,
         stats,
         task_handle: Some(handle),
-        config: CreateInputRequest::Udp { listen_port, name },
+        config: CreateInputRequest::Udp { 
+            bind_host: None,
+            bind_port: None,
+            name,
+            listen_port: Some(listen_port)
+        },
         output_tasks: std::collections::HashMap::new(),
         stopped_outputs: std::collections::HashMap::new(),
         analysis_tasks: std::collections::HashMap::new(),

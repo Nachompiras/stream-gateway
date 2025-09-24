@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 use anyhow::{Result, anyhow};
-use log::{info, warn, error};
+use log::{info, error};
 
 use crate::models::*;
 use crate::{ACTIVE_STREAMS, STATE_CHANGE_TX};
@@ -23,7 +23,7 @@ pub async fn start_input(input_id: i64) -> Result<()> {
 
     // Recreate the input task based on the stored config
     match &input_info.config {
-        CreateInputRequest::Udp { listen_port, .. } => {
+        CreateInputRequest::Udp { .. } => {
             let state_tx = input_info.state_tx.clone().or_else(|| {
                 // If no state_tx, try to get the global one
                 tokio::task::block_in_place(|| {
@@ -33,11 +33,12 @@ pub async fn start_input(input_id: i64) -> Result<()> {
                 })
             });
 
+            let port = input_info.config.get_bind_port();
             let new_input_info = spawn_udp_input_with_stats(
                 input_info.id,
                 input_info.name.clone(),
                 input_info.details.clone(),
-                *listen_port,
+                port,
                 state_tx,
             ).map_err(|e| anyhow::anyhow!("Failed to spawn UDP input: {}", e))?;
 
@@ -143,8 +144,7 @@ pub async fn stop_input(input_id: i64) -> Result<()> {
     input_info.stopped_outputs.extend(outputs_to_stop);
 
     // Pause active analysis
-    let active_analysis: Vec<AnalysisType> = input_info.analysis_tasks.iter()
-        .map(|(_, info)| info.analysis_type.clone())
+    let active_analysis: Vec<AnalysisType> = input_info.analysis_tasks.values().map(|info| info.analysis_type.clone())
         .collect();
 
     for analysis_type in active_analysis {
@@ -181,9 +181,9 @@ pub async fn start_output(input_id: i64, output_id: i64) -> Result<()> {
     } else {
         // Check if it's already running
         if input_info.output_tasks.contains_key(&output_id) {
-            return Err(anyhow!("Output {} is already running", output_id));
+            Err(anyhow!("Output {} is already running", output_id))
         } else {
-            return Err(anyhow!("Output {} not found in input {}", output_id, input_id));
+            Err(anyhow!("Output {} not found in input {}", output_id, input_id))
         }
     }
 }
@@ -213,9 +213,9 @@ pub async fn stop_output(input_id: i64, output_id: i64) -> Result<()> {
     } else {
         // Check if it's already stopped
         if input_info.stopped_outputs.contains_key(&output_id) {
-            return Err(anyhow!("Output {} is already stopped", output_id));
+            Err(anyhow!("Output {} is already stopped", output_id))
         } else {
-            return Err(anyhow!("Output {} not found in input {}", output_id, input_id));
+            Err(anyhow!("Output {} not found in input {}", output_id, input_id))
         }
     }
 }
@@ -223,10 +223,15 @@ pub async fn stop_output(input_id: i64, output_id: i64) -> Result<()> {
 /// Internal helper to start an output with given config
 async fn start_output_internal(input_info: &mut InputInfo, output_id: i64, output_config: CreateOutputRequest) -> Result<()> {
     let output_info = match &output_config {
-        CreateOutputRequest::Udp { destination_addr, name, input_id, .. } => {
+        CreateOutputRequest::Udp { name, input_id, .. } => {
+            // Use helper methods to construct destination_addr
+            let host = output_config.get_remote_host().unwrap_or_else(|| "127.0.0.1".to_string());
+            let port = output_config.get_remote_port().unwrap_or(8000);
+            let destination_addr = format!("{}:{}", host, port);
+            
             create_udp_output(
                 *input_id,
-                destination_addr.clone(),
+                destination_addr,
                 input_info,
                 output_id,
                 name.clone(),

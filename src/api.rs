@@ -151,13 +151,25 @@ pub async fn create_output(
         }
     };
 
-    // Validation logic
+    // Validation logic - build destination string using new helper methods
     let (destination_addr, listen_port) = match &req_val {
-        CreateOutputRequest::Udp { destination_addr, .. } => (destination_addr.clone(), None),
+        CreateOutputRequest::Udp { .. } => {
+            // Use helper methods to get host and port, with fallbacks for legacy fields
+            let host = req_val.get_remote_host().unwrap_or_else(|| "127.0.0.1".to_string());
+            let port = req_val.get_remote_port().unwrap_or(8000);
+            (format!("{}:{}", host, port), None)
+        },
         CreateOutputRequest::Srt { config, .. } => {
             match config {
-                SrtOutputConfig::Caller { destination_addr, .. } => (destination_addr.clone(), None),
-                SrtOutputConfig::Listener { listen_port, .. } => (format!(":{}", listen_port), Some(*listen_port)),
+                SrtOutputConfig::Caller { .. } => {
+                    let host = config.get_remote_host().unwrap_or_else(|| "127.0.0.1".to_string());
+                    let port = config.get_remote_port().unwrap_or(8000);
+                    (format!("{}:{}", host, port), None)
+                },
+                SrtOutputConfig::Listener { .. } => {
+                    let port = config.get_bind_port().unwrap_or(8000);
+                    (format!(":{}", port), Some(port))
+                },
             }
         }
     };
@@ -206,10 +218,15 @@ pub async fn create_output(
                 SrtOutputConfig::Listener { .. } => "srt_listener",
             };
             let auto_name = match config {
-                SrtOutputConfig::Caller { destination_addr, .. } =>
-                    format!("SRT Caller to {}", destination_addr),
-                SrtOutputConfig::Listener { listen_port, .. } =>
-                    format!("SRT Listener on {}", listen_port),
+                SrtOutputConfig::Caller { .. } => {
+                    let host = config.get_remote_host().unwrap_or_else(|| "unknown".to_string());
+                    let port = config.get_remote_port().unwrap_or(0);
+                    format!("SRT Caller to {}:{}", host, port)
+                },
+                SrtOutputConfig::Listener { .. } => {
+                    let port = config.get_bind_port().unwrap_or(0);
+                    format!("SRT Listener on {}", port)
+                },
             };
             let final_name = user_name.clone().or(Some(auto_name));
             let config_json = Some(serde_json::to_string(config)
@@ -232,8 +249,10 @@ pub async fn create_output(
 
     // Create the output with the generated ID
     let output_info = match &req_val {
-        CreateOutputRequest::Udp { destination_addr, name: user_name, .. } =>
-            create_udp_output(input_id, destination_addr.clone(), input, output_id, user_name.clone(), get_state_change_sender().await).await?,
+        CreateOutputRequest::Udp { name: user_name, .. } => {
+            // Use the already computed destination_addr string
+            create_udp_output(input_id, destination_addr.clone(), input, output_id, user_name.clone(), get_state_change_sender().await).await?
+        },
 
         CreateOutputRequest::Srt { config, name: user_name, .. } =>
             create_srt_output(input_id, config.clone(), input, output_id, user_name.clone(), get_state_change_sender().await)?,
@@ -575,7 +594,12 @@ pub async fn load_from_db(state: &AppState) -> anyhow::Result<()> {
                         .as_u64()
                         .ok_or_else(|| anyhow::anyhow!("Missing listen_port in UDP config"))?
                         as u16;
-                    CreateInputRequest::Udp { listen_port, name: r.name.clone() }
+                    CreateInputRequest::Udp { 
+                        bind_host: None,
+                        bind_port: None,
+                        name: r.name.clone(),
+                        listen_port: Some(listen_port) // Legacy compatibility
+                    }
                 },
                 "srt_listener" | "srt_caller" => CreateInputRequest::Srt {
                     name: r.name.clone(),
@@ -620,7 +644,12 @@ pub async fn load_from_db(state: &AppState) -> anyhow::Result<()> {
                     .as_u64()
                     .ok_or_else(|| anyhow::anyhow!("Missing listen_port in UDP config"))?
                     as u16;
-                CreateInputRequest::Udp { listen_port, name: None }
+                CreateInputRequest::Udp { 
+                    bind_host: None,
+                    bind_port: None,
+                    name: None,
+                    listen_port: Some(listen_port) // Legacy compatibility
+                }
             },
             "srt_listener" => CreateInputRequest::Srt {
                 name: None,
@@ -655,7 +684,7 @@ pub async fn load_from_db(state: &AppState) -> anyhow::Result<()> {
     println!("Recreando outputs para inputs cargados...");
     // Group outputs by input_id
     for o in outs {
-        outputs_by_input.entry(o.input_id).or_insert(Vec::new()).push(o);
+        outputs_by_input.entry(o.input_id).or_default().push(o);
     }
 
     println!("Procesando outputs para cada input cargado...");
@@ -682,14 +711,18 @@ pub async fn load_from_db(state: &AppState) -> anyhow::Result<()> {
                     let output_config = match o.kind.as_str() {
                         "udp" => CreateOutputRequest::Udp {
                             input_id,
-                            destination_addr: destination.clone(),
+                            remote_host: None,
+                            remote_port: None,
                             name: o.name.clone(),
+                            destination_addr: Some(destination.clone()), // Legacy compatibility
                         },
                         "srt_caller" => {
                             let config_json = o.config_json.unwrap_or_default();
                             let config: SrtOutputConfig = serde_json::from_str(&config_json)
                                 .unwrap_or(SrtOutputConfig::Caller {
-                                    destination_addr: destination.clone(),
+                                    remote_host: None,
+                                    remote_port: None,
+                                    destination_addr: Some(destination.clone()), // Legacy compatibility
                                     common: SrtCommonConfig::default()
                                 });
                             CreateOutputRequest::Srt {
@@ -702,7 +735,9 @@ pub async fn load_from_db(state: &AppState) -> anyhow::Result<()> {
                             let config_json = o.config_json.unwrap_or_default();
                             let config: SrtOutputConfig = serde_json::from_str(&config_json)
                                 .unwrap_or(SrtOutputConfig::Listener {
-                                    listen_port: o.listen_port.unwrap_or(8000),
+                                    bind_host: None,
+                                    bind_port: None,
+                                    listen_port: Some(o.listen_port.unwrap_or(8000)), // Legacy compatibility
                                     common: SrtCommonConfig::default()
                                 });
                             CreateOutputRequest::Srt {
@@ -740,7 +775,12 @@ pub async fn load_from_db(state: &AppState) -> anyhow::Result<()> {
                         let cfg: SrtCommonConfig = serde_json::from_str(
                             o.config_json.as_deref().unwrap_or("{}")
                         )?;
-                        let output_config = SrtOutputConfig::Caller { destination_addr: destination.clone(), common: cfg };
+                        let output_config = SrtOutputConfig::Caller { 
+                            remote_host: None,
+                            remote_port: None,
+                            destination_addr: Some(destination.clone()), // Legacy compatibility
+                            common: cfg 
+                        };
                         match create_srt_output(input_id, output_config, input, o.id, o.name.clone(), get_state_change_sender().await) {
                             Ok(output_info) => {
                                 input.output_tasks.insert(o.id, output_info);
@@ -759,7 +799,12 @@ pub async fn load_from_db(state: &AppState) -> anyhow::Result<()> {
                             None => return Err(anyhow::anyhow!("Missing listen_port for SRT Listener output {}", o.id)),
                         };
 
-                        let output_config = SrtOutputConfig::Listener { listen_port, common: cfg };
+                        let output_config = SrtOutputConfig::Listener { 
+                            bind_host: None,
+                            bind_port: None,
+                            listen_port: Some(listen_port), // Legacy compatibility
+                            common: cfg 
+                        };
 
                         let output_info = match create_srt_output(input_id, output_config, input, o.id, o.name.clone(), get_state_change_sender().await) {
                             Ok(_) => {
@@ -808,15 +853,21 @@ fn get_name_from_request(req: &CreateInputRequest) -> Option<String> {
 
 fn generate_input_name_and_details(req: &CreateInputRequest) -> (Option<String>, String) {
     match req {
-        CreateInputRequest::Udp { listen_port, .. } => {
-            (Some(format!("UDP Listener {listen_port}")), format!("UDP Listener on port {listen_port}"))
+        CreateInputRequest::Udp { .. } => {
+            let port = req.get_bind_port();
+            (Some(format!("UDP Listener {port}")), format!("UDP Listener on port {port}"))
         }
         CreateInputRequest::Srt { config, .. } => {
             let name = match config {
-                SrtInputConfig::Listener { listen_port, .. } =>
-                    format!("SRT Listener {listen_port}"),
-                SrtInputConfig::Caller { target_addr, .. } =>
-                    format!("SRT Caller {}", target_addr),
+                SrtInputConfig::Listener { .. } => {
+                    let port = config.get_bind_port();
+                    format!("SRT Listener {port}")
+                },
+                SrtInputConfig::Caller { .. } => {
+                    let host = config.get_remote_host().unwrap_or_else(|| "unknown".to_string());
+                    let port = config.get_remote_port().unwrap_or(0);
+                    format!("SRT Caller {}:{}", host, port)
+                },
             };
             (Some(name), format!("{:?}", config))
         }
@@ -826,8 +877,9 @@ fn generate_input_name_and_details(req: &CreateInputRequest) -> (Option<String>,
 async fn spawn_input(req: CreateInputRequest, id: i64, name: Option<String>, details: String) -> Result<InputInfo, actix_web::Error> {
     match req {
         /* ----------------------------- UDP ----------------------------- */
-        CreateInputRequest::Udp { listen_port, .. } => {
-            spawn_udp_input_with_stats(id, name, details, listen_port, get_state_change_sender().await)
+        CreateInputRequest::Udp { .. } => {
+            let port = req.get_bind_port();
+            spawn_udp_input_with_stats(id, name, details, port, get_state_change_sender().await)
         }
 
         /* ----------------------- SRT  (caller o listener) -------------- */

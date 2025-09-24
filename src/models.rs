@@ -102,8 +102,16 @@ impl SrtCommonConfig {
 pub enum CreateInputRequest {
     #[serde(rename = "udp")]
     Udp {
-        listen_port: u16,
+        // New naming scheme
+        #[serde(default)]
+        bind_host: Option<String>,  // Optional, defaults to "0.0.0.0"
+        #[serde(default)]
+        bind_port: Option<u16>,     // New field
         name: Option<String>,
+        
+        // Legacy fields for backward compatibility
+        #[serde(skip_serializing_if = "Option::is_none")]
+        listen_port: Option<u16>,  // Deprecated, use bind_port
     },
     #[serde(rename = "srt")]
     Srt {
@@ -118,15 +126,31 @@ pub enum CreateInputRequest {
 pub enum SrtInputConfig {
     #[serde(rename = "listener")]
     Listener {
-        listen_port: u16,
+        // New naming scheme
+        #[serde(default)]
+        bind_host: Option<String>,  // Optional, defaults to "0.0.0.0" 
+        #[serde(default)]
+        bind_port: Option<u16>,     // New field
         #[serde(flatten)]
         common: SrtCommonConfig,
+        
+        // Legacy fields for backward compatibility
+        #[serde(skip_serializing_if = "Option::is_none")]
+        listen_port: Option<u16>,  // Deprecated, use bind_port
     },
     #[serde(rename = "caller")]
     Caller {
-        target_addr: String,
+        // New naming scheme
+        #[serde(default)]
+        remote_host: Option<String>, // New field
+        #[serde(default)]
+        remote_port: Option<u16>,    // New field
         #[serde(flatten)]
         common: SrtCommonConfig,
+        
+        // Legacy fields for backward compatibility
+        #[serde(skip_serializing_if = "Option::is_none")]
+        target_addr: Option<String>,  // Deprecated, use remote_host:remote_port
     },
 }
 
@@ -136,8 +160,16 @@ pub enum CreateOutputRequest {
     #[serde(rename = "udp")]
     Udp {
         input_id: i64,            // ID del input al que conectar
-        destination_addr: String, // "host:port"
+        // New naming scheme
+        #[serde(default)]
+        remote_host: Option<String>, // New field
+        #[serde(default)]
+        remote_port: Option<u16>,    // New field
         name: Option<String>,
+        
+        // Legacy fields for backward compatibility
+        #[serde(skip_serializing_if = "Option::is_none")]
+        destination_addr: Option<String>, // Deprecated, use remote_host:remote_port
     },
     #[serde(rename = "srt")]
     Srt {
@@ -153,15 +185,31 @@ pub enum CreateOutputRequest {
 pub enum SrtOutputConfig {
     #[serde(rename = "listener")]
     Listener {
-        listen_port: u16,        
+        // New naming scheme
+        #[serde(default)]
+        bind_host: Option<String>,  // Optional, defaults to "0.0.0.0"
+        #[serde(default)]
+        bind_port: Option<u16>,     // New field
         #[serde(flatten)]
         common: SrtCommonConfig,
+        
+        // Legacy fields for backward compatibility
+        #[serde(skip_serializing_if = "Option::is_none")]
+        listen_port: Option<u16>,  // Deprecated, use bind_port
     },
     #[serde(rename = "caller")]
     Caller {
-        destination_addr: String, // "host:port"        
+        // New naming scheme  
+        #[serde(default)]
+        remote_host: Option<String>, // New field
+        #[serde(default)]
+        remote_port: Option<u16>,    // New field
         #[serde(flatten)]
         common: SrtCommonConfig,
+        
+        // Legacy fields for backward compatibility
+        #[serde(skip_serializing_if = "Option::is_none")]
+        destination_addr: Option<String>, // Deprecated, use remote_host:remote_port
     },
 }
 
@@ -251,7 +299,7 @@ pub type StatsCell = Arc<RwLock<Option<InputStats>>>;
 
 #[derive(Clone,Debug)]
 pub enum InputStats {
-    Srt(SrtStats),
+    Srt(Box<SrtStats>),
     Udp(UdpStats),
 }
 
@@ -296,6 +344,7 @@ pub struct ForwardHandle {
     pub handle: JoinHandle<()>,
     pub stats:  StatsCell,        // si también las quieres
 }
+
 #[derive(Serialize, Deserialize, FromRow)]
 pub struct InputRow {
     pub id:          i64,
@@ -342,6 +391,239 @@ pub fn input_type_display_string(kind: &str) -> &'static str {
         "srt_listener" => "SRT Listener",
         "srt_caller" => "SRT Caller",
         _ => "Unknown",
+    }
+}
+
+// Helper functions for backward compatibility and field extraction
+
+impl CreateInputRequest {
+    /// Get the effective bind port, handling backward compatibility
+    pub fn get_bind_port(&self) -> u16 {
+        match self {
+            CreateInputRequest::Udp { bind_port, listen_port, .. } => {
+                // Prefer legacy field first for backward compatibility, then new field
+                listen_port.or(*bind_port).unwrap_or(0)
+            },
+            CreateInputRequest::Srt { config, .. } => config.get_bind_port(),
+        }
+    }
+    
+    /// Get the effective bind host, handling backward compatibility  
+    pub fn get_bind_host(&self) -> String {
+        match self {
+            CreateInputRequest::Udp { bind_host, .. } => {
+                bind_host.clone().unwrap_or_else(|| "0.0.0.0".to_string())
+            },
+            CreateInputRequest::Srt { config, .. } => config.get_bind_host(),
+        }
+    }
+    
+    /// Get remote host for caller modes
+    pub fn get_remote_host(&self) -> Option<String> {
+        match self {
+            CreateInputRequest::Udp { .. } => None, // UDP inputs don't have remote hosts
+            CreateInputRequest::Srt { config, .. } => config.get_remote_host(),
+        }
+    }
+    
+    /// Get remote port for caller modes
+    pub fn get_remote_port(&self) -> Option<u16> {
+        match self {
+            CreateInputRequest::Udp { .. } => None, // UDP inputs don't have remote ports
+            CreateInputRequest::Srt { config, .. } => config.get_remote_port(),
+        }
+    }
+}
+
+impl SrtInputConfig {
+    /// Get the effective bind port for SRT config
+    pub fn get_bind_port(&self) -> u16 {
+        match self {
+            SrtInputConfig::Listener { bind_port, listen_port, .. } => {
+                // Prefer legacy field first for backward compatibility, then new field
+                listen_port.or(*bind_port).unwrap_or(0)
+            },
+            SrtInputConfig::Caller { .. } => 0, // Callers don't bind
+        }
+    }
+    
+    /// Get the effective bind host for SRT config
+    pub fn get_bind_host(&self) -> String {
+        match self {
+            SrtInputConfig::Listener { bind_host, .. } => {
+                bind_host.clone().unwrap_or_else(|| "0.0.0.0".to_string())
+            },
+            SrtInputConfig::Caller { .. } => "0.0.0.0".to_string(), // Callers don't bind
+        }
+    }
+    
+    /// Get remote host for SRT caller
+    pub fn get_remote_host(&self) -> Option<String> {
+        match self {
+            SrtInputConfig::Listener { .. } => None,
+            SrtInputConfig::Caller { remote_host, target_addr, .. } => {
+                // Prefer new field, fallback to parsing legacy field
+                if let Some(host) = remote_host {
+                    if !host.is_empty() {
+                        Some(host.clone())
+                    } else {
+                        None
+                    }
+                } else if let Some(addr) = target_addr {
+                    // Parse "host:port" format
+                    addr.split(':').next().map(|s| s.to_string())
+                } else {
+                    None
+                }
+            },
+        }
+    }
+    
+    /// Get remote port for SRT caller
+    pub fn get_remote_port(&self) -> Option<u16> {
+        match self {
+            SrtInputConfig::Listener { .. } => None,
+            SrtInputConfig::Caller { remote_port, target_addr, .. } => {
+                // Prefer new field, fallback to parsing legacy field
+                if let Some(port) = remote_port {
+                    if *port != 0 {
+                        Some(*port)
+                    } else {
+                        None
+                    }
+                } else if let Some(addr) = target_addr {
+                    // Parse "host:port" format
+                    addr.split(':').nth(1).and_then(|s| s.parse().ok())
+                } else {
+                    None
+                }
+            },
+        }
+    }
+}
+
+impl CreateOutputRequest {
+    /// Get the effective remote host
+    pub fn get_remote_host(&self) -> Option<String> {
+        match self {
+            CreateOutputRequest::Udp { remote_host, destination_addr, .. } => {
+                // Prefer new field, fallback to parsing legacy field
+                if let Some(host) = remote_host {
+                    if !host.is_empty() {
+                        Some(host.clone())
+                    } else {
+                        None
+                    }
+                } else if let Some(addr) = destination_addr {
+                    addr.split(':').next().map(|s| s.to_string())
+                } else {
+                    None
+                }
+            },
+            CreateOutputRequest::Srt { config, .. } => config.get_remote_host(),
+        }
+    }
+    
+    /// Get the effective remote port
+    pub fn get_remote_port(&self) -> Option<u16> {
+        match self {
+            CreateOutputRequest::Udp { remote_port, destination_addr, .. } => {
+                // Prefer new field, fallback to parsing legacy field
+                if let Some(port) = remote_port {
+                    if *port != 0 {
+                        Some(*port)
+                    } else {
+                        None
+                    }
+                } else if let Some(addr) = destination_addr {
+                    addr.split(':').nth(1).and_then(|s| s.parse().ok())
+                } else {
+                    None
+                }
+            },
+            CreateOutputRequest::Srt { config, .. } => config.get_remote_port(),
+        }
+    }
+    
+    /// Get bind port for listener outputs
+    pub fn get_bind_port(&self) -> Option<u16> {
+        match self {
+            CreateOutputRequest::Udp { .. } => None, // UDP outputs don't bind
+            CreateOutputRequest::Srt { config, .. } => config.get_bind_port(),
+        }
+    }
+    
+    /// Get bind host for listener outputs
+    pub fn get_bind_host(&self) -> Option<String> {
+        match self {
+            CreateOutputRequest::Udp { .. } => None, // UDP outputs don't bind
+            CreateOutputRequest::Srt { config, .. } => config.get_bind_host(),
+        }
+    }
+}
+
+impl SrtOutputConfig {
+    /// Get remote host for SRT output
+    pub fn get_remote_host(&self) -> Option<String> {
+        match self {
+            SrtOutputConfig::Listener { .. } => None,
+            SrtOutputConfig::Caller { remote_host, destination_addr, .. } => {
+                // Prefer new field, fallback to parsing legacy field
+                if let Some(host) = remote_host {
+                    if !host.is_empty() {
+                        Some(host.clone())
+                    } else {
+                        None
+                    }
+                } else if let Some(addr) = destination_addr {
+                    addr.split(':').next().map(|s| s.to_string())
+                } else {
+                    None
+                }
+            },
+        }
+    }
+    
+    /// Get remote port for SRT output
+    pub fn get_remote_port(&self) -> Option<u16> {
+        match self {
+            SrtOutputConfig::Listener { .. } => None,
+            SrtOutputConfig::Caller { remote_port, destination_addr, .. } => {
+                // Prefer new field, fallback to parsing legacy field
+                if let Some(port) = remote_port {
+                    if *port != 0 {
+                        Some(*port)
+                    } else {
+                        None
+                    }
+                } else if let Some(addr) = destination_addr {
+                    addr.split(':').nth(1).and_then(|s| s.parse().ok())
+                } else {
+                    None
+                }
+            },
+        }
+    }
+    
+    /// Get bind port for SRT listener output
+    pub fn get_bind_port(&self) -> Option<u16> {
+        match self {
+            SrtOutputConfig::Listener { bind_port, listen_port, .. } => {
+                // Prefer legacy field first for backward compatibility, then new field
+                listen_port.or(*bind_port)
+            },
+            SrtOutputConfig::Caller { .. } => None,
+        }
+    }
+    
+    /// Get bind host for SRT listener output
+    pub fn get_bind_host(&self) -> Option<String> {
+        match self {
+            SrtOutputConfig::Listener { bind_host, .. } => {
+                Some(bind_host.clone().unwrap_or_else(|| "0.0.0.0".to_string()))
+            },
+            SrtOutputConfig::Caller { .. } => None,
+        }
     }
 }
 
