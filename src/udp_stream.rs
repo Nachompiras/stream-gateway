@@ -7,6 +7,7 @@ use tokio::{net::UdpSocket, sync::{broadcast::{self, Receiver}, RwLock}};
 use futures::stream::{AbortHandle, Abortable};
 use log::{info};
 use crate::models::*;
+use crate::metrics;
 use std::time::SystemTime;
 
 // --- Tareas Asíncronas ---
@@ -30,7 +31,15 @@ pub fn spawn_output_sender(
             match packet_rx.recv().await {
                 Ok(bytes) => {
                     let buf = bytes;
-                    let _ = sock.send_to(&buf, dest_addr).await;
+                    let bytes_sent = buf.len() as u64;
+                    if sock.send_to(&buf, dest_addr).await.is_ok() {
+                        // Record metrics for successful send
+                        metrics::record_output_bytes(&input_id.to_string(), &output_id.to_string(), "udp", bytes_sent);
+                        metrics::record_output_packets(&input_id.to_string(), &output_id.to_string(), "udp", 1);
+                    } else {
+                        // Record error metric
+                        metrics::record_stream_error("udp", "send_failed");
+                    }
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
@@ -63,6 +72,9 @@ pub async fn create_udp_output(
     let packet_rx = input.packet_tx.subscribe();
     let abort_handle =
         spawn_output_sender(packet_rx, dest_addr, input_id, output_id);
+
+    // Increment active outputs counter
+    metrics::increment_active_outputs();
 
     let final_name = name.or(Some(format!("UDP Output to {}", destination_addr)));
     Ok(OutputInfo {
@@ -151,6 +163,10 @@ pub fn spawn_udp_input_with_stats(
                     total_bytes += n as u64;
                     total_packets += 1;
 
+                    // Record metrics for received data
+                    metrics::record_input_bytes(&id.to_string(), "udp", n as u64);
+                    metrics::record_input_packets(&id.to_string(), "udp", 1);
+
                     // Update last packet time
                     last_packet_time = Instant::now();
 
@@ -209,6 +225,9 @@ pub fn spawn_udp_input_with_stats(
         }
         println!("UDP input {listen_port}: shutdown completed");
     });
+
+    // Increment active inputs counter
+    metrics::increment_active_inputs();
 
     Ok(InputInfo {
         id,

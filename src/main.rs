@@ -11,6 +11,7 @@ mod models;
 mod srt_stream;
 mod stream_control;
 mod database;
+mod metrics;
 use tokio::sync::Mutex;
 use std::{collections::HashMap, sync::Arc};
 use once_cell::sync::Lazy;
@@ -127,6 +128,8 @@ async fn main() -> std::io::Result<()> {
             .service(stop_output_endpoint)
             // General status
             .service(get_status)
+            // Metrics endpoint
+            .service(get_metrics)
     })
     .bind(server_addr)?
     .run();

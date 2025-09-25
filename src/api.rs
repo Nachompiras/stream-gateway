@@ -13,6 +13,7 @@ use crate::database::{self, check_output_exists, check_port_conflict, get_input_
 use crate::{ACTIVE_STREAMS, STATE_CHANGE_TX};
 use crate::analysis;
 use crate::stream_control;
+use crate::metrics;
 use sqlx::types::chrono;
 use tokio::sync::{broadcast, RwLock};
 use std::sync::Arc;
@@ -124,15 +125,22 @@ pub async fn delete_input(
         if let Some(handle) = input_info.task_handle.take() {
             handle.abort();
         }
+        // Decrement active inputs counter
+        metrics::decrement_active_inputs();
         // El drop del broadcast::Sender (input_info.packet_tx) ocurrirá cuando input_info salga del scope.
         // Esto hará que los receivers de los outputs obtengan RecvError::Closed.
 
         // 2. Abortar explícitamente las tareas de output asociadas
+        let output_count = input_info.output_tasks.len();
         for (output_id, output_info) in input_info.output_tasks {
             info!("[{}] Abortando output task [{}]", input_id, output_id);
             if let Some(handle) = output_info.abort_handle {
                 handle.abort();
             }
+        }
+        // Decrement active outputs counter for all outputs of this input
+        for _ in 0..output_count {
+            metrics::decrement_active_outputs();
         }
 
         // 3. Abortar explícitamente las tareas de análisis asociadas
@@ -581,6 +589,8 @@ pub async fn delete_output(
             if let Some(handle) = output_info.abort_handle {
                 handle.abort();
             }
+            // Decrement active outputs counter
+            metrics::decrement_active_outputs();
 
             // Remove from database
             if let Err(e) = database::delete_output_from_db(&state.pool, output_id).await {
@@ -1276,6 +1286,21 @@ pub async fn stop_output_endpoint(
         Err(e) => {
             error!("Failed to stop output {}: {}", output_id, e);
             Err(ErrorInternalServerError(format!("Failed to stop output: {}", e)))
+        }
+    }
+}
+
+#[actix_web::get("/metrics")]
+pub async fn get_metrics() -> ActixResult<impl Responder> {
+    match metrics::get_metrics_text() {
+        Ok(metrics_text) => {
+            Ok(HttpResponse::Ok()
+                .content_type("text/plain; version=0.0.4; charset=utf-8")
+                .body(metrics_text))
+        }
+        Err(e) => {
+            error!("Failed to generate metrics: {}", e);
+            Err(ErrorInternalServerError("Failed to generate metrics"))
         }
     }
 }

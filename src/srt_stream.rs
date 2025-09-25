@@ -4,6 +4,7 @@ use tokio::{io::AsyncReadExt, sync::{broadcast::{self}, RwLock}, task::JoinHandl
 use futures::{stream::{AbortHandle, Abortable}, FutureExt};
 use bytes::Bytes;
 use crate::models::*;
+use crate::metrics;
 use std::time::{Duration, SystemTime};
 use tokio::time::sleep;
 use async_trait::async_trait;          // 1-liner: macro para traits async
@@ -12,6 +13,8 @@ use std::io;
 pub fn spawn_srt_output(
     mut sink: Box<dyn SrtSink>,
     mut rx:   broadcast::Receiver<Bytes>,
+    input_id: i64,
+    output_id: i64,
 ) -> (AbortHandle, JoinHandle<()>, StatsCell) {
 
     // (abort_handle, reg) para poder cancelar desde la API
@@ -41,7 +44,14 @@ pub fn spawn_srt_output(
                 loop {
                     match rx.recv().await {
                         Ok(pkt) => {
-                            if sock.socket.send(&pkt).is_err() {
+                            let bytes_sent = pkt.len() as u64;
+                            if sock.socket.send(&pkt).is_ok() {
+                                // Record metrics for successful send
+                                metrics::record_output_bytes(&input_id.to_string(), &output_id.to_string(), "srt", bytes_sent);
+                                metrics::record_output_packets(&input_id.to_string(), &output_id.to_string(), "srt", 1);
+                            } else {
+                                // Record error metric and reconnect
+                                metrics::record_stream_error("srt", "send_failed");
                                 eprintln!("envío falló; reconectando…");
                                 break;
                             }
@@ -79,7 +89,10 @@ pub fn create_srt_output(
     println!("Creando output SRT con config: {:?}", cfg);
 
     let rx = input.packet_tx.subscribe();
-    let (abort_handle, _, stats) = spawn_srt_output(Box::new(cfg.clone()), rx);
+    let (abort_handle, _, stats) = spawn_srt_output(Box::new(cfg.clone()), rx, input_id, output_id);
+
+    // Increment active outputs counter
+    metrics::increment_active_outputs();
 
     println!("Output SRT creado con config: {:?}", cfg);
 
@@ -393,6 +406,10 @@ impl Forwarder {
                             break;
                         }
                         Ok(n) => {
+                            // Record metrics for received data
+                            metrics::record_input_bytes(&input_id.to_string(), "srt", n as u64);
+                            metrics::record_input_packets(&input_id.to_string(), "srt", 1);
+
                             // ignorar si no hay consumidores
                             let _ = tx_clone.send(Bytes::copy_from_slice(&buf[..n]));
                         }
@@ -422,6 +439,9 @@ impl Forwarder {
         });
 
         // 4) devolver manejadores al llamante
+        // Increment active inputs counter
+        metrics::increment_active_inputs();
+
         ForwardHandle {
             tx,
             stats: stats_cell,
