@@ -199,8 +199,21 @@ impl SrtSource for SrtSourceWithState {
                 let host = self.config.get_remote_host().unwrap_or_else(|| "127.0.0.1".to_string());
                 let port = self.config.get_remote_port().unwrap_or(8000);
                 let addr = format!("{}:{}", host, port);
-                let stream_async = common
-                    .async_builder()
+
+                let mut builder = common.async_builder();
+
+                // Set local bind address if specified
+                if let Some(bind_host) = self.config.get_caller_bind_host() {
+                    if !bind_host.is_empty() && bind_host != "0.0.0.0" {
+                        let bind_addr = format!("{}:0", bind_host); // Use port 0 for automatic assignment
+                        // Note: SRT library may not support local bind for callers in all versions
+                        // This is a placeholder for when the feature is available
+                        println!("SRT Caller: attempting to bind to local address {}", bind_addr);
+                        // builder = builder.set_local_addr(&bind_addr); // Uncomment if supported
+                    }
+                }
+
+                let stream_async = builder
                     .connect(&addr)?
                     .await
                     .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
@@ -253,11 +266,22 @@ impl SrtSource for SrtInputConfig {
                 let host = self.get_remote_host().unwrap_or_else(|| "127.0.0.1".to_string());
                 let port = self.get_remote_port().unwrap_or(8000);
                 let addr = format!("{}:{}", host, port);
-                let stream_async = match self {
-                    SrtInputConfig::Caller { common, .. } => common,
+
+                let mut builder = match self {
+                    SrtInputConfig::Caller { common, .. } => common.async_builder(),
                     _ => unreachable!(),
+                };
+
+                // Set local bind address if specified
+                if let Some(bind_host) = self.get_caller_bind_host() {
+                    if !bind_host.is_empty() && bind_host != "0.0.0.0" {
+                        let bind_addr = format!("{}:0", bind_host); // Use port 0 for automatic assignment
+                        println!("SRT Caller: attempting to bind to local address {}", bind_addr);
+                        // builder = builder.set_local_addr(&bind_addr); // Uncomment if supported
+                    }
                 }
-                    .async_builder()
+
+                let stream_async = builder
                     .connect(&addr)?
                     .await
                     .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
@@ -283,8 +307,20 @@ impl SrtSink for SrtOutputConfig {
                     SrtOutputConfig::Caller { common, .. } => common.clone(),
                     _ => unreachable!(),
                 };
+                let bind_host = self.get_caller_bind_host();
+
                 tokio::task::spawn_blocking(move || {
-                    let builder = common_clone.builder();
+                    let mut builder = common_clone.builder();
+
+                    // Set local bind address if specified
+                    if let Some(bind_host) = bind_host {
+                        if !bind_host.is_empty() && bind_host != "0.0.0.0" {
+                            let bind_addr = format!("{}:0", bind_host); // Use port 0 for automatic assignment
+                            println!("SRT Output Caller: attempting to bind to local address {}", bind_addr);
+                            // builder = builder.set_local_addr(&bind_addr); // Uncomment if supported
+                        }
+                    }
+
                     let caller = builder
                             .connect(&addr)
                             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;

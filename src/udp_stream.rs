@@ -9,6 +9,7 @@ use log::{info};
 use crate::models::*;
 use crate::metrics;
 use std::time::SystemTime;
+use socket2::{Socket, Domain, Type, Protocol, SockAddr};
 
 // --- Tareas Asíncronas ---
 // Tarea que escucha en un socket UDP y transmite los paquetes recibidos
@@ -18,13 +19,19 @@ pub fn spawn_output_sender(
     dest_addr: SocketAddr,
     input_id: i64,
     output_id: i64,
+    bind_host: Option<String>,
 ) -> AbortHandle {
     let (abort_handle, reg) = futures::future::AbortHandle::new_pair();
     let out_input = input_id;
     let out_output = output_id;
 
     tokio::spawn(Abortable::new(async move {
-        let sock = UdpSocket::bind("0.0.0.0:0")
+        let bind_addr = if let Some(host) = bind_host {
+            format!("{}:0", host)
+        } else {
+            "0.0.0.0:0".to_string()
+        };
+        let sock = UdpSocket::bind(&bind_addr)
             .await
             .expect("bind local udp"); // no debería fallar
         loop {
@@ -60,6 +67,7 @@ pub async fn create_udp_output(
     input: &InputInfo,
     output_id: i64,
     name: Option<String>,
+    bind_host: Option<String>,
     state_tx: Option<StateChangeSender>,
 ) -> Result<OutputInfo, actix_web::Error> {
     // Resolver la dirección una sola vez
@@ -71,7 +79,7 @@ pub async fn create_udp_output(
 
     let packet_rx = input.packet_tx.subscribe();
     let abort_handle =
-        spawn_output_sender(packet_rx, dest_addr, input_id, output_id);
+        spawn_output_sender(packet_rx, dest_addr, input_id, output_id, bind_host.clone());
 
     // Increment active outputs counter
     metrics::increment_active_outputs();
@@ -92,6 +100,7 @@ pub async fn create_udp_output(
             remote_port: None,
             automatic_port: None,
             name: final_name,
+            bind_host: bind_host,
             destination_addr: Some(destination_addr),
         },
         started_at: Some(std::time::SystemTime::now()),
@@ -104,6 +113,9 @@ pub fn spawn_udp_input_with_stats(
     id: i64,
     name: Option<String>,
     listen_port: u16,
+    bind_host: Option<String>,
+    multicast_group: Option<String>,
+    source_specific_multicast: Option<String>,
     state_tx: Option<StateChangeSender>,
 ) -> Result<InputInfo, actix_web::Error> {
     // canal interno
@@ -113,13 +125,18 @@ pub fn spawn_udp_input_with_stats(
     let tx_for_task = tx.clone();
     let stats_task = stats.clone();
     let state_tx_task = state_tx.clone();
+    let bind_host_task = bind_host.clone();
+    let multicast_group_task = multicast_group.clone();
+    let source_specific_multicast_task = source_specific_multicast.clone();
 
     // tarea: leer de UDP y publicar en broadcast
     let handle = tokio::spawn(async move {
-        use tokio::net::UdpSocket;
         use tokio::time::timeout;
 
-        let sock = match UdpSocket::bind(("0.0.0.0", listen_port)).await {
+        let bind_addr = bind_host_task.as_deref().unwrap_or("0.0.0.0");
+
+        // Create socket with socket2 for multicast support
+        let sock = match create_multicast_socket(bind_addr, listen_port, multicast_group_task.as_deref(), source_specific_multicast_task.as_deref()).await {
             Ok(s) => {
                 // Notify listening state
                 if let Some(ref tx) = state_tx_task {
@@ -132,7 +149,7 @@ pub fn spawn_udp_input_with_stats(
                 s
             },
             Err(e) => {
-                eprintln!("Error binding UDP socket on port {}: {}", listen_port, e);
+                eprintln!("Error creating UDP socket on {}:{}: {}", bind_addr, listen_port, e);
                 // Notify error state
                 if let Some(ref tx) = state_tx_task {
                     let _ = tx.send(StateChange::InputStateChanged {
@@ -237,10 +254,12 @@ pub fn spawn_udp_input_with_stats(
         stats,
         task_handle: Some(handle),
         config: CreateInputRequest::Udp {
-            bind_host: None,
-            bind_port: None,
+            bind_host: bind_host.clone(),
+            bind_port: Some(listen_port),
             automatic_port: None,
             name,
+            multicast_group: multicast_group.clone(),
+            source_specific_multicast: source_specific_multicast.clone(),
             listen_port: Some(listen_port)
         },
         output_tasks: std::collections::HashMap::new(),
@@ -251,4 +270,74 @@ pub fn spawn_udp_input_with_stats(
         connected_at: None, // Will be set when first packet arrives
         state_tx,
     })
+}
+
+/// Create a UDP socket with multicast support using socket2
+async fn create_multicast_socket(
+    bind_addr: &str,
+    port: u16,
+    multicast_group: Option<&str>,
+    source_specific_multicast: Option<&str>,
+) -> Result<UdpSocket, std::io::Error> {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    // Create socket2 socket
+    let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+
+    // Enable SO_REUSEADDR to allow multiple processes to bind to the same multicast address
+    socket.set_reuse_address(true)?;
+
+    #[cfg(unix)]
+    {
+        socket.set_reuse_port(true)?;
+    }
+
+    // Bind to the address and port
+    let bind_sockaddr: SockAddr = format!("{}:{}", bind_addr, port).parse::<SocketAddr>()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?.into();
+    socket.bind(&bind_sockaddr)?;
+
+    // Join multicast group if specified
+    if let Some(group_addr_str) = multicast_group {
+        let group_addr: IpAddr = group_addr_str.parse()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput,
+                format!("Invalid multicast group address '{}': {}", group_addr_str, e)))?;
+
+        match group_addr {
+            IpAddr::V4(group_ipv4) => {
+                // Validate it's a multicast address (224.0.0.0 - 239.255.255.255)
+                if !group_ipv4.is_multicast() {
+                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput,
+                        format!("Address '{}' is not a valid IPv4 multicast address", group_addr_str)));
+                }
+
+                let interface_addr: Ipv4Addr = bind_addr.parse().unwrap_or(Ipv4Addr::UNSPECIFIED);
+
+                if let Some(source_addr_str) = source_specific_multicast {
+                    // Source-Specific Multicast (SSM)
+                    let source_addr: Ipv4Addr = source_addr_str.parse()
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput,
+                            format!("Invalid source address '{}': {}", source_addr_str, e)))?;
+
+                    socket.join_ssm_v4(&group_ipv4, &interface_addr, &source_addr)?;
+                    info!("Joined SSM group {} with source {} on interface {}", group_ipv4, source_addr, interface_addr);
+                } else {
+                    // Any-Source Multicast (ASM)
+                    socket.join_multicast_v4(&group_ipv4, &interface_addr)?;
+                    info!("Joined multicast group {} on interface {}", group_ipv4, interface_addr);
+                }
+            },
+            IpAddr::V6(group_ipv6) => {
+                // For IPv6, we need the interface index (0 means any interface)
+                let interface_index = 0; // TODO: Could be made configurable
+                socket.join_multicast_v6(&group_ipv6, interface_index)?;
+                info!("Joined IPv6 multicast group {} on interface index {}", group_ipv6, interface_index);
+            },
+        }
+    }
+
+    // Convert socket2 socket to tokio UdpSocket
+    socket.set_nonblocking(true)?;
+    let std_socket: std::net::UdpSocket = socket.into();
+    UdpSocket::from_std(std_socket)
 }
