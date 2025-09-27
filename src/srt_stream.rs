@@ -15,6 +15,7 @@ pub fn spawn_srt_output(
     mut rx:   broadcast::Receiver<Bytes>,
     input_id: i64,
     output_id: i64,
+    output_name: Option<String>,
 ) -> (AbortHandle, JoinHandle<()>, StatsCell) {
 
     // (abort_handle, reg) para poder cancelar desde la API
@@ -47,11 +48,11 @@ pub fn spawn_srt_output(
                             let bytes_sent = pkt.len() as u64;
                             if sock.socket.send(&pkt).is_ok() {
                                 // Record metrics for successful send
-                                metrics::record_output_bytes(&input_id.to_string(), &output_id.to_string(), "srt", bytes_sent);
-                                metrics::record_output_packets(&input_id.to_string(), &output_id.to_string(), "srt", 1);
+                                metrics::record_output_bytes(&output_name, input_id, output_id, "srt", bytes_sent);
+                                metrics::record_output_packets(&output_name, input_id, output_id, "srt", 1);
                             } else {
                                 // Record error metric and reconnect
-                                metrics::record_stream_error("srt", "send_failed");
+                                metrics::record_stream_error(&output_name, output_id, "srt", "send_failed");
                                 eprintln!("envío falló; reconectando…");
                                 break;
                             }
@@ -88,14 +89,6 @@ pub fn create_srt_output(
 
     println!("Creando output SRT con config: {:?}", cfg);
 
-    let rx = input.packet_tx.subscribe();
-    let (abort_handle, _, stats) = spawn_srt_output(Box::new(cfg.clone()), rx, input_id, output_id);
-
-    // Increment active outputs counter
-    metrics::increment_active_outputs();
-
-    println!("Output SRT creado con config: {:?}", cfg);
-
     let (auto_name, destination) = match &cfg {
         SrtOutputConfig::Caller { .. } => {
             let host = cfg.get_remote_host().unwrap_or_else(|| "unknown".to_string());
@@ -108,6 +101,14 @@ pub fn create_srt_output(
         },
     };
     let final_name = name.or(auto_name);
+
+    let rx = input.packet_tx.subscribe();
+    let (abort_handle, _, stats) = spawn_srt_output(Box::new(cfg.clone()), rx, input_id, output_id, final_name.clone());
+
+    // Increment active outputs counter
+    metrics::increment_active_outputs();
+
+    println!("Output SRT creado con config: {:?}", cfg);
     println!("Output SRT destino: {}", destination);
 
     let info = OutputInfo {
@@ -345,6 +346,7 @@ impl Forwarder {
         mut source: Box<dyn SrtSource>,
         reconnect_delay: Duration,
         input_id: i64,
+        input_name: Option<String>,
         state_tx: Option<StateChangeSender>,
     ) -> ForwardHandle {
         // 1) canal de salida
@@ -357,6 +359,7 @@ impl Forwarder {
         let tx_clone     = tx.clone();
         let stats_clone  = stats_cell.clone();
         let state_tx_clone = state_tx.clone();
+        let input_name_clone = input_name.clone();
 
         let handle: JoinHandle<()> = tokio::spawn(async move {
             let mut buf = vec![0u8; 2048]; // buffer de lectura
@@ -424,8 +427,8 @@ impl Forwarder {
                         }
                         Ok(n) => {
                             // Record metrics for received data
-                            metrics::record_input_bytes(&input_id.to_string(), "srt", n as u64);
-                            metrics::record_input_packets(&input_id.to_string(), "srt", 1);
+                            metrics::record_input_bytes(&input_name_clone, input_id, "srt", n as u64);
+                            metrics::record_input_packets(&input_name_clone, input_id, "srt", 1);
 
                             // ignorar si no hay consumidores
                             let _ = tx_clone.send(Bytes::copy_from_slice(&buf[..n]));

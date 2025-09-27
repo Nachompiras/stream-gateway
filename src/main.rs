@@ -69,11 +69,75 @@ async fn main() -> std::io::Result<()> {
                     println!("Input {} state changed to: {}", input_id, new_status);
                     let mut streams = ACTIVE_STREAMS.lock().await;
                     if let Some(input_info) = streams.get_mut(&input_id) {
+                        let old_status = input_info.status.clone();
                         input_info.status = new_status.clone();
-                        if new_status.is_connected() {
+
+                        // Determine stream type from config
+                        let stream_type = match &input_info.config {
+                            models::CreateInputRequest::Udp { .. } => "udp",
+                            models::CreateInputRequest::Srt { .. } => "srt",
+                        };
+
+                        // Handle connection events
+                        if new_status.is_connected() && !old_status.is_connected() {
+                            // New connection established
                             input_info.connected_at = connected_at;
-                            input_info.source_address = source_address;
+                            input_info.source_address = source_address.clone();
+
+                            metrics::record_connection_event(
+                                &input_info.name,
+                                input_id,
+                                stream_type,
+                                "input",
+                                "connected",
+                                &source_address
+                            );
+                            metrics::update_active_connections(
+                                &input_info.name,
+                                input_id,
+                                stream_type,
+                                "input",
+                                true
+                            );
+                        } else if old_status.is_connected() && !new_status.is_connected() {
+                            // Connection lost (including Connected -> Listening transitions)
+                            metrics::record_connection_event(
+                                &input_info.name,
+                                input_id,
+                                stream_type,
+                                "input",
+                                "disconnected",
+                                &input_info.source_address
+                            );
+                            metrics::update_active_connections(
+                                &input_info.name,
+                                input_id,
+                                stream_type,
+                                "input",
+                                false
+                            );
+
+                            // Record connection duration if we have connected_at time
+                            if let Some(connected_time) = input_info.connected_at {
+                                if let Ok(duration) = connected_time.elapsed() {
+                                    metrics::record_connection_duration_event(
+                                        &input_info.name,
+                                        input_id,
+                                        stream_type,
+                                        "input",
+                                        duration.as_secs_f64()
+                                    );
+                                }
+                            }
+
+                            input_info.connected_at = None;
+                            input_info.source_address = None;
+                        } else if new_status.is_connected() {
+                            // Update source address for already connected streams
+                            input_info.connected_at = connected_at;
+                            input_info.source_address = source_address.clone();
                         } else if !new_status.is_active() {
+                            // Stream stopped or in error state
                             input_info.connected_at = None;
                             input_info.source_address = None;
                         }
@@ -84,11 +148,75 @@ async fn main() -> std::io::Result<()> {
                     let mut streams = ACTIVE_STREAMS.lock().await;
                     if let Some(input_info) = streams.get_mut(&input_id) {
                         if let Some(output_info) = input_info.output_tasks.get_mut(&output_id) {
+                            let old_status = output_info.status.clone();
                             output_info.status = new_status.clone();
-                            if new_status.is_connected() {
+
+                            // Determine stream type from output config
+                            let stream_type = match &output_info.config {
+                                models::CreateOutputRequest::Udp { .. } => "udp",
+                                models::CreateOutputRequest::Srt { .. } => "srt",
+                            };
+
+                            // Handle connection events
+                            if new_status.is_connected() && !old_status.is_connected() {
+                                // New connection established
                                 output_info.connected_at = connected_at;
-                                output_info.peer_address = peer_address;
+                                output_info.peer_address = peer_address.clone();
+
+                                metrics::record_connection_event(
+                                    &output_info.name,
+                                    output_id,
+                                    stream_type,
+                                    "output",
+                                    "connected",
+                                    &peer_address
+                                );
+                                metrics::update_active_connections(
+                                    &output_info.name,
+                                    output_id,
+                                    stream_type,
+                                    "output",
+                                    true
+                                );
+                            } else if old_status.is_connected() && !new_status.is_connected() {
+                                // Connection lost (including Connected -> Listening transitions)
+                                metrics::record_connection_event(
+                                    &output_info.name,
+                                    output_id,
+                                    stream_type,
+                                    "output",
+                                    "disconnected",
+                                    &output_info.peer_address
+                                );
+                                metrics::update_active_connections(
+                                    &output_info.name,
+                                    output_id,
+                                    stream_type,
+                                    "output",
+                                    false
+                                );
+
+                                // Record connection duration if we have connected_at time
+                                if let Some(connected_time) = output_info.connected_at {
+                                    if let Ok(duration) = connected_time.elapsed() {
+                                        metrics::record_connection_duration_event(
+                                            &output_info.name,
+                                            output_id,
+                                            stream_type,
+                                            "output",
+                                            duration.as_secs_f64()
+                                        );
+                                    }
+                                }
+
+                                output_info.connected_at = None;
+                                output_info.peer_address = None;
+                            } else if new_status.is_connected() {
+                                // Update peer address for already connected streams
+                                output_info.connected_at = connected_at;
+                                output_info.peer_address = peer_address.clone();
                             } else if !new_status.is_active() {
+                                // Stream stopped or in error state
                                 output_info.connected_at = None;
                                 output_info.peer_address = None;
                             }

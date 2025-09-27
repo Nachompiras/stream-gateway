@@ -18,6 +18,7 @@ pub fn spawn_output_sender(
     dest_addr: SocketAddr,
     input_id: i64,
     output_id: i64,
+    output_name: Option<String>,
 ) -> AbortHandle {
     let (abort_handle, reg) = futures::future::AbortHandle::new_pair();
     let out_input = input_id;
@@ -34,11 +35,11 @@ pub fn spawn_output_sender(
                     let bytes_sent = buf.len() as u64;
                     if sock.send_to(&buf, dest_addr).await.is_ok() {
                         // Record metrics for successful send
-                        metrics::record_output_bytes(&input_id.to_string(), &output_id.to_string(), "udp", bytes_sent);
-                        metrics::record_output_packets(&input_id.to_string(), &output_id.to_string(), "udp", 1);
+                        metrics::record_output_bytes(&output_name, input_id, output_id, "udp", bytes_sent);
+                        metrics::record_output_packets(&output_name, input_id, output_id, "udp", 1);
                     } else {
                         // Record error metric
-                        metrics::record_stream_error("udp", "send_failed");
+                        metrics::record_stream_error(&output_name, output_id, "udp", "send_failed");
                     }
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
@@ -69,14 +70,13 @@ pub async fn create_udp_output(
         .next()
         .ok_or_else(|| ErrorBadRequest(format!("No se pudo resolver '{}'", destination_addr)))?;
 
+    let final_name = name.or(Some(format!("UDP Output to {}", destination_addr)));
     let packet_rx = input.packet_tx.subscribe();
     let abort_handle =
-        spawn_output_sender(packet_rx, dest_addr, input_id, output_id);
+        spawn_output_sender(packet_rx, dest_addr, input_id, output_id, final_name.clone());
 
     // Increment active outputs counter
     metrics::increment_active_outputs();
-
-    let final_name = name.or(Some(format!("UDP Output to {}", destination_addr)));
     Ok(OutputInfo {
         id: output_id,
         name: final_name.clone(),
@@ -114,6 +114,8 @@ pub fn spawn_udp_input_with_stats(
     let tx_for_task = tx.clone();
     let stats_task = stats.clone();
     let state_tx_task = state_tx.clone();
+    let name_for_task = name.clone();
+    let listen_port_for_task = listen_port;
 
     // tarea: leer de UDP y publicar en broadcast
     let handle = tokio::spawn(async move {
@@ -168,8 +170,8 @@ pub fn spawn_udp_input_with_stats(
                     total_packets += 1;
 
                     // Record metrics for received data
-                    metrics::record_input_bytes(&id.to_string(), "udp", n as u64);
-                    metrics::record_input_packets(&id.to_string(), "udp", 1);
+                    metrics::record_input_bytes(&name_for_task, id, "udp", n as u64);
+                    metrics::record_input_packets(&name_for_task, id, "udp", 1);
 
                     // Update last packet time
                     last_packet_time = Instant::now();
@@ -182,7 +184,7 @@ pub fn spawn_udp_input_with_stats(
                                 input_id: id,
                                 new_status: StreamStatus::Connected,
                                 connected_at: Some(SystemTime::now()),
-                                source_address: Some(peer_addr.to_string()),
+                                source_address: Some(format!("{}:{}", peer_addr.ip(), listen_port_for_task)),
                             });
                         }
                     }

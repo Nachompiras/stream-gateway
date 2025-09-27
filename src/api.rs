@@ -1010,7 +1010,7 @@ async fn spawn_input(req: CreateInputRequest, id: i64, name: Option<String>, _as
                 state_tx: state_tx.clone(),
             };
             let sender =
-                Forwarder::spawn_with_stats(Box::new(source_with_state), Duration::from_secs(1), id, state_tx);
+                Forwarder::spawn_with_stats(Box::new(source_with_state), Duration::from_secs(1), id, name.clone(), state_tx);
 
             println!("Input SRT '{id}' creado");
             Ok(InputInfo {

@@ -67,6 +67,7 @@ pub async fn start_input(input_id: i64) -> Result<()> {
                 Box::new(source_with_state),
                 Duration::from_secs(1),
                 input_info.id,
+                input_info.name.clone(),
                 state_tx,
             );
 
