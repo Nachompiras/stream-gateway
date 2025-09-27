@@ -186,6 +186,12 @@ pub enum CreateOutputRequest {
         #[serde(default)]
         bind_host: Option<String>,  // Source IP to bind from (for multi-NIC scenarios)
 
+        // Multicast output support
+        #[serde(default)]
+        multicast_ttl: Option<u8>,  // TTL for multicast packets (1-255, default varies by OS)
+        #[serde(default)]
+        multicast_interface: Option<String>,  // Interface for multicast sending (IP address)
+
         // Legacy fields for backward compatibility
         #[serde(skip_serializing_if = "Option::is_none")]
         destination_addr: Option<String>, // Deprecated, use remote_host:remote_port

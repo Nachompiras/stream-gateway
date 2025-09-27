@@ -11,6 +11,12 @@ use crate::metrics;
 use std::time::SystemTime;
 use socket2::{Socket, Domain, Type, Protocol, SockAddr};
 
+#[derive(Debug, Clone)]
+pub struct MulticastOutputConfig {
+    pub ttl: u8,
+    pub interface: Option<String>,
+}
+
 // --- Tareas Asíncronas ---
 // Tarea que escucha en un socket UDP y transmite los paquetes recibidos
 
@@ -20,20 +26,20 @@ pub fn spawn_output_sender(
     input_id: i64,
     output_id: i64,
     bind_host: Option<String>,
+    multicast_config: Option<MulticastOutputConfig>,
 ) -> AbortHandle {
     let (abort_handle, reg) = futures::future::AbortHandle::new_pair();
     let out_input = input_id;
     let out_output = output_id;
 
     tokio::spawn(Abortable::new(async move {
-        let bind_addr = if let Some(host) = bind_host {
-            format!("{}:0", host)
-        } else {
-            "0.0.0.0:0".to_string()
+        let sock = match create_multicast_output_socket(bind_host.as_deref(), multicast_config.as_ref()).await {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("Error creating UDP output socket: {}", e);
+                return;
+            }
         };
-        let sock = UdpSocket::bind(&bind_addr)
-            .await
-            .expect("bind local udp"); // no debería fallar
         loop {
             match packet_rx.recv().await {
                 Ok(bytes) => {
@@ -68,6 +74,7 @@ pub async fn create_udp_output(
     output_id: i64,
     name: Option<String>,
     bind_host: Option<String>,
+    multicast_config: Option<MulticastOutputConfig>,
     state_tx: Option<StateChangeSender>,
 ) -> Result<OutputInfo, actix_web::Error> {
     // Resolver la dirección una sola vez
@@ -79,7 +86,7 @@ pub async fn create_udp_output(
 
     let packet_rx = input.packet_tx.subscribe();
     let abort_handle =
-        spawn_output_sender(packet_rx, dest_addr, input_id, output_id, bind_host.clone());
+        spawn_output_sender(packet_rx, dest_addr, input_id, output_id, bind_host.clone(), multicast_config.clone());
 
     // Increment active outputs counter
     metrics::increment_active_outputs();
@@ -101,6 +108,8 @@ pub async fn create_udp_output(
             automatic_port: None,
             name: final_name,
             bind_host: bind_host,
+            multicast_ttl: multicast_config.as_ref().map(|c| c.ttl),
+            multicast_interface: multicast_config.as_ref().and_then(|c| c.interface.clone()),
             destination_addr: Some(destination_addr),
         },
         started_at: Some(std::time::SystemTime::now()),
@@ -334,6 +343,49 @@ async fn create_multicast_socket(
                 info!("Joined IPv6 multicast group {} on interface index {}", group_ipv6, interface_index);
             },
         }
+    }
+
+    // Convert socket2 socket to tokio UdpSocket
+    socket.set_nonblocking(true)?;
+    let std_socket: std::net::UdpSocket = socket.into();
+    UdpSocket::from_std(std_socket)
+}
+
+/// Create a UDP socket for multicast output with proper configuration
+async fn create_multicast_output_socket(
+    bind_host: Option<&str>,
+    multicast_config: Option<&MulticastOutputConfig>,
+) -> Result<UdpSocket, std::io::Error> {
+    use std::net::{IpAddr, Ipv4Addr};
+
+    // Create socket2 socket
+    let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+
+    // Bind to specified interface or any interface
+    let bind_addr = if let Some(host) = bind_host {
+        format!("{}:0", host)
+    } else {
+        "0.0.0.0:0".to_string()
+    };
+
+    let bind_sockaddr: SockAddr = bind_addr.parse::<SocketAddr>()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?.into();
+    socket.bind(&bind_sockaddr)?;
+
+    // Configure multicast settings if specified
+    if let Some(config) = multicast_config {
+        // Set multicast TTL
+        socket.set_multicast_ttl_v4(config.ttl as u32)?;
+
+        // Set multicast interface if specified
+        if let Some(interface_ip) = &config.interface {
+            if let Ok(IpAddr::V4(interface_ipv4)) = interface_ip.parse() {
+                socket.set_multicast_if_v4(&interface_ipv4)?;
+                info!("Set multicast interface to {}", interface_ip);
+            }
+        }
+
+        info!("Configured multicast output with TTL {}", config.ttl);
     }
 
     // Convert socket2 socket to tokio UdpSocket

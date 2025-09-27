@@ -126,11 +126,37 @@ fn validate_srt_config(config: &CreateInputRequest) -> Result<(), String> {
 
 /// Validate UDP output configuration
 fn validate_udp_output_config(config: &CreateOutputRequest) -> Result<(), String> {
-    if let CreateOutputRequest::Udp { bind_host, .. } = config {
+    if let CreateOutputRequest::Udp { bind_host, multicast_ttl, multicast_interface, remote_host, .. } = config {
         // Validate bind address if specified
         if let Some(bind_addr) = bind_host {
             if !bind_addr.is_empty() {
                 validate_bind_address(bind_addr)?;
+            }
+        }
+
+        // Validate multicast interface if specified
+        if let Some(mcast_interface) = multicast_interface {
+            if !mcast_interface.is_empty() {
+                validate_bind_address(mcast_interface)?;
+            }
+        }
+
+        // Validate multicast TTL range
+        if let Some(ttl) = multicast_ttl {
+            if *ttl == 0 {
+                return Err("Multicast TTL must be between 1 and 255".to_string());
+            }
+        }
+
+        // Check if destination is multicast address
+        if let Some(remote_addr) = remote_host {
+            if let Ok(addr) = remote_addr.parse::<std::net::IpAddr>() {
+                if addr.is_multicast() {
+                    // For multicast destinations, recommend setting TTL if not specified
+                    if multicast_ttl.is_none() {
+                        // This is just a warning, not an error - we'll use system default
+                    }
+                }
             }
         }
     }
@@ -473,9 +499,27 @@ pub async fn create_output(
 
     // Create the output with the generated ID using the final request
     let output_info = match &final_req {
-        CreateOutputRequest::Udp { name: user_name, bind_host, .. } => {
+        CreateOutputRequest::Udp { name: user_name, bind_host, multicast_ttl, multicast_interface, remote_host, .. } => {
+            // Check if destination is multicast and create config
+            let multicast_config = if let Some(ref host) = remote_host {
+                if let Ok(addr) = host.parse::<std::net::IpAddr>() {
+                    if addr.is_multicast() {
+                        Some(crate::udp_stream::MulticastOutputConfig {
+                            ttl: multicast_ttl.unwrap_or(1), // Default TTL of 1 for local network
+                            interface: multicast_interface.clone(),
+                        })
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
             // Use the already computed destination_addr string
-            create_udp_output(input_id, destination_addr.clone(), input, output_id, user_name.clone(), bind_host.clone(), get_state_change_sender().await).await?
+            create_udp_output(input_id, destination_addr.clone(), input, output_id, user_name.clone(), bind_host.clone(), multicast_config, get_state_change_sender().await).await?
         },
 
         CreateOutputRequest::Srt { config, name: user_name, .. } =>
@@ -975,6 +1019,8 @@ pub async fn load_from_db(state: &AppState) -> anyhow::Result<()> {
                             automatic_port: None,
                             name: o.name.clone(),
                             bind_host: None,
+                            multicast_ttl: None,
+                            multicast_interface: None,
                             destination_addr: Some(destination.clone()), // Legacy compatibility
                         },
                         "srt_caller" => {
@@ -1023,7 +1069,7 @@ pub async fn load_from_db(state: &AppState) -> anyhow::Result<()> {
                     "udp" => {
                         if let Ok(_dest) = destination.parse::<std::net::SocketAddr>() {
                             // Use create_udp_output to properly handle names
-                            match create_udp_output(input_id, destination.clone(), input, o.id, o.name.clone(), None, get_state_change_sender().await).await {
+                            match create_udp_output(input_id, destination.clone(), input, o.id, o.name.clone(), None, None, get_state_change_sender().await).await {
                                 Ok(output_info) => {
                                     input.output_tasks.insert(o.id, output_info);
                                     Ok(())

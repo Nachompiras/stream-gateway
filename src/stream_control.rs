@@ -233,11 +233,25 @@ pub async fn stop_output(input_id: i64, output_id: i64) -> Result<()> {
 /// Internal helper to start an output with given config
 async fn start_output_internal(input_info: &mut InputInfo, output_id: i64, output_config: CreateOutputRequest) -> Result<()> {
     let output_info = match &output_config {
-        CreateOutputRequest::Udp { name, input_id, bind_host, .. } => {
+        CreateOutputRequest::Udp { name, input_id, bind_host, multicast_ttl, multicast_interface, .. } => {
             // Use helper methods to construct destination_addr
             let host = output_config.get_remote_host().unwrap_or_else(|| "127.0.0.1".to_string());
             let port = output_config.get_remote_port().unwrap_or(8000);
             let destination_addr = format!("{}:{}", host, port);
+
+            // Check if destination is multicast and create config
+            let multicast_config = if let Ok(addr) = host.parse::<std::net::IpAddr>() {
+                if addr.is_multicast() {
+                    Some(crate::udp_stream::MulticastOutputConfig {
+                        ttl: multicast_ttl.unwrap_or(1),
+                        interface: multicast_interface.clone(),
+                    })
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
 
             create_udp_output(
                 *input_id,
@@ -246,6 +260,7 @@ async fn start_output_internal(input_info: &mut InputInfo, output_id: i64, outpu
                 output_id,
                 name.clone(),
                 bind_host.clone(),
+                multicast_config,
                 tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current().block_on(async {
                         STATE_CHANGE_TX.lock().await.clone()
