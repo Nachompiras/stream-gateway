@@ -65,19 +65,21 @@ async fn main() -> std::io::Result<()> {
         println!("State change processor started");
         while let Some(change) = state_rx.recv().await {
             match change {
-                StateChange::InputStateChanged { input_id, new_status, connected_at } => {
+                StateChange::InputStateChanged { input_id, new_status, connected_at, source_address } => {
                     println!("Input {} state changed to: {}", input_id, new_status);
                     let mut streams = ACTIVE_STREAMS.lock().await;
                     if let Some(input_info) = streams.get_mut(&input_id) {
                         input_info.status = new_status.clone();
                         if new_status.is_connected() {
                             input_info.connected_at = connected_at;
+                            input_info.source_address = source_address;
                         } else if !new_status.is_active() {
                             input_info.connected_at = None;
+                            input_info.source_address = None;
                         }
                     }
                 }
-                StateChange::OutputStateChanged { input_id, output_id, new_status, connected_at } => {
+                StateChange::OutputStateChanged { input_id, output_id, new_status, connected_at, peer_address } => {
                     println!("Output {} (input {}) state changed to: {}", output_id, input_id, new_status);
                     let mut streams = ACTIVE_STREAMS.lock().await;
                     if let Some(input_info) = streams.get_mut(&input_id) {
@@ -85,8 +87,10 @@ async fn main() -> std::io::Result<()> {
                             output_info.status = new_status.clone();
                             if new_status.is_connected() {
                                 output_info.connected_at = connected_at;
+                                output_info.peer_address = peer_address;
                             } else if !new_status.is_active() {
                                 output_info.connected_at = None;
+                                output_info.peer_address = None;
                             }
                         }
                     }

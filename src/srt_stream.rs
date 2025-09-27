@@ -130,6 +130,7 @@ pub fn create_srt_output(
         started_at: Some(std::time::SystemTime::now()),
         connected_at: None, // Will be set when connection is established
         state_tx,
+        peer_address: None, // Will be set when peer connects (for SRT listeners)
     };
 
     println!("Output creado: {:?}", info);
@@ -155,6 +156,7 @@ impl SrtSource for SrtSourceWithState {
                         input_id: self.input_id,
                         new_status: StreamStatus::Listening,
                         connected_at: None,
+                        source_address: None,
                     });
                 }
 
@@ -177,7 +179,18 @@ impl SrtSource for SrtSourceWithState {
                     .accept()
                     .await?;                  // <───  100 % async
 
-                println!("SRT listener: aceptada conexión de {peer}");
+                let peer_str = peer.to_string();
+                println!("SRT listener: aceptada conexión de {peer_str}");
+
+                // Notify connected state with source address
+                if let Some(ref tx) = self.state_tx {
+                    let _ = tx.send(StateChange::InputStateChanged {
+                        input_id: self.input_id,
+                        new_status: StreamStatus::Connected,
+                        connected_at: Some(std::time::SystemTime::now()),
+                        source_address: Some(peer_str),
+                    });
+                }
 
                 // 3) si tu código necesita la versión síncrona
                 //    conviértela (o trabaja directamente con la async)
@@ -193,6 +206,7 @@ impl SrtSource for SrtSourceWithState {
                         input_id: self.input_id,
                         new_status: StreamStatus::Connecting,
                         connected_at: None,
+                        source_address: None,
                     });
                 }
 
@@ -317,8 +331,9 @@ impl SrtSink for SrtOutputConfig {
                 let lst = builder.listen(&bind, 2)
                             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
                 println!("output listener ► esperando conexiones en {}", bind);
-                let (s, peer) = lst.accept().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?; 
-                println!("output listener ► peer {peer}");
+                let (s, peer) = lst.accept().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                let peer_str = peer.to_string();
+                println!("output listener ► peer {peer_str}");
                 Ok(s)
             }
         }
@@ -360,6 +375,7 @@ impl Forwarder {
                                 input_id,
                                 new_status: StreamStatus::Connected,
                                 connected_at: Some(SystemTime::now()),
+                                source_address: None, // Will be updated later when we capture peer address
                             });
                         }
                         s
@@ -372,6 +388,7 @@ impl Forwarder {
                                 input_id,
                                 new_status: StreamStatus::Error,
                                 connected_at: None,
+                                source_address: None,
                             });
                         }
                         sleep(reconnect_delay).await;
@@ -426,6 +443,7 @@ impl Forwarder {
                         input_id,
                         new_status: StreamStatus::Reconnecting,
                         connected_at: None,
+                        source_address: None,
                     });
                 }
 

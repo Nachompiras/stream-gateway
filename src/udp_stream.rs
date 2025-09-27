@@ -97,6 +97,7 @@ pub async fn create_udp_output(
         started_at: Some(std::time::SystemTime::now()),
         connected_at: Some(std::time::SystemTime::now()), // UDP outputs are immediately connected
         state_tx,
+        peer_address: None, // UDP doesn't track connected peers
     })
 }
 
@@ -127,6 +128,7 @@ pub fn spawn_udp_input_with_stats(
                         input_id: id,
                         new_status: StreamStatus::Listening,
                         connected_at: None,
+                        source_address: None,
                     });
                 }
                 s
@@ -139,6 +141,7 @@ pub fn spawn_udp_input_with_stats(
                         input_id: id,
                         new_status: StreamStatus::Error,
                         connected_at: None,
+                        source_address: None,
                     });
                 }
                 return;
@@ -157,8 +160,9 @@ pub fn spawn_udp_input_with_stats(
 
         loop {
             // Use timeout to make recv responsive to cancellation
-            match timeout(Duration::from_millis(500), sock.recv(&mut buf)).await {
-                Ok(Ok(n)) => {
+            match timeout(Duration::from_millis(500), sock.recv_from(&mut buf)).await {
+                Ok(Ok((n, peer_addr))) => {
+                    //println!("UDP input {listen_port}: received {n} bytes from {peer_addr}");
                     let _ = tx_for_task.send(Bytes::copy_from_slice(&buf[..n]));
                     total_bytes += n as u64;
                     total_packets += 1;
@@ -178,6 +182,7 @@ pub fn spawn_udp_input_with_stats(
                                 input_id: id,
                                 new_status: StreamStatus::Connected,
                                 connected_at: Some(SystemTime::now()),
+                                source_address: Some(peer_addr.to_string()),
                             });
                         }
                     }
@@ -215,6 +220,7 @@ pub fn spawn_udp_input_with_stats(
                                 input_id: id,
                                 new_status: StreamStatus::Listening,
                                 connected_at: None,
+                                source_address: None,
                             });
                         }
                         println!("UDP input {}: transitioned back to listening due to inactivity", listen_port);
@@ -250,5 +256,6 @@ pub fn spawn_udp_input_with_stats(
         started_at: Some(std::time::SystemTime::now()),
         connected_at: None, // Will be set when first packet arrives
         state_tx,
+        source_address: None, // UDP doesn't track individual source addresses
     })
 }

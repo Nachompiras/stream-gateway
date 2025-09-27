@@ -32,6 +32,7 @@ pub struct InputInfo {
     pub started_at:       Option<std::time::SystemTime>, // When stream started, None when stopped
     pub connected_at:     Option<std::time::SystemTime>, // When stream connected, None when not connected
     pub state_tx:         Option<StateChangeSender>, // Channel to notify state changes
+    pub source_address:   Option<String>,          // Address of the connected source (for SRT listeners)
 }
 
 #[derive(Debug, Clone)]
@@ -48,6 +49,7 @@ pub struct OutputInfo {
     pub started_at:   Option<std::time::SystemTime>, // When stream started, None when stopped
     pub connected_at: Option<std::time::SystemTime>, // When stream connected, None when not connected
     pub state_tx:     Option<StateChangeSender>, // Channel to notify state changes
+    pub peer_address: Option<String>,          // Address of the connected peer (for SRT listeners)
 }
 
 
@@ -239,6 +241,7 @@ pub struct InputResponse {
     pub assigned_port: Option<u16>, // Port assigned automatically or specified
     pub outputs: Vec<OutputResponse>, // Lista de outputs asociados
     pub uptime_seconds: Option<u64>, // Uptime in seconds, None if stopped
+    pub source_address: Option<String>, // Address of connected source (for SRT listeners)
 }
 
 #[derive(Serialize)]
@@ -251,6 +254,7 @@ pub struct OutputResponse {
     pub status: String,
     pub assigned_port: Option<u16>, // Port assigned automatically or specified
     pub uptime_seconds: Option<u64>, // Uptime in seconds, None if stopped
+    pub peer_address: Option<String>, // Address of connected peer (for SRT listeners)
 }
 
 // New response models for CRUD endpoints
@@ -263,6 +267,7 @@ pub struct InputListResponse {
     pub assigned_port: Option<u16>, // Port assigned automatically or specified
     pub output_count: usize, // Número de outputs asociados
     pub uptime_seconds: Option<u64>, // Uptime in seconds, None if stopped
+    pub source_address: Option<String>, // Address of connected source (for SRT listeners)
 }
 
 #[derive(Serialize)]
@@ -274,6 +279,7 @@ pub struct InputDetailResponse {
     pub assigned_port: Option<u16>, // Port assigned automatically or specified
     pub outputs: Vec<OutputDetailResponse>,
     pub uptime_seconds: Option<u64>, // Uptime in seconds, None if stopped
+    pub source_address: Option<String>, // Address of connected source (for SRT listeners)
 }
 
 #[derive(Serialize)]
@@ -287,6 +293,7 @@ pub struct OutputDetailResponse {
     pub assigned_port: Option<u16>, // Port assigned automatically or specified
     pub config: Option<String>, // JSON config if needed
     pub uptime_seconds: Option<u64>, // Uptime in seconds, None if stopped
+    pub peer_address: Option<String>, // Address of connected peer (for SRT listeners)
 }
 
 #[derive(Serialize)]
@@ -300,6 +307,7 @@ pub struct OutputListResponse {
     pub status: String,
     pub assigned_port: Option<u16>, // Port assigned automatically or specified
     pub uptime_seconds: Option<u64>, // Uptime in seconds, None if stopped
+    pub peer_address: Option<String>, // Address of connected peer (for SRT listeners)
 }
 
 /* SRT models */
@@ -776,13 +784,15 @@ pub enum StateChange {
     InputStateChanged {
         input_id: i64,
         new_status: StreamStatus,
-        connected_at: Option<std::time::SystemTime>
+        connected_at: Option<std::time::SystemTime>,
+        source_address: Option<String>,
     },
     OutputStateChanged {
         input_id: i64,
         output_id: i64,
         new_status: StreamStatus,
-        connected_at: Option<std::time::SystemTime>
+        connected_at: Option<std::time::SystemTime>,
+        peer_address: Option<String>,
     },
 }
 

@@ -374,6 +374,7 @@ pub async fn list_inputs(state: web::Data<AppState>) -> ActixResult<impl Respond
             assigned_port,
             output_count: input_info.output_tasks.len(),
             uptime_seconds: calculate_connection_uptime(&input_info.status, input_info.connected_at),
+            source_address: input_info.source_address.clone(),
         });
     }
 
@@ -425,6 +426,7 @@ pub async fn get_input(
                 assigned_port,
                 config,
                 uptime_seconds: calculate_connection_uptime(&output_info.status, output_info.connected_at),
+                peer_address: output_info.peer_address.clone(),
             });
         }
 
@@ -447,6 +449,7 @@ pub async fn get_input(
             assigned_port: input_assigned_port,
             outputs,
             uptime_seconds: calculate_connection_uptime(&input_info.status, input_info.connected_at),
+            source_address: input_info.source_address.clone(),
         };
 
         Ok(HttpResponse::Ok().json(response))
@@ -472,6 +475,7 @@ pub async fn list_outputs(_state: web::Data<AppState>) -> ActixResult<impl Respo
                 status: output_info.status.to_string(),
                 assigned_port: output_info.config.extract_assigned_port(),
                 uptime_seconds: calculate_connection_uptime(&output_info.status, output_info.connected_at),
+                peer_address: output_info.peer_address.clone(),
             });
         }
     }
@@ -517,6 +521,7 @@ pub async fn get_output(
                 assigned_port,
                 config,
                 uptime_seconds: calculate_connection_uptime(&output_info.status, output_info.connected_at),
+                peer_address: output_info.peer_address.clone(),
             };
 
             return Ok(HttpResponse::Ok().json(response));
@@ -564,6 +569,7 @@ pub async fn get_input_outputs(
                 assigned_port,
                 config,
                 uptime_seconds: calculate_connection_uptime(&output_info.status, output_info.connected_at),
+                peer_address: output_info.peer_address.clone(),
             });
         }
 
@@ -632,6 +638,7 @@ pub async fn get_status(_state: web::Data<AppState>) -> ActixResult<impl Respond
                 status: output_info.status.to_string(),
                 assigned_port: output_info.config.extract_assigned_port(),
                 uptime_seconds: calculate_connection_uptime(&output_info.status, output_info.connected_at),
+                peer_address: output_info.peer_address.clone(),
             });
         }
 
@@ -642,6 +649,7 @@ pub async fn get_status(_state: web::Data<AppState>) -> ActixResult<impl Respond
             assigned_port: input_info.config.extract_assigned_port(),
             outputs: outputs_resp,
             uptime_seconds: calculate_connection_uptime(&input_info.status, input_info.connected_at),
+            source_address: input_info.source_address.clone(),
         });
     }
 
@@ -744,6 +752,7 @@ pub async fn load_from_db(state: &AppState) -> anyhow::Result<()> {
                 started_at: None, // Not started when stopped
                 connected_at: None, // Not connected when stopped
                 state_tx: None, // No state channel for stopped streams
+                source_address: None, // No source address when stopped
             };
 
             loaded_inputs.insert(r.id, stopped_input_info);
@@ -1022,6 +1031,7 @@ async fn spawn_input(req: CreateInputRequest, id: i64, name: Option<String>, _as
                 started_at: Some(SystemTime::now()),
                 connected_at: None, // Will be set when connection is established
                 state_tx: get_state_change_sender().await, // Use global state channel
+                source_address: None, // Will be set when SRT listener accepts connection
             })
         }
     }
