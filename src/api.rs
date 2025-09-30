@@ -596,6 +596,8 @@ pub async fn get_input(
 
         // Build outputs list with detailed information
         let mut outputs: Vec<OutputDetailResponse> = Vec::new();
+
+        // Add active outputs
         for (output_id, output_info) in input_info.output_tasks.iter() {
             let (config, assigned_port) = if let Ok(Some(db_output)) = get_output_by_id(&state.pool, *output_id).await {
                 let port = if let Some(config_json) = &db_output.config_json {
@@ -624,6 +626,53 @@ pub async fn get_input(
                 config,
                 uptime_seconds: calculate_connection_uptime(&output_info.status, output_info.connected_at),
                 peer_address: output_info.peer_address.clone(),
+            });
+        }
+
+        // Add stopped outputs
+        for (output_id, output_config) in input_info.stopped_outputs.iter() {
+            let (destination, output_type) = match output_config {
+                CreateOutputRequest::Udp { .. } => {
+                    let host = output_config.get_remote_host().unwrap_or_else(|| "127.0.0.1".to_string());
+                    let port = output_config.get_remote_port().unwrap_or(8000);
+                    (format!("{}:{}", host, port), "udp")
+                },
+                CreateOutputRequest::Srt { config, .. } => {
+                    let kind_str = match config {
+                        SrtOutputConfig::Caller { .. } => "srt_caller",
+                        SrtOutputConfig::Listener { .. } => "srt_listener",
+                    };
+                    let dest = match config {
+                        SrtOutputConfig::Caller { .. } => {
+                            let host = config.get_remote_host().unwrap_or_else(|| "unknown".to_string());
+                            let port = config.get_remote_port().unwrap_or(0);
+                            format!("{}:{}", host, port)
+                        },
+                        SrtOutputConfig::Listener { .. } => {
+                            let port = config.get_bind_port().unwrap_or(0);
+                            format!(":{}", port)
+                        },
+                    };
+                    (dest, kind_str)
+                }
+            };
+
+            let name = match output_config {
+                CreateOutputRequest::Udp { name, .. } => name.clone(),
+                CreateOutputRequest::Srt { name, .. } => name.clone(),
+            };
+
+            outputs.push(OutputDetailResponse {
+                id: *output_id,
+                name,
+                input_id,
+                destination,
+                output_type: output_type.to_string(),
+                status: "stopped".to_string(),
+                assigned_port: output_config.extract_assigned_port(),
+                config: Some(serde_json::to_string(output_config).unwrap_or_default()),
+                uptime_seconds: None,
+                peer_address: None,
             });
         }
 
@@ -661,6 +710,7 @@ pub async fn list_outputs(_state: web::Data<AppState>) -> ActixResult<impl Respo
     let mut response: Vec<OutputListResponse> = Vec::new();
 
     for (input_id, input_info) in state_guard.iter() {
+        // Add active outputs
         for (output_id, output_info) in input_info.output_tasks.iter() {
             response.push(OutputListResponse {
                 id: *output_id,
@@ -673,6 +723,48 @@ pub async fn list_outputs(_state: web::Data<AppState>) -> ActixResult<impl Respo
                 assigned_port: output_info.config.extract_assigned_port(),
                 uptime_seconds: calculate_connection_uptime(&output_info.status, output_info.connected_at),
                 peer_address: output_info.peer_address.clone(),
+            });
+        }
+
+        // Add stopped outputs
+        for (output_id, output_config) in input_info.stopped_outputs.iter() {
+            let (destination, output_type, name) = match output_config {
+                CreateOutputRequest::Udp { name, .. } => {
+                    let host = output_config.get_remote_host().unwrap_or_else(|| "127.0.0.1".to_string());
+                    let port = output_config.get_remote_port().unwrap_or(8000);
+                    (format!("{}:{}", host, port), "udp".to_string(), name.clone())
+                },
+                CreateOutputRequest::Srt { name, config, .. } => {
+                    let kind_str = match config {
+                        SrtOutputConfig::Caller { .. } => "srt_caller",
+                        SrtOutputConfig::Listener { .. } => "srt_listener",
+                    };
+                    let dest = match config {
+                        SrtOutputConfig::Caller { .. } => {
+                            let host = config.get_remote_host().unwrap_or_else(|| "unknown".to_string());
+                            let port = config.get_remote_port().unwrap_or(0);
+                            format!("{}:{}", host, port)
+                        },
+                        SrtOutputConfig::Listener { .. } => {
+                            let port = config.get_bind_port().unwrap_or(0);
+                            format!(":{}", port)
+                        },
+                    };
+                    (dest, kind_str.to_string(), name.clone())
+                }
+            };
+
+            response.push(OutputListResponse {
+                id: *output_id,
+                name,
+                input_id: *input_id,
+                input_name: input_info.name.clone(),
+                destination,
+                output_type,
+                status: "stopped".to_string(),
+                assigned_port: output_config.extract_assigned_port(),
+                uptime_seconds: None,
+                peer_address: None,
             });
         }
     }
@@ -739,6 +831,7 @@ pub async fn get_input_outputs(
     if let Some(input_info) = state_guard.get(&input_id) {
         let mut outputs: Vec<OutputDetailResponse> = Vec::new();
 
+        // Add active outputs
         for (output_id, output_info) in input_info.output_tasks.iter() {
             let (config, assigned_port) = if let Ok(Some(db_output)) = database::get_output_by_id(&state.pool, *output_id).await {
                 let port = if let Some(config_json) = &db_output.config_json {
@@ -767,6 +860,53 @@ pub async fn get_input_outputs(
                 config,
                 uptime_seconds: calculate_connection_uptime(&output_info.status, output_info.connected_at),
                 peer_address: output_info.peer_address.clone(),
+            });
+        }
+
+        // Add stopped outputs
+        for (output_id, output_config) in input_info.stopped_outputs.iter() {
+            let (destination, output_type) = match output_config {
+                CreateOutputRequest::Udp { .. } => {
+                    let host = output_config.get_remote_host().unwrap_or_else(|| "127.0.0.1".to_string());
+                    let port = output_config.get_remote_port().unwrap_or(8000);
+                    (format!("{}:{}", host, port), "udp")
+                },
+                CreateOutputRequest::Srt { config, .. } => {
+                    let kind_str = match config {
+                        SrtOutputConfig::Caller { .. } => "srt_caller",
+                        SrtOutputConfig::Listener { .. } => "srt_listener",
+                    };
+                    let dest = match config {
+                        SrtOutputConfig::Caller { .. } => {
+                            let host = config.get_remote_host().unwrap_or_else(|| "unknown".to_string());
+                            let port = config.get_remote_port().unwrap_or(0);
+                            format!("{}:{}", host, port)
+                        },
+                        SrtOutputConfig::Listener { .. } => {
+                            let port = config.get_bind_port().unwrap_or(0);
+                            format!(":{}", port)
+                        },
+                    };
+                    (dest, kind_str)
+                }
+            };
+
+            let name = match output_config {
+                CreateOutputRequest::Udp { name, .. } => name.clone(),
+                CreateOutputRequest::Srt { name, .. } => name.clone(),
+            };
+
+            outputs.push(OutputDetailResponse {
+                id: *output_id,
+                name,
+                input_id,
+                destination,
+                output_type: output_type.to_string(),
+                status: "stopped".to_string(),
+                assigned_port: output_config.extract_assigned_port(),
+                config: Some(serde_json::to_string(output_config).unwrap_or_default()),
+                uptime_seconds: None,
+                peer_address: None,
             });
         }
 
@@ -823,6 +963,8 @@ pub async fn get_status(_state: web::Data<AppState>) -> ActixResult<impl Respond
 
     for (input_id, input_info) in state_guard.iter() {
         let mut outputs_resp: Vec<OutputResponse> = Vec::new();
+
+        // Add active outputs
         for (output_id, output_info) in input_info.output_tasks.iter() {
              let o_type = output_kind_string(&output_info.kind);
 
@@ -836,6 +978,52 @@ pub async fn get_status(_state: web::Data<AppState>) -> ActixResult<impl Respond
                 assigned_port: output_info.config.extract_assigned_port(),
                 uptime_seconds: calculate_connection_uptime(&output_info.status, output_info.connected_at),
                 peer_address: output_info.peer_address.clone(),
+            });
+        }
+
+        // Add stopped outputs
+        for (output_id, output_config) in input_info.stopped_outputs.iter() {
+            let (destination, output_type) = match output_config {
+                CreateOutputRequest::Udp { .. } => {
+                    let host = output_config.get_remote_host().unwrap_or_else(|| "127.0.0.1".to_string());
+                    let port = output_config.get_remote_port().unwrap_or(8000);
+                    (format!("{}:{}", host, port), "udp")
+                },
+                CreateOutputRequest::Srt { config, .. } => {
+                    let kind_str = match config {
+                        SrtOutputConfig::Caller { .. } => "srt_caller",
+                        SrtOutputConfig::Listener { .. } => "srt_listener",
+                    };
+                    let dest = match config {
+                        SrtOutputConfig::Caller { .. } => {
+                            let host = config.get_remote_host().unwrap_or_else(|| "unknown".to_string());
+                            let port = config.get_remote_port().unwrap_or(0);
+                            format!("{}:{}", host, port)
+                        },
+                        SrtOutputConfig::Listener { .. } => {
+                            let port = config.get_bind_port().unwrap_or(0);
+                            format!(":{}", port)
+                        },
+                    };
+                    (dest, kind_str)
+                }
+            };
+
+            let name = match output_config {
+                CreateOutputRequest::Udp { name, .. } => name.clone(),
+                CreateOutputRequest::Srt { name, .. } => name.clone(),
+            };
+
+            outputs_resp.push(OutputResponse {
+                id: *output_id,
+                name,
+                input_id: *input_id,
+                destination,
+                output_type: output_type.to_string(),
+                status: "stopped".to_string(),
+                assigned_port: output_config.extract_assigned_port(),
+                uptime_seconds: None,
+                peer_address: None,
             });
         }
 
@@ -1126,15 +1314,13 @@ pub async fn load_from_db(state: &AppState) -> anyhow::Result<()> {
                             common: cfg
                         };
 
-                        let output_info = match create_srt_output(input_id, output_config, input, o.id, o.name.clone(), get_state_change_sender().await) {
-                            Ok(_) => {
-                                println!("Output SRT Listener {} creado para input {}", o.id, input_id);
+                        match create_srt_output(input_id, output_config, input, o.id, o.name.clone(), get_state_change_sender().await) {
+                            Ok(output_info) => {
+                                input.output_tasks.insert(o.id, output_info);
                                 Ok(())
                             }
                             Err(e) => Err(anyhow::anyhow!("Error recreating SRT Listener output: {}", e))
-                        };
-                        println!("Output SRT Listener {} recreado para input {}", o.id, input_id);
-                        output_info
+                        }
                     }
                     _ => {
                         println!("Tipo de output desconocido: {}, saltando", o.kind);
@@ -1401,8 +1587,18 @@ pub async fn start_input_endpoint(
 
     match stream_control::start_input(input_id).await {
         Ok(()) => {
-            // Update database status
-            if let Err(e) = update_input_status_in_db(&state.pool, input_id, "running").await {
+            // Get the actual status from the input after starting
+            let status_str = {
+                let guard = ACTIVE_STREAMS.lock().await;
+                if let Some(input) = guard.get(&input_id) {
+                    input.status.to_string().to_lowercase()
+                } else {
+                    "listening".to_string() // Default fallback
+                }
+            };
+
+            // Update database status with the actual stream status
+            if let Err(e) = update_input_status_in_db(&state.pool, input_id, &status_str).await {
                 error!("Failed to update input status in database: {}", e);
                 // Continue anyway - the stream is started in memory
             }
@@ -1411,7 +1607,7 @@ pub async fn start_input_endpoint(
             Ok(HttpResponse::Ok().json(serde_json::json!({
                 "message": "Input started successfully",
                 "input_id": input_id,
-                "status": "running"
+                "status": status_str
             })))
         }
         Err(e) => {
@@ -1472,8 +1668,22 @@ pub async fn start_output_endpoint(
 
     match stream_control::start_output(input_id, output_id).await {
         Ok(()) => {
-            // Update database status
-            if let Err(e) = update_output_status_in_db(&state.pool, output_id, "running").await {
+            // Get the actual status from the output after starting
+            let status_str = {
+                let guard = ACTIVE_STREAMS.lock().await;
+                if let Some(input) = guard.get(&input_id) {
+                    if let Some(output) = input.output_tasks.get(&output_id) {
+                        output.status.to_string().to_lowercase()
+                    } else {
+                        "connecting".to_string() // Default fallback
+                    }
+                } else {
+                    "connecting".to_string() // Default fallback
+                }
+            };
+
+            // Update database status with the actual stream status
+            if let Err(e) = update_output_status_in_db(&state.pool, output_id, &status_str).await {
                 error!("Failed to update output status in database: {}", e);
                 // Continue anyway - the stream is started in memory
             }
@@ -1483,7 +1693,7 @@ pub async fn start_output_endpoint(
                 "message": "Output started successfully",
                 "output_id": output_id,
                 "input_id": input_id,
-                "status": "running"
+                "status": status_str
             })))
         }
         Err(e) => {

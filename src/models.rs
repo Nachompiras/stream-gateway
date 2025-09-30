@@ -169,7 +169,7 @@ pub enum SrtInputConfig {
     },
 }
 
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "type")]
 pub enum CreateOutputRequest {
     #[serde(rename = "udp")]
@@ -377,7 +377,7 @@ pub trait SrtSource: Send + Sync + 'static {
 
 #[async_trait]
 pub trait SrtSink: Send + Sync + 'static {
-    async fn get_socket(&mut self) -> io::Result<SrtStream>;
+    async fn get_socket(&mut self) -> io::Result<SrtAsyncStream>;
 }
 
 pub struct Forwarder;

@@ -1,5 +1,5 @@
 use std::{sync::Arc};
-use srt_rs::{SrtAsyncStream, SrtStream};
+use srt_rs::{SrtAsyncStream};
 use tokio::{io::AsyncReadExt, sync::{broadcast::{self}, RwLock}, task::JoinHandle, time::Instant};
 use futures::{stream::{AbortHandle, Abortable}, FutureExt};
 use bytes::Bytes;
@@ -16,6 +16,7 @@ pub fn spawn_srt_output(
     input_id: i64,
     output_id: i64,
     output_name: Option<String>,
+    state_tx: Option<StateChangeSender>,
 ) -> (AbortHandle, JoinHandle<()>, StatsCell) {
 
     // (abort_handle, reg) para poder cancelar desde la API
@@ -24,20 +25,32 @@ pub fn spawn_srt_output(
     let stats_cell: StatsCell = Arc::new(RwLock::new(None));
 
     let stats_clone  = stats_cell.clone();
+    let state_tx_clone = state_tx.clone();
 
     let handle = tokio::spawn(
         Abortable::new(async move {
             loop {
                 // 1) Obtener / reconectar socket
+                // Note: State notifications (Listening/Connecting/Connected) are handled in SrtSinkWithState::get_socket()
                 let sock = match sink.get_socket().await {
                     Ok(s)  => s,
                     Err(e) => {
                         eprintln!("sink.get_socket(): {e}");
+                        // Notify reconnecting state on error
+                        if let Some(ref tx) = state_tx_clone {
+                            let _ = tx.send(StateChange::OutputStateChanged {
+                                input_id,
+                                output_id,
+                                new_status: StreamStatus::Reconnecting,
+                                connected_at: None,
+                                peer_address: None,
+                            });
+                        }
                         sleep(Duration::from_secs(2)).await;
                         continue;
                     }
                 };
-                
+
                 // para refrescar stats cada segundo sin segunda tarea
                 let mut next_stats = Instant::now();
 
@@ -46,6 +59,7 @@ pub fn spawn_srt_output(
                     match rx.recv().await {
                         Ok(pkt) => {
                             let bytes_sent = pkt.len() as u64;
+                            
                             if sock.socket.send(&pkt).is_ok() {
                                 // Record metrics for successful send
                                 metrics::record_output_bytes(&output_name, input_id, output_id, "srt", bytes_sent);
@@ -69,6 +83,18 @@ pub fn spawn_srt_output(
                         next_stats = Instant::now();
                     }
                 }
+
+                // Notify reconnecting state when connection breaks
+                if let Some(ref tx) = state_tx_clone {
+                    let _ = tx.send(StateChange::OutputStateChanged {
+                        input_id,
+                        output_id,
+                        new_status: StreamStatus::Reconnecting,
+                        connected_at: None,
+                        peer_address: None,
+                    });
+                }
+
                 sleep(Duration::from_secs(2)).await;
             }
         }, reg)
@@ -102,14 +128,25 @@ pub fn create_srt_output(
     };
     let final_name = name.or(auto_name);
 
+    let sink_with_state = SrtSinkWithState {
+        config: cfg.clone(),
+        input_id,
+        output_id,
+        state_tx: state_tx.clone(),
+    };
     let rx = input.packet_tx.subscribe();
-    let (abort_handle, _, stats) = spawn_srt_output(Box::new(cfg.clone()), rx, input_id, output_id, final_name.clone());
+    let (abort_handle, _, stats) = spawn_srt_output(Box::new(sink_with_state), rx, input_id, output_id, final_name.clone(), state_tx.clone());
 
     // Increment active outputs counter
     metrics::increment_active_outputs();
 
     println!("Output SRT creado con config: {:?}", cfg);
     println!("Output SRT destino: {}", destination);
+
+    let initial_status = match cfg {
+        SrtOutputConfig::Caller { .. }   => StreamStatus::Connecting,
+        SrtOutputConfig::Listener { .. } => StreamStatus::Listening,
+    };
 
     let info = OutputInfo {
         id: output_id,
@@ -119,7 +156,7 @@ pub fn create_srt_output(
             SrtOutputConfig::Caller { .. }   => OutputKind::SrtCaller,
             SrtOutputConfig::Listener { .. } => OutputKind::SrtListener,
         },
-        status: StreamStatus::Connecting, // SRT outputs start in connecting state
+        status: initial_status,
         destination,
         stats,
         abort_handle: Some(abort_handle),
@@ -142,6 +179,14 @@ pub fn create_srt_output(
 pub struct SrtSourceWithState {
     pub config: SrtInputConfig,
     pub input_id: i64,
+    pub state_tx: Option<StateChangeSender>,
+}
+
+// Wrapper for SRT output sink with state notifications
+pub struct SrtSinkWithState {
+    pub config: SrtOutputConfig,
+    pub input_id: i64,
+    pub output_id: i64,
     pub state_tx: Option<StateChangeSender>,
 }
 
@@ -241,57 +286,38 @@ impl SrtSource for SrtSourceWithState {
 }
 
 #[async_trait]
-impl SrtSource for SrtInputConfig {
+impl SrtSink for SrtSinkWithState {
     async fn get_socket(&mut self) -> io::Result<SrtAsyncStream> {
-        match self {
-            //-------------------------------------------------- LISTENER
-            SrtInputConfig::Listener { .. } => {
-                let host = self.get_bind_host();
-                let port = self.get_bind_port();
-                let addr = format!("{}:{}", host, port);
-                println!("SRT listener ► esperando conexiones en {addr}");
-
-                // 1) builder asíncrono  (¡no bloquea!)
-                let listener = match self {
-                    SrtInputConfig::Listener { common, .. } => common,
-                    _ => unreachable!(),
+        match &self.config {
+            /* ---------------- SRT CALLER ---------------- */
+            SrtOutputConfig::Caller { .. } => {
+                // Notify connecting state
+                if let Some(ref tx) = self.state_tx {
+                    let _ = tx.send(StateChange::OutputStateChanged {
+                        input_id: self.input_id,
+                        output_id: self.output_id,
+                        new_status: StreamStatus::Connecting,
+                        connected_at: None,
+                        peer_address: None,
+                    });
                 }
-                    .async_builder()// <───
-                    .listen(&addr, 2, None)   // callback = None
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
-
-                // 2) await sobre el future `accept()`
-                //    – si pulsas Ctrl-C y cancelas la tarea, este await
-                //      se despierta con Err(Interrupted) y sale enseguida.
-                let (stream_async, peer) = listener
-                    .accept()
-                    .await?;                  // <───  100 % async
-
-                println!("SRT listener: aceptada conexión de {peer}");
-
-                // 3) si tu código necesita la versión síncrona
-                //    conviértela (o trabaja directamente con la async)
-                Ok(stream_async)
-            }
-
-            //-------------------------------------------------- CALLER
-            // (caller podía quedarse como estaba – ya no bloquea)
-            SrtInputConfig::Caller { .. } => {
-                let host = self.get_remote_host().unwrap_or_else(|| "127.0.0.1".to_string());
-                let port = self.get_remote_port().unwrap_or(8000);
+                let host = self.config.get_remote_host().unwrap_or_else(|| "127.0.0.1".to_string());
+                let port = self.config.get_remote_port().unwrap_or(8000);
                 let addr = format!("{}:{}", host, port);
-
-                let builder = match self {
-                    SrtInputConfig::Caller { common, .. } => common.async_builder(),
+                let common = match &self.config {
+                    SrtOutputConfig::Caller { common, .. } => common,
                     _ => unreachable!(),
                 };
+                let bind_host = self.config.get_caller_bind_host();
+
+                let builder = common.async_builder();
 
                 // Set local bind address if specified
-                if let Some(bind_host) = self.get_caller_bind_host() {
+                if let Some(bind_host) = bind_host {
                     if !bind_host.is_empty() && bind_host != "0.0.0.0" {
                         let bind_addr = format!("{}:0", bind_host); // Use port 0 for automatic assignment
-                        println!("SRT Caller: attempting to bind to local address {}", bind_addr);
+                        println!("SRT Output Caller: attempting to bind to local address {}", bind_addr);
                         // builder = builder.set_local_addr(&bind_addr); // Uncomment if supported
                     }
                 }
@@ -302,76 +328,62 @@ impl SrtSource for SrtInputConfig {
                     .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
                 println!("Caller: conectado a {addr}");
+
+                // Convert async stream to sync for the output (SrtStream)
                 Ok(stream_async)
-            }
-        }
-    }
-}
-
-#[async_trait]
-impl SrtSink for SrtOutputConfig {
-    async fn get_socket(&mut self) -> io::Result<SrtStream> {
-        match self {
-            /* ---------------- SRT CALLER ---------------- */
-            SrtOutputConfig::Caller { .. } => {
-                // connect() es sincrónico → spawn_blocking
-                let host = self.get_remote_host().unwrap_or_else(|| "127.0.0.1".to_string());
-                let port = self.get_remote_port().unwrap_or(8000);
-                let addr = format!("{}:{}", host, port);
-                let common_clone = match self {
-                    SrtOutputConfig::Caller { common, .. } => common.clone(),
-                    _ => unreachable!(),
-                };
-                let bind_host = self.get_caller_bind_host();
-
-                tokio::task::spawn_blocking(move || {
-                    let builder = common_clone.builder();
-
-                    // Set local bind address if specified
-                    if let Some(bind_host) = bind_host {
-                        if !bind_host.is_empty() && bind_host != "0.0.0.0" {
-                            let bind_addr = format!("{}:0", bind_host); // Use port 0 for automatic assignment
-                            println!("SRT Output Caller: attempting to bind to local address {}", bind_addr);
-                            // builder = builder.set_local_addr(&bind_addr); // Uncomment if supported
-                        }
-                    }
-
-                    let caller = builder
-                            .connect(&addr)
-                            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-
-                        println!("Caller: conectado a {addr}");
-                        Ok(caller)
-                })
-                .await?
             }
 
             /* --------------- SRT LISTENER ---------------- */
             SrtOutputConfig::Listener { .. } => {
-                let host = self.get_bind_host().unwrap_or_else(|| "0.0.0.0".to_string());
-                let port = self.get_bind_port().unwrap_or(8000);
+                // Notify listening state
+                if let Some(ref tx) = self.state_tx {
+                    let _ = tx.send(StateChange::OutputStateChanged {
+                        input_id: self.input_id,
+                        output_id: self.output_id,
+                        new_status: StreamStatus::Listening,
+                        connected_at: None,
+                        peer_address: None,
+                    });
+                }
+
+                let host = self.config.get_bind_host().unwrap_or_else(|| "0.0.0.0".to_string());
+                let port = self.config.get_bind_port().unwrap_or(8000);
                 let bind = format!("{}:{}", host, port);
-                // Creas (o reutilizas) un listener y aceptas 1 peer.
-                // Guardamos el listener en Option para re-usar el puerto.
-                // if common.__listener.is_none() {
-                //     let lst = common.apply(srt::builder())
-                //                     .listen(&bind, 2)?;
-                //     common.__listener = Some(lst);     // guardamos
-                // }
-                // // accept() es async (ya no bloquea hilo)
-                // let (s, peer) = common.__listener.as_ref().unwrap()
-                //                    .accept().await?;
-                let builder = match self {
+
+                let common = match &self.config {
                     SrtOutputConfig::Listener { common, .. } => common,
                     _ => unreachable!(),
-                }.builder();
-                let lst = builder.listen(&bind, 2)
-                            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                };
+
+                // Use async_builder instead of builder
+                let listener = common
+                    .async_builder()
+                    .listen(&bind, 2, None)
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
                 println!("output listener ► esperando conexiones en {}", bind);
-                let (s, peer) = lst.accept().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
+                // await on accept() - fully async
+                let (stream_async, peer) = listener
+                    .accept()
+                    .await?;
+
                 let peer_str = peer.to_string();
                 println!("output listener ► peer {peer_str}");
-                Ok(s)
+
+                // Notify peer address when connected
+                if let Some(ref tx) = self.state_tx {
+                    let _ = tx.send(StateChange::OutputStateChanged {
+                        input_id: self.input_id,
+                        output_id: self.output_id,
+                        new_status: StreamStatus::Connected,
+                        connected_at: Some(SystemTime::now()),
+                        peer_address: Some(peer_str),
+                    });
+                }
+
+                // Convert async stream to sync for the output (SrtStream)
+                Ok(stream_async)
             }
         }
     }

@@ -21,21 +21,32 @@ pub async fn start_input(input_id: i64) -> Result<()> {
         return Err(anyhow!("Input {} is already running", input_id));
     }
 
-    // Recreate the input task based on the stored config
-    match &input_info.config {
-        CreateInputRequest::Udp { .. } => {
-            let state_tx = input_info.state_tx.clone().or_else(|| {
-                // If no state_tx, try to get the global one
-                tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current().block_on(async {
-                        STATE_CHANGE_TX.lock().await.clone()
-                    })
-                })
-            });
+    // Get state_tx before recreating the input (we need to release the lock temporarily)
+    let config = input_info.config.clone();
+    let input_id = input_info.id;
+    let name = input_info.name.clone();
+    let state_tx = input_info.state_tx.clone();
 
-            let port = input_info.config.get_bind_port();
-            let bind_host = Some(input_info.config.get_bind_host()).filter(|h| h != "0.0.0.0");
-            let (multicast_group, source_specific_multicast) = match &input_info.config {
+    // Release the lock to get global state_tx if needed
+    drop(guard);
+
+    let state_tx = if state_tx.is_some() {
+        state_tx
+    } else {
+        STATE_CHANGE_TX.lock().await.clone()
+    };
+
+    // Re-acquire the lock
+    let mut guard = ACTIVE_STREAMS.lock().await;
+    let input_info = guard.get_mut(&input_id)
+        .ok_or_else(|| anyhow!("Input {} not found after lock re-acquisition", input_id))?;
+
+    // Recreate the input task based on the stored config
+    match &config {
+        CreateInputRequest::Udp { .. } => {
+            let port = config.get_bind_port();
+            let bind_host = Some(config.get_bind_host()).filter(|h| h != "0.0.0.0");
+            let (multicast_group, source_specific_multicast) = match &config {
                 CreateInputRequest::Udp { multicast_group, source_specific_multicast, .. } => {
                     (multicast_group.clone(), source_specific_multicast.clone())
                 },
@@ -43,13 +54,13 @@ pub async fn start_input(input_id: i64) -> Result<()> {
             };
 
             let new_input_info = spawn_udp_input_with_stats(
-                input_info.id,
-                input_info.name.clone(),
+                input_id,
+                name.clone(),
                 port,
                 bind_host,
                 multicast_group,
                 source_specific_multicast,
-                state_tx,
+                state_tx.clone(),
             ).map_err(|e| anyhow::anyhow!("Failed to spawn UDP input: {}", e))?;
 
             // Update the existing InputInfo with new task and sender
@@ -59,33 +70,24 @@ pub async fn start_input(input_id: i64) -> Result<()> {
             input_info.status = StreamStatus::Listening; // UDP starts listening
             input_info.started_at = Some(SystemTime::now());
         },
-        CreateInputRequest::Srt { config, .. } => {
-            let state_tx = input_info.state_tx.clone().or_else(|| {
-                // If no state_tx, try to get the global one
-                tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current().block_on(async {
-                        STATE_CHANGE_TX.lock().await.clone()
-                    })
-                })
-            });
-
+        CreateInputRequest::Srt { config: srt_config, .. } => {
             let source_with_state = SrtSourceWithState {
-                config: config.clone(),
-                input_id: input_info.id,
+                config: srt_config.clone(),
+                input_id,
                 state_tx: state_tx.clone(),
             };
             let sender = Forwarder::spawn_with_stats(
                 Box::new(source_with_state),
                 Duration::from_secs(1),
-                input_info.id,
-                input_info.name.clone(),
-                state_tx,
+                input_id,
+                name.clone(),
+                state_tx.clone(),
             );
 
             input_info.task_handle = Some(sender.handle);
             input_info.packet_tx = sender.tx;
             input_info.stats = sender.stats;
-            input_info.status = match config {
+            input_info.status = match srt_config {
                 SrtInputConfig::Listener { .. } => StreamStatus::Listening,
                 SrtInputConfig::Caller { .. } => StreamStatus::Connecting,
             };
@@ -233,6 +235,9 @@ pub async fn stop_output(input_id: i64, output_id: i64) -> Result<()> {
 
 /// Internal helper to start an output with given config
 async fn start_output_internal(input_info: &mut InputInfo, output_id: i64, output_config: CreateOutputRequest) -> Result<()> {
+    // Get state_tx from global if needed
+    let state_tx = STATE_CHANGE_TX.lock().await.clone();
+
     let output_info = match &output_config {
         CreateOutputRequest::Udp { name, bind_host, multicast_ttl, multicast_interface, .. } => {
             // Use helper methods to construct destination_addr
@@ -254,18 +259,14 @@ async fn start_output_internal(input_info: &mut InputInfo, output_id: i64, outpu
                 None
             };
 
-            create_udp_output(                
+            create_udp_output(
                 destination_addr,
                 input_info,
                 output_id,
                 name.clone(),
                 bind_host.clone(),
                 multicast_config,
-                tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current().block_on(async {
-                        STATE_CHANGE_TX.lock().await.clone()
-                    })
-                }),
+                state_tx,
             ).await.map_err(|e| anyhow::anyhow!("Failed to create UDP output: {}", e))?
         },
         CreateOutputRequest::Srt { config, name, input_id, .. } => {
@@ -275,11 +276,7 @@ async fn start_output_internal(input_info: &mut InputInfo, output_id: i64, outpu
                 input_info,
                 output_id,
                 name.clone(),
-                tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current().block_on(async {
-                        STATE_CHANGE_TX.lock().await.clone()
-                    })
-                }),
+                state_tx,
             ).map_err(|e| anyhow::anyhow!("Failed to create SRT output: {}", e))?
         }
     };
