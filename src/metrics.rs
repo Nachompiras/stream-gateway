@@ -1,11 +1,10 @@
 use prometheus::{
-    Counter, CounterVec, Gauge, GaugeVec, Histogram, HistogramVec, Registry, TextEncoder, Encoder
+    CounterVec, Gauge, GaugeVec, HistogramVec, Registry, TextEncoder
 };
-use std::collections::HashMap;
 use once_cell::sync::Lazy;
 
 // Global metrics registry
-pub static METRICS_REGISTRY: Lazy<Registry> = Lazy::new(|| Registry::new());
+pub static METRICS_REGISTRY: Lazy<Registry> = Lazy::new(Registry::new);
 
 // Stream metrics
 pub static ACTIVE_INPUTS: Lazy<Gauge> = Lazy::new(|| {
@@ -56,15 +55,6 @@ pub static OUTPUT_PACKETS_SENT: Lazy<CounterVec> = Lazy::new(|| {
     counter
 });
 
-pub static STREAM_CONNECTION_DURATION: Lazy<HistogramVec> = Lazy::new(|| {
-    let histogram = HistogramVec::new(
-        prometheus::HistogramOpts::new("stream_gateway_connection_duration_seconds", "Duration of stream connections in seconds"),
-        &["stream_type", "connection_type"]
-    ).unwrap();
-    METRICS_REGISTRY.register(Box::new(histogram.clone())).unwrap();
-    histogram
-});
-
 pub static STREAM_ERRORS: Lazy<CounterVec> = Lazy::new(|| {
     let counter = CounterVec::new(
         prometheus::Opts::new("stream_gateway_errors_total", "Total number of stream errors"),
@@ -72,24 +62,6 @@ pub static STREAM_ERRORS: Lazy<CounterVec> = Lazy::new(|| {
     ).unwrap();
     METRICS_REGISTRY.register(Box::new(counter.clone())).unwrap();
     counter
-});
-
-pub static HTTP_REQUESTS_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
-    let counter = CounterVec::new(
-        prometheus::Opts::new("stream_gateway_http_requests_total", "Total HTTP requests"),
-        &["method", "endpoint", "status"]
-    ).unwrap();
-    METRICS_REGISTRY.register(Box::new(counter.clone())).unwrap();
-    counter
-});
-
-pub static HTTP_REQUEST_DURATION: Lazy<HistogramVec> = Lazy::new(|| {
-    let histogram = HistogramVec::new(
-        prometheus::HistogramOpts::new("stream_gateway_http_request_duration_seconds", "HTTP request duration in seconds"),
-        &["method", "endpoint"]
-    ).unwrap();
-    METRICS_REGISTRY.register(Box::new(histogram.clone())).unwrap();
-    histogram
 });
 
 // Connection event metrics
@@ -189,22 +161,6 @@ pub fn record_stream_error(stream_name: &Option<String>, stream_id: i64, stream_
     STREAM_ERRORS
         .with_label_values(&[normalized_name.as_str(), stream_id_str.as_str(), stream_type, error_type])
         .inc();
-}
-
-pub fn record_connection_duration(stream_type: &str, connection_type: &str, duration: f64) {
-    STREAM_CONNECTION_DURATION
-        .with_label_values(&[stream_type, connection_type])
-        .observe(duration);
-}
-
-pub fn record_http_request(method: &str, endpoint: &str, status: &str, duration: f64) {
-    HTTP_REQUESTS_TOTAL
-        .with_label_values(&[method, endpoint, status])
-        .inc();
-
-    HTTP_REQUEST_DURATION
-        .with_label_values(&[method, endpoint])
-        .observe(duration);
 }
 
 // Helper function to normalize stream names for Prometheus labels

@@ -19,7 +19,7 @@ use once_cell::sync::Lazy;
 use api::*;
 use api::{AppState, InputsMap};
 use tokio_util::sync::CancellationToken;
-use models::{StateChange, StateChangeSender, StateChangeReceiver};
+use models::{StateChange, StateChangeSender};
 use tokio::sync::mpsc;
 
 use crate::database::init_database;

@@ -254,8 +254,7 @@ async fn start_output_internal(input_info: &mut InputInfo, output_id: i64, outpu
                 None
             };
 
-            create_udp_output(
-                *input_id,
+            create_udp_output(                
                 destination_addr,
                 input_info,
                 output_id,

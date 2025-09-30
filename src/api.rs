@@ -19,7 +19,7 @@ use sqlx::types::chrono;
 use tokio::sync::{broadcast, RwLock};
 use std::sync::Arc;
 use std::time::SystemTime;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr};
 
 pub type InputsMap = std::collections::HashMap<i64, InputInfo>;
 
@@ -519,7 +519,7 @@ pub async fn create_output(
             };
 
             // Use the already computed destination_addr string
-            create_udp_output(input_id, destination_addr.clone(), input, output_id, user_name.clone(), bind_host.clone(), multicast_config, get_state_change_sender().await).await?
+            create_udp_output(destination_addr.clone(), input, output_id, user_name.clone(), bind_host.clone(), multicast_config, get_state_change_sender().await).await?
         },
 
         CreateOutputRequest::Srt { config, name: user_name, .. } =>
@@ -1078,7 +1078,7 @@ pub async fn load_from_db(state: &AppState) -> anyhow::Result<()> {
                     "udp" => {
                         if let Ok(_dest) = destination.parse::<std::net::SocketAddr>() {
                             // Use create_udp_output to properly handle names
-                            match create_udp_output(input_id, destination.clone(), input, o.id, o.name.clone(), None, None, get_state_change_sender().await).await {
+                            match create_udp_output(destination.clone(), input, o.id, o.name.clone(), None, None, get_state_change_sender().await).await {
                                 Ok(output_info) => {
                                     input.output_tasks.insert(o.id, output_info);
                                     Ok(())

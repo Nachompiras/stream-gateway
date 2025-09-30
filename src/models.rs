@@ -838,7 +838,6 @@ pub enum StateChange {
 
 // Type alias for the state change sender
 pub type StateChangeSender = mpsc::UnboundedSender<StateChange>;
-pub type StateChangeReceiver = mpsc::UnboundedReceiver<StateChange>;
 
 // Helper functions to extract ports from configuration JSON
 impl CreateInputRequest {

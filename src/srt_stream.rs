@@ -215,7 +215,7 @@ impl SrtSource for SrtSourceWithState {
                 let port = self.config.get_remote_port().unwrap_or(8000);
                 let addr = format!("{}:{}", host, port);
 
-                let mut builder = common.async_builder();
+                let builder = common.async_builder();
 
                 // Set local bind address if specified
                 if let Some(bind_host) = self.config.get_caller_bind_host() {
@@ -282,7 +282,7 @@ impl SrtSource for SrtInputConfig {
                 let port = self.get_remote_port().unwrap_or(8000);
                 let addr = format!("{}:{}", host, port);
 
-                let mut builder = match self {
+                let builder = match self {
                     SrtInputConfig::Caller { common, .. } => common.async_builder(),
                     _ => unreachable!(),
                 };
@@ -325,7 +325,7 @@ impl SrtSink for SrtOutputConfig {
                 let bind_host = self.get_caller_bind_host();
 
                 tokio::task::spawn_blocking(move || {
-                    let mut builder = common_clone.builder();
+                    let builder = common_clone.builder();
 
                     // Set local bind address if specified
                     if let Some(bind_host) = bind_host {

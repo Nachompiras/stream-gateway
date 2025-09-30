@@ -10,6 +10,8 @@ use crate::models::*;
 use crate::metrics;
 use std::time::SystemTime;
 use socket2::{Socket, Domain, Type, Protocol, SockAddr};
+use std::net::{IpAddr,Ipv4Addr};
+use tokio::time::timeout;
 
 #[derive(Debug, Clone)]
 pub struct MulticastOutputConfig {
@@ -68,8 +70,7 @@ pub fn spawn_output_sender(
     abort_handle
 }
 
-pub async fn create_udp_output(
-    input_id: i64,
+pub async fn create_udp_output(    
     destination_addr: String,
     input: &InputInfo,
     output_id: i64,
@@ -88,21 +89,21 @@ pub async fn create_udp_output(
     let final_name = name.or(Some(format!("UDP Output to {}", destination_addr)));
     let packet_rx = input.packet_tx.subscribe();
     let abort_handle =
-        spawn_output_sender(packet_rx, dest_addr, input_id, output_id, bind_host.clone(),  bind_host.clone(),multicast_config.clone());
+        spawn_output_sender(packet_rx, dest_addr, input.id, output_id, bind_host.clone(),  bind_host.clone(),multicast_config.clone());
 
     // Increment active outputs counter
     metrics::increment_active_outputs();
     Ok(OutputInfo {
         id: output_id,
         name: final_name.clone(),
-        input_id,
+        input_id: input.id,
         destination: destination_addr.clone(),
         kind: OutputKind::Udp,
         status: StreamStatus::Connected, // UDP outputs are immediately connected
         stats: Arc::new(RwLock::new(None)),
         abort_handle: Some(abort_handle),
         config: CreateOutputRequest::Udp {
-            input_id,
+            input_id: input.id,
             remote_host: None,
             remote_port: None,
             automatic_port: None,
@@ -142,8 +143,7 @@ pub fn spawn_udp_input_with_stats(
     let listen_port_for_task = listen_port;
     
     // tarea: leer de UDP y publicar en broadcast
-    let handle = tokio::spawn(async move {
-        use tokio::time::timeout;
+    let handle = tokio::spawn(async move {        
 
         let bind_addr = bind_host_task.as_deref().unwrap_or("0.0.0.0");
 
@@ -297,7 +297,6 @@ async fn create_multicast_socket(
     multicast_group: Option<&str>,
     source_specific_multicast: Option<&str>,
 ) -> Result<UdpSocket, std::io::Error> {
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
     // Create socket2 socket
     let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
@@ -365,7 +364,6 @@ async fn create_multicast_output_socket(
     bind_host: Option<&str>,
     multicast_config: Option<&MulticastOutputConfig>,
 ) -> Result<UdpSocket, std::io::Error> {
-    use std::net::{IpAddr, Ipv4Addr};
 
     // Create socket2 socket
     let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
