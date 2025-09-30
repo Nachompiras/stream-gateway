@@ -5,6 +5,7 @@ use tokio::signal;
 mod analysis;
 mod api;
 mod config;
+mod interfaces;
 mod port_utils;
 mod udp_stream;
 mod models;
@@ -262,6 +263,8 @@ async fn main() -> std::io::Result<()> {
             .service(get_status)
             // Metrics endpoint
             .service(get_metrics)
+            // Network interfaces endpoint
+            .service(get_interfaces)
     })
     .bind(server_addr)?
     .run();

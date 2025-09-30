@@ -14,10 +14,12 @@ use crate::{ACTIVE_STREAMS, STATE_CHANGE_TX};
 use crate::analysis;
 use crate::stream_control;
 use crate::metrics;
+use crate::interfaces;
 use sqlx::types::chrono;
 use tokio::sync::{broadcast, RwLock};
 use std::sync::Arc;
 use std::time::SystemTime;
+use std::net::{IpAddr, Ipv4Addr};
 
 pub type InputsMap = std::collections::HashMap<i64, InputInfo>;
 
@@ -25,13 +27,182 @@ pub struct AppState {
     pub pool: sqlx::SqlitePool,
 }
 
+/// Validate multicast group address
+fn validate_multicast_group(group_addr: &str) -> Result<(), String> {
+    let addr: IpAddr = group_addr.parse()
+        .map_err(|_| format!("Invalid IP address format: '{}'", group_addr))?;
+
+    match addr {
+        IpAddr::V4(ipv4) => {
+            if !ipv4.is_multicast() {
+                return Err(format!("Address '{}' is not a valid IPv4 multicast address (must be in range 224.0.0.0 - 239.255.255.255)", group_addr));
+            }
+        },
+        IpAddr::V6(ipv6) => {
+            if !ipv6.is_multicast() {
+                return Err(format!("Address '{}' is not a valid IPv6 multicast address", group_addr));
+            }
+        },
+    }
+
+    Ok(())
+}
+
+/// Validate bind IP address
+fn validate_bind_address(bind_addr: &str) -> Result<(), String> {
+    if bind_addr == "0.0.0.0" || bind_addr == "::" {
+        return Ok(()); // These are always valid
+    }
+
+    let _addr: IpAddr = bind_addr.parse()
+        .map_err(|_| format!("Invalid bind IP address format: '{}'", bind_addr))?;
+
+    // Check if the bind address exists on one of the system's network interfaces
+    if !interfaces::is_valid_bind_address(bind_addr) {
+        return Err(format!("Bind address '{}' not found in system interfaces. Use GET /interfaces to see available addresses.", bind_addr));
+    }
+
+    Ok(())
+}
+
+/// Validate UDP input configuration
+fn validate_udp_input_config(config: &CreateInputRequest) -> Result<(), String> {
+    if let CreateInputRequest::Udp { bind_host, multicast_group, source_specific_multicast, .. } = config {
+        // Validate bind address if specified
+        if let Some(bind_addr) = bind_host {
+            if !bind_addr.is_empty() {
+                validate_bind_address(bind_addr)?;
+            }
+        }
+
+        // Validate multicast group if specified
+        if let Some(group_addr) = multicast_group {
+            if !group_addr.is_empty() {
+                validate_multicast_group(group_addr)?;
+            }
+        }
+
+        // Validate source-specific multicast requirements
+        if let Some(source_addr) = source_specific_multicast {
+            if !source_addr.is_empty() {
+                // Source-specific multicast requires a multicast group
+                if multicast_group.is_none() || multicast_group.as_ref().unwrap().is_empty() {
+                    return Err("Source-specific multicast requires a multicast group to be specified".to_string());
+                }
+
+                // Validate source address format
+                let _addr: IpAddr = source_addr.parse()
+                    .map_err(|_| format!("Invalid source IP address format: '{}'", source_addr))?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Validate SRT configuration
+fn validate_srt_config(config: &CreateInputRequest) -> Result<(), String> {
+    if let CreateInputRequest::Srt { config: srt_config, .. } = config {
+        match srt_config {
+            SrtInputConfig::Listener { bind_host, .. } => {
+                if let Some(bind_addr) = bind_host {
+                    if !bind_addr.is_empty() {
+                        validate_bind_address(bind_addr)?;
+                    }
+                }
+            },
+            SrtInputConfig::Caller { bind_host, .. } => {
+                if let Some(bind_addr) = bind_host {
+                    if !bind_addr.is_empty() {
+                        validate_bind_address(bind_addr)?;
+                    }
+                }
+            },
+        }
+    }
+
+    Ok(())
+}
+
+/// Validate UDP output configuration
+fn validate_udp_output_config(config: &CreateOutputRequest) -> Result<(), String> {
+    if let CreateOutputRequest::Udp { bind_host, multicast_ttl, multicast_interface, remote_host, .. } = config {
+        // Validate bind address if specified
+        if let Some(bind_addr) = bind_host {
+            if !bind_addr.is_empty() {
+                validate_bind_address(bind_addr)?;
+            }
+        }
+
+        // Validate multicast interface if specified
+        if let Some(mcast_interface) = multicast_interface {
+            if !mcast_interface.is_empty() {
+                validate_bind_address(mcast_interface)?;
+            }
+        }
+
+        // Validate multicast TTL range
+        if let Some(ttl) = multicast_ttl {
+            if *ttl == 0 {
+                return Err("Multicast TTL must be between 1 and 255".to_string());
+            }
+        }
+
+        // Check if destination is multicast address
+        if let Some(remote_addr) = remote_host {
+            if let Ok(addr) = remote_addr.parse::<std::net::IpAddr>() {
+                if addr.is_multicast() {
+                    // For multicast destinations, recommend setting TTL if not specified
+                    if multicast_ttl.is_none() {
+                        // This is just a warning, not an error - we'll use system default
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Validate SRT output configuration
+fn validate_srt_output_config(config: &CreateOutputRequest) -> Result<(), String> {
+    if let CreateOutputRequest::Srt { config: srt_config, .. } = config {
+        match srt_config {
+            SrtOutputConfig::Listener { bind_host, .. } => {
+                if let Some(bind_addr) = bind_host {
+                    if !bind_addr.is_empty() {
+                        validate_bind_address(bind_addr)?;
+                    }
+                }
+            },
+            SrtOutputConfig::Caller { bind_host, .. } => {
+                if let Some(bind_addr) = bind_host {
+                    if !bind_addr.is_empty() {
+                        validate_bind_address(bind_addr)?;
+                    }
+                }
+            },
+        }
+    }
+
+    Ok(())
+}
+
 #[actix_web::post("/inputs")]
 async fn create_input(
     state: web::Data<AppState>,
     req:   web::Json<CreateInputRequest>,
-) -> ActixResult<impl Responder> {    
+) -> ActixResult<impl Responder> {
 
     println!("Petición para crear input: {:?}", req);
+
+    // Validate configuration before processing
+    if let Err(validation_error) = validate_udp_input_config(&req) {
+        return Err(actix_web::error::ErrorBadRequest(validation_error));
+    }
+    if let Err(validation_error) = validate_srt_config(&req) {
+        return Err(actix_web::error::ErrorBadRequest(validation_error));
+    }
 
     // Generate name for the input
     let auto_name = generate_input_name(&req);
@@ -172,6 +343,14 @@ pub async fn create_output(
 ) -> ActixResult<impl Responder> {
 
     info!("Petición para crear output: {:?}", req);
+
+    // Validate configuration before processing
+    if let Err(validation_error) = validate_udp_output_config(&req) {
+        return Err(actix_web::error::ErrorBadRequest(validation_error));
+    }
+    if let Err(validation_error) = validate_srt_output_config(&req) {
+        return Err(actix_web::error::ErrorBadRequest(validation_error));
+    }
 
     // Bloqueamos el estado una sola vez
     let mut guard = ACTIVE_STREAMS.lock().await;
@@ -320,9 +499,27 @@ pub async fn create_output(
 
     // Create the output with the generated ID using the final request
     let output_info = match &final_req {
-        CreateOutputRequest::Udp { name: user_name, .. } => {
+        CreateOutputRequest::Udp { name: user_name, bind_host, multicast_ttl, multicast_interface, remote_host, .. } => {
+            // Check if destination is multicast and create config
+            let multicast_config = if let Some(ref host) = remote_host {
+                if let Ok(addr) = host.parse::<std::net::IpAddr>() {
+                    if addr.is_multicast() {
+                        Some(crate::udp_stream::MulticastOutputConfig {
+                            ttl: multicast_ttl.unwrap_or(1), // Default TTL of 1 for local network
+                            interface: multicast_interface.clone(),
+                        })
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
             // Use the already computed destination_addr string
-            create_udp_output(input_id, destination_addr.clone(), input, output_id, user_name.clone(), get_state_change_sender().await).await?
+            create_udp_output(input_id, destination_addr.clone(), input, output_id, user_name.clone(), bind_host.clone(), multicast_config, get_state_change_sender().await).await?
         },
 
         CreateOutputRequest::Srt { config, name: user_name, .. } =>
@@ -830,6 +1027,9 @@ pub async fn load_from_db(state: &AppState) -> anyhow::Result<()> {
                             remote_port: None,
                             automatic_port: None,
                             name: o.name.clone(),
+                            bind_host: None,
+                            multicast_ttl: None,
+                            multicast_interface: None,
                             destination_addr: Some(destination.clone()), // Legacy compatibility
                         },
                         "srt_caller" => {
@@ -838,6 +1038,7 @@ pub async fn load_from_db(state: &AppState) -> anyhow::Result<()> {
                                 .unwrap_or(SrtOutputConfig::Caller {
                                     remote_host: None,
                                     remote_port: None,
+                                    bind_host: None,
                                     destination_addr: Some(destination.clone()), // Legacy compatibility
                                     common: SrtCommonConfig::default()
                                 });
@@ -877,7 +1078,7 @@ pub async fn load_from_db(state: &AppState) -> anyhow::Result<()> {
                     "udp" => {
                         if let Ok(_dest) = destination.parse::<std::net::SocketAddr>() {
                             // Use create_udp_output to properly handle names
-                            match create_udp_output(input_id, destination.clone(), input, o.id, o.name.clone(), get_state_change_sender().await).await {
+                            match create_udp_output(input_id, destination.clone(), input, o.id, o.name.clone(), None, None, get_state_change_sender().await).await {
                                 Ok(output_info) => {
                                     input.output_tasks.insert(o.id, output_info);
                                     Ok(())
@@ -892,11 +1093,12 @@ pub async fn load_from_db(state: &AppState) -> anyhow::Result<()> {
                         let cfg: SrtCommonConfig = serde_json::from_str(
                             o.config_json.as_deref().unwrap_or("{}")
                         )?;
-                        let output_config = SrtOutputConfig::Caller { 
+                        let output_config = SrtOutputConfig::Caller {
                             remote_host: None,
                             remote_port: None,
+                            bind_host: None,
                             destination_addr: Some(destination.clone()), // Legacy compatibility
-                            common: cfg 
+                            common: cfg
                         };
                         match create_srt_output(input_id, output_config, input, o.id, o.name.clone(), get_state_change_sender().await) {
                             Ok(output_info) => {
@@ -995,9 +1197,18 @@ fn generate_input_name(req: &CreateInputRequest) -> Option<String> {
 async fn spawn_input(req: CreateInputRequest, id: i64, name: Option<String>, _assigned_port: Option<u16>) -> Result<InputInfo, actix_web::Error> {
     match req {
         /* ----------------------------- UDP ----------------------------- */
-        CreateInputRequest::Udp { .. } => {
+        CreateInputRequest::Udp { ref multicast_group, ref source_specific_multicast, .. } => {
             let port = req.get_bind_port();
-            spawn_udp_input_with_stats(id, name, port, get_state_change_sender().await)
+            let bind_host = Some(req.get_bind_host()).filter(|h| h != "0.0.0.0");
+            spawn_udp_input_with_stats(
+                id,
+                name,
+                port,
+                bind_host,
+                multicast_group.clone(),
+                source_specific_multicast.clone(),
+                get_state_change_sender().await
+            )
         }
 
         /* ----------------------- SRT  (caller o listener) -------------- */
@@ -1313,4 +1524,25 @@ pub async fn get_metrics() -> ActixResult<impl Responder> {
             Err(ErrorInternalServerError("Failed to generate metrics"))
         }
     }
+}
+
+#[actix_web::get("/interfaces")]
+pub async fn get_interfaces(
+    query: web::Query<InterfaceQueryParams>
+) -> ActixResult<impl Responder> {
+    let interfaces = interfaces::get_filtered_interfaces(
+        query.only_up,
+        query.exclude_loopback,
+        query.ipv4_only,
+    ).map_err(|e| ErrorInternalServerError(format!("Failed to enumerate interfaces: {}", e)))?;
+
+    let response = interfaces::InterfacesResponse { interfaces };
+    Ok(HttpResponse::Ok().json(response))
+}
+
+#[derive(serde::Deserialize)]
+pub struct InterfaceQueryParams {
+    only_up: Option<bool>,
+    exclude_loopback: Option<bool>,
+    ipv4_only: Option<bool>,
 }

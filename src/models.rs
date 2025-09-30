@@ -112,6 +112,12 @@ pub enum CreateInputRequest {
         automatic_port: Option<bool>, // If true, automatically assign an available port
         name: Option<String>,
 
+        // Multicast support
+        #[serde(default)]
+        multicast_group: Option<String>,  // Multicast group to join (e.g. "239.1.1.1")
+        #[serde(default)]
+        source_specific_multicast: Option<String>,  // Source IP for SSM (optional)
+
         // Legacy fields for backward compatibility
         #[serde(skip_serializing_if = "Option::is_none")]
         listen_port: Option<u16>,  // Deprecated, use bind_port
@@ -152,7 +158,11 @@ pub enum SrtInputConfig {
         remote_port: Option<u16>,    // New field
         #[serde(flatten)]
         common: SrtCommonConfig,
-        
+
+        // Network interface binding for multi-NIC support
+        #[serde(default)]
+        bind_host: Option<String>,  // Local IP to bind from (for multi-NIC scenarios)
+
         // Legacy fields for backward compatibility
         #[serde(skip_serializing_if = "Option::is_none")]
         target_addr: Option<String>,  // Deprecated, use remote_host:remote_port
@@ -173,6 +183,16 @@ pub enum CreateOutputRequest {
         #[serde(default)]
         automatic_port: Option<bool>, // If true, automatically assign an available port
         name: Option<String>,
+
+        // Network interface binding for multi-NIC support
+        #[serde(default)]
+        bind_host: Option<String>,  // Source IP to bind from (for multi-NIC scenarios)
+
+        // Multicast output support
+        #[serde(default)]
+        multicast_ttl: Option<u8>,  // TTL for multicast packets (1-255, default varies by OS)
+        #[serde(default)]
+        multicast_interface: Option<String>,  // Interface for multicast sending (IP address)
 
         // Legacy fields for backward compatibility
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -208,14 +228,18 @@ pub enum SrtOutputConfig {
     },
     #[serde(rename = "caller")]
     Caller {
-        // New naming scheme  
+        // New naming scheme
         #[serde(default)]
         remote_host: Option<String>, // New field
         #[serde(default)]
         remote_port: Option<u16>,    // New field
         #[serde(flatten)]
         common: SrtCommonConfig,
-        
+
+        // Network interface binding for multi-NIC support
+        #[serde(default)]
+        bind_host: Option<String>,  // Local IP to bind from (for multi-NIC scenarios)
+
         // Legacy fields for backward compatibility
         #[serde(skip_serializing_if = "Option::is_none")]
         destination_addr: Option<String>, // Deprecated, use remote_host:remote_port
@@ -533,6 +557,14 @@ impl SrtInputConfig {
             },
         }
     }
+
+    /// Get local bind host for SRT caller
+    pub fn get_caller_bind_host(&self) -> Option<String> {
+        match self {
+            SrtInputConfig::Listener { .. } => None,
+            SrtInputConfig::Caller { bind_host, .. } => bind_host.clone(),
+        }
+    }
     
     /// Get remote port for SRT caller
     pub fn get_remote_port(&self) -> Option<u16> {
@@ -630,7 +662,7 @@ impl CreateOutputRequest {
     /// Get bind host for listener outputs
     pub fn get_bind_host(&self) -> Option<String> {
         match self {
-            CreateOutputRequest::Udp { .. } => None, // UDP outputs don't bind
+            CreateOutputRequest::Udp { bind_host, .. } => bind_host.clone(), // UDP outputs can bind to specific interface
             CreateOutputRequest::Srt { config, .. } => config.get_bind_host(),
         }
     }
@@ -675,6 +707,14 @@ impl SrtOutputConfig {
                     None
                 }
             },
+        }
+    }
+
+    /// Get local bind host for SRT caller output
+    pub fn get_caller_bind_host(&self) -> Option<String> {
+        match self {
+            SrtOutputConfig::Listener { .. } => None,
+            SrtOutputConfig::Caller { bind_host, .. } => bind_host.clone(),
         }
     }
     
