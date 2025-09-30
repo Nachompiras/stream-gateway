@@ -7,6 +7,7 @@ mod api;
 mod config;
 mod interfaces;
 mod port_utils;
+mod state_processor;
 mod udp_stream;
 mod models;
 mod srt_stream;
@@ -40,7 +41,7 @@ async fn main() -> std::io::Result<()> {
     let _ = startup();
 
     // Initialize state change notification system
-    let (state_tx, mut state_rx) = mpsc::unbounded_channel::<StateChange>();
+    let (state_tx, state_rx) = mpsc::unbounded_channel::<StateChange>();
     {
         let mut tx_guard = STATE_CHANGE_TX.lock().await;
         *tx_guard = Some(state_tx);
@@ -62,172 +63,7 @@ async fn main() -> std::io::Result<()> {
         .expect("error cargando inputs/outputs desde BD");
 
     // Start the state change processor task
-    tokio::spawn(async move {
-        println!("State change processor started");
-        while let Some(change) = state_rx.recv().await {
-            match change {
-                StateChange::InputStateChanged { input_id, new_status, connected_at, source_address } => {
-                    println!("Input {} state changed to: {}", input_id, new_status);
-                    let mut streams = ACTIVE_STREAMS.lock().await;
-                    if let Some(input_info) = streams.get_mut(&input_id) {
-                        let old_status = input_info.status.clone();
-                        input_info.status = new_status.clone();
-
-                        // Determine stream type from config
-                        let stream_type = match &input_info.config {
-                            models::CreateInputRequest::Udp { .. } => "udp",
-                            models::CreateInputRequest::Srt { .. } => "srt",
-                        };
-
-                        // Handle connection events
-                        if new_status.is_connected() && !old_status.is_connected() {
-                            // New connection established
-                            input_info.connected_at = connected_at;
-                            input_info.source_address = source_address.clone();
-
-                            metrics::record_connection_event(
-                                &input_info.name,
-                                input_id,
-                                stream_type,
-                                "input",
-                                "connected",
-                                &source_address
-                            );
-                            metrics::update_active_connections(
-                                &input_info.name,
-                                input_id,
-                                stream_type,
-                                "input",
-                                true
-                            );
-                        } else if old_status.is_connected() && !new_status.is_connected() {
-                            // Connection lost (including Connected -> Listening transitions)
-                            metrics::record_connection_event(
-                                &input_info.name,
-                                input_id,
-                                stream_type,
-                                "input",
-                                "disconnected",
-                                &input_info.source_address
-                            );
-                            metrics::update_active_connections(
-                                &input_info.name,
-                                input_id,
-                                stream_type,
-                                "input",
-                                false
-                            );
-
-                            // Record connection duration if we have connected_at time
-                            if let Some(connected_time) = input_info.connected_at {
-                                if let Ok(duration) = connected_time.elapsed() {
-                                    metrics::record_connection_duration_event(
-                                        &input_info.name,
-                                        input_id,
-                                        stream_type,
-                                        "input",
-                                        duration.as_secs_f64()
-                                    );
-                                }
-                            }
-
-                            input_info.connected_at = None;
-                            input_info.source_address = None;
-                        } else if new_status.is_connected() {
-                            // Update source address for already connected streams
-                            input_info.connected_at = connected_at;
-                            input_info.source_address = source_address.clone();
-                        } else if !new_status.is_active() {
-                            // Stream stopped or in error state
-                            input_info.connected_at = None;
-                            input_info.source_address = None;
-                        }
-                    }
-                }
-                StateChange::OutputStateChanged { input_id, output_id, new_status, connected_at, peer_address } => {
-                    println!("Output {} (input {}) state changed to: {}", output_id, input_id, new_status);
-                    let mut streams = ACTIVE_STREAMS.lock().await;
-                    if let Some(input_info) = streams.get_mut(&input_id) {
-                        if let Some(output_info) = input_info.output_tasks.get_mut(&output_id) {
-                            let old_status = output_info.status.clone();
-                            output_info.status = new_status.clone();
-
-                            // Determine stream type from output config
-                            let stream_type = match &output_info.config {
-                                models::CreateOutputRequest::Udp { .. } => "udp",
-                                models::CreateOutputRequest::Srt { .. } => "srt",
-                            };
-
-                            // Handle connection events
-                            if new_status.is_connected() && !old_status.is_connected() {
-                                // New connection established
-                                output_info.connected_at = connected_at;
-                                output_info.peer_address = peer_address.clone();
-
-                                metrics::record_connection_event(
-                                    &output_info.name,
-                                    output_id,
-                                    stream_type,
-                                    "output",
-                                    "connected",
-                                    &peer_address
-                                );
-                                metrics::update_active_connections(
-                                    &output_info.name,
-                                    output_id,
-                                    stream_type,
-                                    "output",
-                                    true
-                                );
-                            } else if old_status.is_connected() && !new_status.is_connected() {
-                                // Connection lost (including Connected -> Listening transitions)
-                                metrics::record_connection_event(
-                                    &output_info.name,
-                                    output_id,
-                                    stream_type,
-                                    "output",
-                                    "disconnected",
-                                    &output_info.peer_address
-                                );
-                                metrics::update_active_connections(
-                                    &output_info.name,
-                                    output_id,
-                                    stream_type,
-                                    "output",
-                                    false
-                                );
-
-                                // Record connection duration if we have connected_at time
-                                if let Some(connected_time) = output_info.connected_at {
-                                    if let Ok(duration) = connected_time.elapsed() {
-                                        metrics::record_connection_duration_event(
-                                            &output_info.name,
-                                            output_id,
-                                            stream_type,
-                                            "output",
-                                            duration.as_secs_f64()
-                                        );
-                                    }
-                                }
-
-                                output_info.connected_at = None;
-                                output_info.peer_address = None;
-                            } else if new_status.is_connected() {
-                                // Update peer address for already connected streams
-                                output_info.connected_at = connected_at;
-                                output_info.peer_address = peer_address.clone();
-                            } else if !new_status.is_active() {
-                                // Stream stopped or in error state
-                                output_info.connected_at = None;
-                                output_info.peer_address = None;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        println!("State change processor ended");
-    });
+    state_processor::start_processor(state_rx);
 
     let app_state = web::Data::new(state);
     let app_state_for_server = app_state.clone();
@@ -250,6 +86,7 @@ async fn main() -> std::io::Result<()> {
             .service(list_outputs)
             .service(get_output)
             .service(get_input_outputs)
+            .service(output_stats)
             // Analysis endpoints
             .service(start_analysis)
             .service(stop_analysis)
@@ -267,6 +104,7 @@ async fn main() -> std::io::Result<()> {
             // Network interfaces endpoint
             .service(get_interfaces)
     })
+    .workers(2) // Número de workers para manejar conexiones concurrentes
     .bind(server_addr)?
     .run();
 

@@ -7,7 +7,7 @@ use anyhow::{Result, anyhow};
 
 use crate::models::{AnalysisType, AnalysisInfo};
 use crate::ACTIVE_STREAMS;
-use mpegts_inspector::inspector;
+use mpegts_inspector::inspector::{self, CodecInfo, InspectorReport};
 
 /// Start MPEG-TS analysis for a specific input
 pub async fn start_analysis(input_id: i64, analysis_type: AnalysisType) -> Result<String> {
@@ -146,7 +146,35 @@ async fn spawn_mux_analysis(mut rx: broadcast::Receiver<Bytes>, input_id: i64, a
             }
         });
 
-        match inspector::run_from_broadcast(rx_vec, 2, false).await {
+        match inspector::run_from_broadcast(
+            rx_vec, 
+            2, 
+            false, 
+            |report: InspectorReport| {
+        // Process structured data directly (no JSON parsing needed)
+            for program in &report.programs {
+                println!("Program {}", program.program_number);
+                for stream in &program.streams {
+                    match &stream.codec {
+                        Some(CodecInfo::Video(v)) => println!("  Video: {} {}x{} @ {:.1}fps",
+                            v.codec, v.width, v.height, v.fps),
+                        Some(CodecInfo::Audio(a)) => println!("  Audio: {} {}Hz {}ch",
+                            a.codec, a.sample_rate.unwrap_or(0), a.channels.unwrap_or(0)),
+                        Some(CodecInfo::Subtitle(s)) => println!("  Subtitle: {}", s.codec),
+                        None => println!("  Unknown stream type {}", stream.stream_type),
+                    }
+                }   
+            }
+
+            // Access TR-101 metrics (filtered by priority level)
+            if report.tr101_metrics.sync_byte_errors > 0 {
+                println!("⚠️ Critical: Sync byte errors: {}", report.tr101_metrics.sync_byte_errors);
+            }
+            if report.tr101_metrics.pcr_accuracy_errors > 0 {
+                println!("⚠️ Timing: PCR accuracy errors: {}", report.tr101_metrics.pcr_accuracy_errors);
+            }
+            // Priority 3 errors (like service_id_mismatch) are automatically filtered out
+        }).await {
             Ok(_) => {
                 info!("MUX analysis task {} for input {} completed successfully", analysis_id, input_id);
             },
@@ -179,7 +207,31 @@ async fn spawn_tr101_analysis(mut rx: broadcast::Receiver<Bytes>, input_id: i64,
             }
         });
 
-        match inspector::run_from_broadcast(rx_vec, 2, true).await {
+        match inspector::run_from_broadcast(rx_vec, 2, true,|report: InspectorReport| {
+        // Process structured data directly (no JSON parsing needed)
+            for program in &report.programs {
+                println!("Program {}", program.program_number);
+                for stream in &program.streams {
+                    match &stream.codec {
+                        Some(CodecInfo::Video(v)) => println!("  Video: {} {}x{} @ {:.1}fps",
+                            v.codec, v.width, v.height, v.fps),
+                        Some(CodecInfo::Audio(a)) => println!("  Audio: {} {}Hz {}ch",
+                            a.codec, a.sample_rate.unwrap_or(0), a.channels.unwrap_or(0)),
+                        Some(CodecInfo::Subtitle(s)) => println!("  Subtitle: {}", s.codec),
+                        None => println!("  Unknown stream type {}", stream.stream_type),
+                    }
+                }   
+            }
+
+            // Access TR-101 metrics (filtered by priority level)
+            if report.tr101_metrics.sync_byte_errors > 0 {
+                println!("⚠️ Critical: Sync byte errors: {}", report.tr101_metrics.sync_byte_errors);
+            }
+            if report.tr101_metrics.pcr_accuracy_errors > 0 {
+                println!("⚠️ Timing: PCR accuracy errors: {}", report.tr101_metrics.pcr_accuracy_errors);
+            }
+            // Priority 3 errors (like service_id_mismatch) are automatically filtered out
+        }).await {
             Ok(_) => {
                 info!("TR-101 analysis task {} for input {} completed successfully", analysis_id, input_id);
             },

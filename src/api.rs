@@ -927,6 +927,7 @@ pub async fn delete_output(
     let mut state_guard = ACTIVE_STREAMS.lock().await;
 
     if let Some(input_info) = state_guard.get_mut(&input_id) {
+        // Try to remove from active outputs first
         if let Some(output_info) = input_info.output_tasks.remove(&output_id) {
             // Abortar la tarea de envío
             if let Some(handle) = output_info.abort_handle {
@@ -942,6 +943,20 @@ pub async fn delete_output(
             }
 
             info!("Output [{}] eliminado para Input '{}'", output_id, input_id);
+            Ok(HttpResponse::Ok().json(serde_json::json!({
+                "message": "Output eliminado",
+                "input_id": input_id,
+                "output_id": output_id
+            })))
+        } else if input_info.stopped_outputs.remove(&output_id).is_some() {
+            // Output was stopped, remove from stopped_outputs
+            // Remove from database
+            if let Err(e) = database::delete_output_from_db(&state.pool, output_id).await {
+                error!("Error deleting output from database: {}", e);
+                // Continue anyway - we already removed from memory
+            }
+
+            info!("Output [{}] (stopped) eliminado para Input '{}'", output_id, input_id);
             Ok(HttpResponse::Ok().json(serde_json::json!({
                 "message": "Output eliminado",
                 "input_id": input_id,
@@ -968,6 +983,19 @@ pub async fn get_status(_state: web::Data<AppState>) -> ActixResult<impl Respond
         for (output_id, output_info) in input_info.output_tasks.iter() {
              let o_type = output_kind_string(&output_info.kind);
 
+            // Extract bitrate from output stats
+            let bitrate_bps = if let Some(stats) = output_info.stats.read().await.as_ref() {
+                match stats {
+                    InputStats::Udp(udp_stats) => Some(udp_stats.bitrate_bps),
+                    InputStats::Srt(srt_stats) => {
+                        // For outputs, use send rate instead of recv rate
+                        Some((srt_stats.mbpsSendRate * 1_000_000.0) as u64)
+                    }
+                }
+            } else {
+                None
+            };
+
             outputs_resp.push(OutputResponse {
                 id: *output_id,
                 name: output_info.name.clone(),
@@ -978,6 +1006,7 @@ pub async fn get_status(_state: web::Data<AppState>) -> ActixResult<impl Respond
                 assigned_port: output_info.config.extract_assigned_port(),
                 uptime_seconds: calculate_connection_uptime(&output_info.status, output_info.connected_at),
                 peer_address: output_info.peer_address.clone(),
+                bitrate_bps,
             });
         }
 
@@ -1024,8 +1053,22 @@ pub async fn get_status(_state: web::Data<AppState>) -> ActixResult<impl Respond
                 assigned_port: output_config.extract_assigned_port(),
                 uptime_seconds: None,
                 peer_address: None,
+                bitrate_bps: None, // No bitrate for stopped outputs
             });
         }
+
+        // Extract bitrate from stats
+        let bitrate_bps = if let Some(stats) = input_info.stats.read().await.as_ref() {
+            match stats {
+                InputStats::Udp(udp_stats) => Some(udp_stats.bitrate_bps),
+                InputStats::Srt(srt_stats) => {
+                    // SRT stats provide mbpsRecvRate, convert to bps
+                    Some((srt_stats.mbpsRecvRate * 1_000_000.0) as u64)
+                }
+            }
+        } else {
+            None
+        };
 
         response.push(InputResponse {
             id: *input_id,
@@ -1035,6 +1078,7 @@ pub async fn get_status(_state: web::Data<AppState>) -> ActixResult<impl Respond
             outputs: outputs_resp,
             uptime_seconds: calculate_connection_uptime(&input_info.status, input_info.connected_at),
             source_address: input_info.source_address.clone(),
+            bitrate_bps,
         });
     }
 
@@ -1088,6 +1132,48 @@ async fn input_stats(
     println!("Input '{}' no encontrado al solicitar stats", id);
     HttpResponse::NotFound().body("input no encontrado")
 }
+
+#[actix_web::get("/outputs/{id}/stats")]
+async fn output_stats(
+    _state: web::Data<AppState>,
+    path:  web::Path<i64>,
+) -> impl Responder {
+    let output_id = path.into_inner();
+    let state_guard = ACTIVE_STREAMS.lock().await;
+
+    // Search for the output across all inputs
+    for (_, input_info) in state_guard.iter() {
+        if let Some(output_info) = input_info.output_tasks.get(&output_id) {
+            if let Some(stats) = output_info.stats.read().await.clone() {
+                println!("Stats obtenidos para output '{}': {:?}", output_id, stats);
+                return HttpResponse::Ok().json(stats);
+            } else {
+                println!("No hay stats disponibles aún para output '{}'", output_id);
+                return HttpResponse::NoContent().finish();                
+            }
+            
+        }
+    }
+    /*let id = path.into_inner();
+    let guard = ACTIVE_STREAMS.lock().await;
+
+    println!("Solicitando stats para input '{}'", id);
+
+    if let Some(info) = guard.get(&id) {
+        println!("Obteniendo stats para input '{}'", id);
+        if let Some(stats) = info.stats.read().await.clone() {
+            println!("Stats obtenidos: {:?}", stats);
+            return HttpResponse::Ok().json(stats);
+        } else {
+            println!("No hay stats disponibles aún para input '{}'", id);
+            return HttpResponse::NoContent().finish();
+        }
+    }
+    */
+    println!("Input '{}' no encontrado al solicitar stats", output_id);
+    HttpResponse::NotFound().body("Output no encontrado")
+}
+
 
 pub async fn load_from_db(state: &AppState) -> anyhow::Result<()> {
     println!("Cargando inputs desde la base de datos...");

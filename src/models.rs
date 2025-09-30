@@ -266,6 +266,7 @@ pub struct InputResponse {
     pub outputs: Vec<OutputResponse>, // Lista de outputs asociados
     pub uptime_seconds: Option<u64>, // Uptime in seconds, None if stopped
     pub source_address: Option<String>, // Address of connected source (for SRT listeners)
+    pub bitrate_bps: Option<u64>, // Bitrate in bits per second
 }
 
 #[derive(Serialize)]
@@ -279,6 +280,7 @@ pub struct OutputResponse {
     pub assigned_port: Option<u16>, // Port assigned automatically or specified
     pub uptime_seconds: Option<u64>, // Uptime in seconds, None if stopped
     pub peer_address: Option<String>, // Address of connected peer (for SRT listeners)
+    pub bitrate_bps: Option<u64>, // Bitrate in bits per second
 }
 
 // New response models for CRUD endpoints

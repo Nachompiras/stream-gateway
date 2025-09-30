@@ -1,6 +1,6 @@
 use std::{sync::Arc};
 use srt_rs::{SrtAsyncStream};
-use tokio::{io::AsyncReadExt, sync::{broadcast::{self}, RwLock}, task::JoinHandle, time::Instant};
+use tokio::{io::{AsyncReadExt, AsyncWriteExt}, sync::{broadcast::{self}, RwLock}, task::JoinHandle, time::Instant};
 use futures::{stream::{AbortHandle, Abortable}, FutureExt};
 use bytes::Bytes;
 use crate::models::*;
@@ -32,7 +32,7 @@ pub fn spawn_srt_output(
             loop {
                 // 1) Obtener / reconectar socket
                 // Note: State notifications (Listening/Connecting/Connected) are handled in SrtSinkWithState::get_socket()
-                let sock = match sink.get_socket().await {
+                let mut sock = match sink.get_socket().await {
                     Ok(s)  => s,
                     Err(e) => {
                         eprintln!("sink.get_socket(): {e}");
@@ -58,18 +58,27 @@ pub fn spawn_srt_output(
                 loop {
                     match rx.recv().await {
                         Ok(pkt) => {
-                            let bytes_sent = pkt.len() as u64;
-                            
-                            if sock.socket.send(&pkt).is_ok() {
-                                // Record metrics for successful send
-                                metrics::record_output_bytes(&output_name, input_id, output_id, "srt", bytes_sent);
-                                metrics::record_output_packets(&output_name, input_id, output_id, "srt", 1);
-                            } else {
-                                // Record error metric and reconnect
-                                metrics::record_stream_error(&output_name, output_id, "srt", "send_failed");
-                                eprintln!("envío falló; reconectando…");
-                                break;
-                            }
+                            let bytes_sent = pkt.len() as u64;                                                        
+
+                            match sock.write(&pkt).await {
+                                Ok(n) if n == pkt.len() => {
+                                    // Sent successfully
+                                    metrics::record_output_bytes(&output_name, input_id, output_id, "srt", bytes_sent);
+                                    metrics::record_output_packets(&output_name, input_id, output_id, "srt", 1);
+                                },
+                                Ok(n) => {
+                                    eprintln!("envío parcial: {}/{} bytes", n, pkt.len());
+                                    // Record error metric for partial send
+                                    metrics::record_stream_error(&output_name, output_id, "srt", "partial_send");
+                                },
+                                Err(e) => {
+                                    eprintln!("error en envío: {e}");
+                                    // Record error metric for send failure
+                                    metrics::record_stream_error(&output_name, output_id, "srt", "send_failed");
+                                    // Break to reconnect
+                                    break;
+                                }
+                            }                           
                         }
                         Err(broadcast::error::RecvError::Closed) => return,
                         Err(broadcast::error::RecvError::Lagged(_)) => continue,
@@ -77,7 +86,7 @@ pub fn spawn_srt_output(
 
                     if next_stats.elapsed() >= Duration::from_secs(1) {
                         if let Ok(s) = sock.socket.srt_bistats(0, 1) {
-                            println!("Output: SRT stats: {s:?}");
+                            //println!("Output: SRT stats: {s:?}");
                             *stats_clone.write().await = Some(InputStats::Srt(Box::new(s)));
                         }
                         next_stats = Instant::now();
@@ -279,6 +288,17 @@ impl SrtSource for SrtSourceWithState {
                     .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
                 println!("Caller: conectado a {addr}");
+
+                // Notify connected state
+                if let Some(ref tx) = self.state_tx {
+                    let _ = tx.send(StateChange::InputStateChanged {
+                        input_id: self.input_id,
+                        new_status: StreamStatus::Connected,
+                        connected_at: Some(SystemTime::now()),
+                        source_address: Some(addr.clone()),
+                    });
+                }
+
                 Ok(stream_async)
             }
         }
@@ -328,6 +348,17 @@ impl SrtSink for SrtSinkWithState {
                     .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
                 println!("Caller: conectado a {addr}");
+
+                // Notify connected state
+                if let Some(ref tx) = self.state_tx {
+                    let _ = tx.send(StateChange::OutputStateChanged {
+                        input_id: self.input_id,
+                        output_id: self.output_id,
+                        new_status: StreamStatus::Connected,
+                        connected_at: Some(SystemTime::now()),
+                        peer_address: Some(addr.clone()),
+                    });
+                }
 
                 // Convert async stream to sync for the output (SrtStream)
                 Ok(stream_async)
@@ -420,15 +451,7 @@ impl Forwarder {
 
                 let mut sock = match source.get_socket().await {
                     Ok(s)  => {
-                        // Notify connected state
-                        if let Some(ref tx) = state_tx_clone {
-                            let _ = tx.send(StateChange::InputStateChanged {
-                                input_id,
-                                new_status: StreamStatus::Connected,
-                                connected_at: Some(SystemTime::now()),
-                                source_address: None, // Will be updated later when we capture peer address
-                            });
-                        }
+                        // Note: State notification (Connected with source_address) is already sent by get_socket()
                         s
                     },
                     Err(e) => {
