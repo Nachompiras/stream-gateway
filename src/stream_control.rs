@@ -234,7 +234,7 @@ pub async fn stop_output(input_id: i64, output_id: i64) -> Result<()> {
 /// Internal helper to start an output with given config
 async fn start_output_internal(input_info: &mut InputInfo, output_id: i64, output_config: CreateOutputRequest) -> Result<()> {
     let output_info = match &output_config {
-        CreateOutputRequest::Udp { name, input_id, bind_host, multicast_ttl, multicast_interface, .. } => {
+        CreateOutputRequest::Udp { name, bind_host, multicast_ttl, multicast_interface, .. } => {
             // Use helper methods to construct destination_addr
             let host = output_config.get_remote_host().unwrap_or_else(|| "127.0.0.1".to_string());
             let port = output_config.get_remote_port().unwrap_or(8000);

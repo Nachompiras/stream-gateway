@@ -179,17 +179,6 @@ pub async fn get_output_by_id(pool: &SqlitePool, output_id: i64) -> Result<Optio
     Ok(row)
 }
 
-pub async fn get_outputs_by_input_id(pool: &SqlitePool, input_id: i64) -> Result<Vec<OutputRow>> {
-    let rows = sqlx::query_as::<_, OutputRow>(
-        "SELECT id, name, input_id, kind, destination, config_json, listen_port, status FROM outputs WHERE input_id = ?"
-    )
-    .bind(input_id)
-    .fetch_all(pool)
-    .await?;
-
-    Ok(rows)
-}
-
 // Status update functions
 pub async fn update_input_status_in_db(pool: &SqlitePool, input_id: i64, status: &str) -> Result<()> {
     sqlx::query("UPDATE inputs SET status = ? WHERE id = ?")

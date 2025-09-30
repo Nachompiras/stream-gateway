@@ -253,6 +253,7 @@ async fn main() -> std::io::Result<()> {
             // Analysis endpoints
             .service(start_analysis)
             .service(stop_analysis)
+            .service(stop_all_analysis)
             .service(get_analysis_status)
             // Stream control endpoints
             .service(start_input_endpoint)

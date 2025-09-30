@@ -1319,6 +1319,29 @@ pub async fn stop_analysis(
     }
 }
 
+#[actix_web::post("/inputs/{id}/analysis/stop")]
+pub async fn stop_all_analysis(
+    path: web::Path<i64>,
+) -> ActixResult<impl Responder> {
+    let input_id = path.into_inner();
+
+    info!("Stopping all analysis tasks for input {}", input_id);
+
+    match analysis::stop_all_analysis(input_id).await {
+        Ok(()) => {
+            info!("All analysis tasks stopped successfully for input {}", input_id);
+            Ok(HttpResponse::Ok().json(serde_json::json!({
+                "message": "All analysis tasks stopped successfully",
+                "input_id": input_id
+            })))
+        }
+        Err(e) => {
+            error!("Failed to stop all analysis tasks: {}", e);
+            Err(ErrorInternalServerError(format!("Failed to stop all analysis tasks: {}", e)))
+        }
+    }
+}
+
 #[actix_web::get("/inputs/{id}/analysis")]
 pub async fn get_analysis_status(
     path: web::Path<i64>,
