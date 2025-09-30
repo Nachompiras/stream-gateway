@@ -25,6 +25,7 @@ pub fn spawn_output_sender(
     dest_addr: SocketAddr,
     input_id: i64,
     output_id: i64,
+    output_name: Option<String>,
     bind_host: Option<String>,
     multicast_config: Option<MulticastOutputConfig>,
 ) -> AbortHandle {
@@ -87,7 +88,7 @@ pub async fn create_udp_output(
     let final_name = name.or(Some(format!("UDP Output to {}", destination_addr)));
     let packet_rx = input.packet_tx.subscribe();
     let abort_handle =
-        spawn_output_sender(packet_rx, dest_addr, input_id, output_id, bind_host.clone(), multicast_config.clone());
+        spawn_output_sender(packet_rx, dest_addr, input_id, output_id, bind_host.clone(),  bind_host.clone(),multicast_config.clone());
 
     // Increment active outputs counter
     metrics::increment_active_outputs();
@@ -106,7 +107,7 @@ pub async fn create_udp_output(
             remote_port: None,
             automatic_port: None,
             name: final_name,
-            bind_host: bind_host,
+            bind_host,
             multicast_ttl: multicast_config.as_ref().map(|c| c.ttl),
             multicast_interface: multicast_config.as_ref().and_then(|c| c.interface.clone()),
             destination_addr: Some(destination_addr),
@@ -137,7 +138,9 @@ pub fn spawn_udp_input_with_stats(
     let bind_host_task = bind_host.clone();
     let multicast_group_task = multicast_group.clone();
     let source_specific_multicast_task = source_specific_multicast.clone();
-
+    let name_for_task = name.clone();
+    let listen_port_for_task = listen_port;
+    
     // tarea: leer de UDP y publicar en broadcast
     let handle = tokio::spawn(async move {
         use tokio::time::timeout;
