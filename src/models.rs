@@ -328,6 +328,7 @@ pub struct OutputResponse {
     pub uptime_seconds: Option<u64>, // Uptime in seconds, None if stopped
     pub peer_address: Option<String>, // Address of connected peer (for SRT listeners)
     pub bitrate_bps: Option<u64>, // Bitrate in bits per second
+    pub program_number: Option<u16>, // Program number for SPTS outputs
 }
 
 // New response models for CRUD endpoints
@@ -367,6 +368,7 @@ pub struct OutputDetailResponse {
     pub config: Option<String>, // JSON config if needed
     pub uptime_seconds: Option<u64>, // Uptime in seconds, None if stopped
     pub peer_address: Option<String>, // Address of connected peer (for SRT listeners)
+    pub program_number: Option<u16>, // Program number for SPTS outputs
 }
 
 #[derive(Serialize)]
@@ -381,6 +383,7 @@ pub struct OutputListResponse {
     pub assigned_port: Option<u16>, // Port assigned automatically or specified
     pub uptime_seconds: Option<u64>, // Uptime in seconds, None if stopped
     pub peer_address: Option<String>, // Address of connected peer (for SRT listeners)
+    pub program_number: Option<u16>, // Program number for SPTS outputs
 }
 
 /* SRT models */
@@ -1015,6 +1018,14 @@ impl CreateOutputRequest {
             },
             CreateOutputRequest::Srt { config, .. } => config.extract_assigned_port(),
             CreateOutputRequest::Spts { destination, .. } => destination.extract_assigned_port(),
+        }
+    }
+
+    /// Extract the program number for SPTS outputs
+    pub fn extract_program_number(&self) -> Option<u16> {
+        match self {
+            CreateOutputRequest::Spts { program_number, .. } => Some(*program_number),
+            _ => None,
         }
     }
 }

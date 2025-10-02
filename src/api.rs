@@ -686,6 +686,7 @@ pub async fn get_input(
                 config,
                 uptime_seconds: calculate_connection_uptime(&output_info.status, output_info.connected_at),
                 peer_address: output_info.peer_address.clone(),
+                program_number: output_info.config.extract_program_number(),
             });
         }
 
@@ -757,6 +758,7 @@ pub async fn get_input(
                 config: Some(serde_json::to_string(output_config).unwrap_or_default()),
                 uptime_seconds: None,
                 peer_address: None,
+                program_number: output_config.extract_program_number(),
             });
         }
 
@@ -807,6 +809,7 @@ pub async fn list_outputs(_state: web::Data<AppState>) -> ActixResult<impl Respo
                 assigned_port: output_info.config.extract_assigned_port(),
                 uptime_seconds: calculate_connection_uptime(&output_info.status, output_info.connected_at),
                 peer_address: output_info.peer_address.clone(),
+                program_number: output_info.config.extract_program_number(),
             });
         }
 
@@ -872,6 +875,7 @@ pub async fn list_outputs(_state: web::Data<AppState>) -> ActixResult<impl Respo
                 assigned_port: output_config.extract_assigned_port(),
                 uptime_seconds: None,
                 peer_address: None,
+                program_number: output_config.extract_program_number(),
             });
         }
     }
@@ -918,6 +922,7 @@ pub async fn get_output(
                 config,
                 uptime_seconds: calculate_connection_uptime(&output_info.status, output_info.connected_at),
                 peer_address: output_info.peer_address.clone(),
+                program_number: output_info.config.extract_program_number(),
             };
 
             return Ok(HttpResponse::Ok().json(response));
@@ -967,6 +972,7 @@ pub async fn get_input_outputs(
                 config,
                 uptime_seconds: calculate_connection_uptime(&output_info.status, output_info.connected_at),
                 peer_address: output_info.peer_address.clone(),
+                program_number: output_info.config.extract_program_number(),
             });
         }
 
@@ -1038,6 +1044,7 @@ pub async fn get_input_outputs(
                 config: Some(serde_json::to_string(output_config).unwrap_or_default()),
                 uptime_seconds: None,
                 peer_address: None,
+                program_number: output_config.extract_program_number(),
             });
         }
 
@@ -1138,6 +1145,7 @@ pub async fn get_status(_state: web::Data<AppState>) -> ActixResult<impl Respond
                 uptime_seconds: calculate_connection_uptime(&output_info.status, output_info.connected_at),
                 peer_address: output_info.peer_address.clone(),
                 bitrate_bps,
+                program_number: output_info.config.extract_program_number(),
             });
         }
 
@@ -1209,6 +1217,7 @@ pub async fn get_status(_state: web::Data<AppState>) -> ActixResult<impl Respond
                 uptime_seconds: None,
                 peer_address: None,
                 bitrate_bps: None, // No bitrate for stopped outputs
+                program_number: output_config.extract_program_number(),
             });
         }
 
