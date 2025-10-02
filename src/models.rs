@@ -932,6 +932,7 @@ pub struct AnalysisInfo {
     pub input_id: i64,
     pub task_handle: JoinHandle<()>,
     pub created_at: std::time::SystemTime,
+    pub report_data: Arc<RwLock<Option<AnalysisDataReport>>>, // Latest analysis data
 }
 
 // API request/response models for analysis endpoints
@@ -948,4 +949,63 @@ pub struct AnalysisStatusResponse {
 pub struct AnalysisListResponse {
     pub input_id: i64,
     pub active_analyses: Vec<AnalysisStatusResponse>,
+}
+
+// Analysis data structures - serializable versions of mpegts_inspector data
+#[derive(Serialize, Clone, Debug)]
+pub struct AnalysisDataReport {
+    pub timestamp: String, // ISO 8601 format
+    pub programs: Vec<ProgramData>,
+    pub tr101_metrics: Option<Tr101MetricsData>,
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct ProgramData {
+    pub program_number: u16,
+    pub streams: Vec<StreamData>,
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct StreamData {
+    pub stream_type: u8,
+    pub pid: u16,
+    pub codec: Option<CodecData>,
+}
+
+#[derive(Serialize, Clone, Debug)]
+#[serde(tag = "type")]
+pub enum CodecData {
+    #[serde(rename = "video")]
+    Video {
+        codec: String,
+        width: u32,
+        height: u32,
+        fps: f64,
+    },
+    #[serde(rename = "audio")]
+    Audio {
+        codec: String,
+        sample_rate: Option<u32>,
+        channels: Option<u8>,
+    },
+    #[serde(rename = "subtitle")]
+    Subtitle {
+        codec: String,
+    },
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct Tr101MetricsData {
+    pub sync_byte_errors: u64,
+    pub continuity_counter_errors: u64,
+    pub pat_errors: u64,
+    pub pmt_errors: u64,
+    pub pid_errors: u64,
+    pub transport_errors: u64,
+    pub crc_errors: u64,
+    pub pcr_repetition_errors: u64,
+    pub pcr_discontinuity_errors: u64,
+    pub pcr_accuracy_errors: u64,
+    pub pts_errors: u64,
+    pub cat_errors: u64,
 }

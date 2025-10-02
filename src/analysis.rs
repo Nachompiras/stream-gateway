@@ -1,11 +1,15 @@
 use bytes::Bytes;
 use log::{info, error, warn};
 use std::time::SystemTime;
-use tokio::{sync::broadcast, task::JoinHandle};
+use std::sync::Arc;
+use tokio::{sync::{broadcast, RwLock}, task::JoinHandle};
 use uuid::Uuid;
 use anyhow::{Result, anyhow};
 
-use crate::models::{AnalysisType, AnalysisInfo};
+use crate::models::{
+    AnalysisType, AnalysisInfo, AnalysisDataReport, ProgramData,
+    StreamData, CodecData, Tr101MetricsData
+};
 use crate::ACTIVE_STREAMS;
 use mpegts_inspector::inspector::{self, CodecInfo, InspectorReport};
 
@@ -36,10 +40,13 @@ pub async fn start_analysis(input_id: i64, analysis_type: AnalysisType) -> Resul
         input_info.packet_tx.subscribe()
     };
 
+    // Create shared report data container
+    let report_data = Arc::new(RwLock::new(None));
+
     // Spawn the analysis task based on type
     let task_handle = match analysis_type {
-        AnalysisType::Mux => spawn_mux_analysis(rx, input_id, analysis_id.clone()).await?,
-        AnalysisType::Tr101 => spawn_tr101_analysis(rx, input_id, analysis_id.clone()).await?,
+        AnalysisType::Mux => spawn_mux_analysis(rx, input_id, analysis_id.clone(), report_data.clone()).await?,
+        AnalysisType::Tr101 => spawn_tr101_analysis(rx, input_id, analysis_id.clone(), report_data.clone()).await?,
     };
 
     // Create AnalysisInfo and add to the input's analysis_tasks
@@ -49,6 +56,7 @@ pub async fn start_analysis(input_id: i64, analysis_type: AnalysisType) -> Resul
         input_id,
         task_handle,
         created_at: SystemTime::now(),
+        report_data,
     };
 
     // Add to the active streams map
@@ -129,7 +137,12 @@ pub async fn get_active_analyses(input_id: i64) -> Result<Vec<(String, AnalysisT
 }
 
 /// Spawn MUX analysis task
-async fn spawn_mux_analysis(mut rx: broadcast::Receiver<Bytes>, input_id: i64, analysis_id: String) -> Result<JoinHandle<()>> {
+async fn spawn_mux_analysis(
+    mut rx: broadcast::Receiver<Bytes>,
+    input_id: i64,
+    analysis_id: String,
+    report_data: Arc<RwLock<Option<AnalysisDataReport>>>
+) -> Result<JoinHandle<()>> {
     let handle = tokio::spawn(async move {
         info!("Starting MUX analysis task {} for input {}", analysis_id, input_id);
 
@@ -146,12 +159,24 @@ async fn spawn_mux_analysis(mut rx: broadcast::Receiver<Bytes>, input_id: i64, a
             }
         });
 
+        // Clone for moving into the callback
+        let report_data_clone = report_data.clone();
+
         match inspector::run_from_broadcast(
-            rx_vec, 
-            2, 
-            false, 
-            |report: InspectorReport| {
-        // Process structured data directly (no JSON parsing needed)
+            rx_vec,
+            2,
+            false,
+            move |report: InspectorReport| {
+        // Convert and store the report data
+        let analysis_data = convert_inspector_report(&report);
+
+        // Update the shared report data (spawn task to avoid blocking)
+        let report_data_update = report_data_clone.clone();
+        tokio::spawn(async move {
+            *report_data_update.write().await = Some(analysis_data);
+        });
+
+        // Process structured data directly (no JSON parsing needed) - keep for logging
             for program in &report.programs {
                 println!("Program {}", program.program_number);
                 for stream in &program.streams {
@@ -163,7 +188,7 @@ async fn spawn_mux_analysis(mut rx: broadcast::Receiver<Bytes>, input_id: i64, a
                         Some(CodecInfo::Subtitle(s)) => println!("  Subtitle: {}", s.codec),
                         None => println!("  Unknown stream type {}", stream.stream_type),
                     }
-                }   
+                }
             }
 
             // Access TR-101 metrics (filtered by priority level)
@@ -190,7 +215,12 @@ async fn spawn_mux_analysis(mut rx: broadcast::Receiver<Bytes>, input_id: i64, a
 }
 
 /// Spawn TR-101 analysis task
-async fn spawn_tr101_analysis(mut rx: broadcast::Receiver<Bytes>, input_id: i64, analysis_id: String) -> Result<JoinHandle<()>> {
+async fn spawn_tr101_analysis(
+    mut rx: broadcast::Receiver<Bytes>,
+    input_id: i64,
+    analysis_id: String,
+    report_data: Arc<RwLock<Option<AnalysisDataReport>>>
+) -> Result<JoinHandle<()>> {
     let handle = tokio::spawn(async move {
         info!("Starting TR-101 analysis task {} for input {}", analysis_id, input_id);
 
@@ -207,8 +237,20 @@ async fn spawn_tr101_analysis(mut rx: broadcast::Receiver<Bytes>, input_id: i64,
             }
         });
 
-        match inspector::run_from_broadcast(rx_vec, 2, true,|report: InspectorReport| {
-        // Process structured data directly (no JSON parsing needed)
+        // Clone for moving into the callback
+        let report_data_clone = report_data.clone();
+
+        match inspector::run_from_broadcast(rx_vec, 2, true, move |report: InspectorReport| {
+        // Convert and store the report data
+        let analysis_data = convert_inspector_report(&report);
+
+        // Update the shared report data (spawn task to avoid blocking)
+        let report_data_update = report_data_clone.clone();
+        tokio::spawn(async move {
+            *report_data_update.write().await = Some(analysis_data);
+        });
+
+        // Process structured data directly (no JSON parsing needed) - keep for logging
             for program in &report.programs {
                 println!("Program {}", program.program_number);
                 for stream in &program.streams {
@@ -220,7 +262,7 @@ async fn spawn_tr101_analysis(mut rx: broadcast::Receiver<Bytes>, input_id: i64,
                         Some(CodecInfo::Subtitle(s)) => println!("  Subtitle: {}", s.codec),
                         None => println!("  Unknown stream type {}", stream.stream_type),
                     }
-                }   
+                }
             }
 
             // Access TR-101 metrics (filtered by priority level)
@@ -244,4 +286,73 @@ async fn spawn_tr101_analysis(mut rx: broadcast::Receiver<Bytes>, input_id: i64,
     });
 
     Ok(handle)
+}
+
+/// Convert InspectorReport to serializable AnalysisDataReport
+fn convert_inspector_report(report: &InspectorReport) -> AnalysisDataReport {
+    let programs = report.programs.iter().map(|program| {
+        let streams = program.streams.iter().map(|stream| {
+            let codec = match &stream.codec {
+                Some(CodecInfo::Video(v)) => Some(CodecData::Video {
+                    codec: v.codec.clone(),
+                    width: v.width as u32,
+                    height: v.height as u32,
+                    fps: v.fps as f64,
+                }),
+                Some(CodecInfo::Audio(a)) => Some(CodecData::Audio {
+                    codec: a.codec.clone(),
+                    sample_rate: a.sample_rate,
+                    channels: a.channels,
+                }),
+                Some(CodecInfo::Subtitle(s)) => Some(CodecData::Subtitle {
+                    codec: s.codec.clone(),
+                }),
+                None => None,
+            };
+
+            StreamData {
+                stream_type: stream.stream_type,
+                pid: stream.pid,
+                codec,
+            }
+        }).collect();
+
+        ProgramData {
+            program_number: program.program_number,
+            streams,
+        }
+    }).collect();
+
+    let tr101_metrics = Some(Tr101MetricsData {
+        sync_byte_errors: report.tr101_metrics.sync_byte_errors,
+        continuity_counter_errors: report.tr101_metrics.continuity_counter_errors,
+        pat_errors: report.tr101_metrics.pat_crc_errors,
+        pmt_errors: report.tr101_metrics.pmt_crc_errors,
+        pid_errors: report.tr101_metrics.pid_errors,
+        transport_errors: report.tr101_metrics.transport_error_indicator,
+        crc_errors: report.tr101_metrics.pat_crc_errors + report.tr101_metrics.pmt_crc_errors,
+        pcr_repetition_errors: report.tr101_metrics.pcr_repetition_errors,
+        pcr_discontinuity_errors: 0, // Field not available in current mpegts_inspector version
+        pcr_accuracy_errors: report.tr101_metrics.pcr_accuracy_errors,
+        pts_errors: report.tr101_metrics.pts_errors,
+        cat_errors: report.tr101_metrics.cat_crc_errors,
+    });
+
+    // Generate ISO 8601 timestamp
+    let timestamp = match SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(duration) => {
+            let secs = duration.as_secs();
+            let nanos = duration.subsec_nanos();
+            sqlx::types::chrono::DateTime::from_timestamp(secs as i64, nanos)
+                .unwrap_or_default()
+                .to_rfc3339()
+        }
+        Err(_) => "unknown".to_string(),
+    };
+
+    AnalysisDataReport {
+        timestamp,
+        programs,
+        tr101_metrics,
+    }
 }

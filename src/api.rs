@@ -1660,6 +1660,52 @@ pub async fn get_analysis_status(
     }
 }
 
+#[actix_web::get("/inputs/{id}/analysis/{analysis_type}/data")]
+pub async fn get_analysis_data(
+    path: web::Path<(i64, String)>,
+) -> ActixResult<impl Responder> {
+    let (input_id, analysis_type_str) = path.into_inner();
+
+    //info!("Getting {} analysis data for input {}", analysis_type_str, input_id);
+
+    // Parse analysis type
+    let analysis_type = match analysis_type_str.parse::<AnalysisType>() {
+        Ok(t) => t,
+        Err(e) => {
+            error!("Invalid analysis type '{}': {}", analysis_type_str, e);
+            return Err(ErrorInternalServerError(format!("Invalid analysis type: {}", e)));
+        }
+    };
+
+    // Get the analysis data
+    let guard = ACTIVE_STREAMS.lock().await;
+    let input_info = guard.get(&input_id)
+        .ok_or_else(|| actix_web::error::ErrorNotFound(format!("Input {} not found", input_id)))?;
+
+    // Find the analysis task with the matching type
+    let analysis_info = input_info.analysis_tasks.values()
+        .find(|analysis| analysis.analysis_type == analysis_type)
+        .ok_or_else(|| actix_web::error::ErrorNotFound(
+            format!("No active {} analysis found for input {}", analysis_type_str, input_id)
+        ))?;
+
+    // Get the report data
+    let report_data = analysis_info.report_data.read().await;
+
+    match report_data.as_ref() {
+        Some(data) => {
+            //info!("Returning {} analysis data for input {}", analysis_type_str, input_id);
+            Ok(HttpResponse::Ok().json(data))
+        }
+        None => {
+            //info!("No data available yet for {} analysis on input {}", analysis_type_str, input_id);
+            Err(actix_web::error::ErrorNotFound(
+                format!("No data available yet for {} analysis on input {}. Analysis may be starting up.", analysis_type_str, input_id)
+            ))
+        }
+    }
+}
+
 // ==================== Stream Control Endpoints ====================
 
 #[actix_web::put("/inputs/{id}/start")]
