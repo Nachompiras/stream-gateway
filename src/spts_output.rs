@@ -5,14 +5,18 @@ use log::{info, error, warn};
 use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
 use std::net::SocketAddr;
+use tokio::io::AsyncWriteExt;
+use tokio::time::{Instant, sleep};
+use std::time::Duration;
 
 use crate::models::{
     CreateOutputRequest, InputInfo, OutputInfo, OutputKind, SpsDestinationConfig,
-    SrtOutputConfig, StateChangeSender, StreamStatus
+    SrtOutputConfig, StateChangeSender, StreamStatus, InputStats, SrtSink
 };
 use crate::mpegts_filter::ProgramFilter;
 use crate::metrics;
 use crate::udp_stream::MulticastOutputConfig;
+use crate::srt_stream::SrtSinkWithState;
 
 /// Create an SPTS output that filters a specific program from an MPTS input
 pub async fn create_spts_output(
@@ -73,7 +77,7 @@ pub async fn create_spts_output(
     };
 
     // Spawn the filtering and sending task
-    let (abort_handle, status) = match destination {
+    let (abort_handle, status, stats) = match destination {
         SpsDestinationConfig::Udp { remote_host, remote_port, destination_addr, bind_host, multicast_ttl, multicast_interface, .. } => {
             let dest_str = if let Some(ref addr) = destination_addr {
                 addr.clone()
@@ -117,16 +121,17 @@ pub async fn create_spts_output(
                 multicast_config,
             );
 
-            (handle, StreamStatus::Connected) // UDP is immediately connected
+            (handle, StreamStatus::Connected, Arc::new(RwLock::new(None))) // UDP is immediately connected
         },
         SpsDestinationConfig::Srt { config } => {
-            let handle = spawn_spts_srt_sender(
+            let (handle, stats_cell) = spawn_spts_srt_sender(
                 packet_rx,
                 config.clone(),
                 program_number,
                 fill_with_nulls,
                 input.id,
                 output_id,
+                state_tx.clone(),
             );
 
             let status = match config {
@@ -134,7 +139,7 @@ pub async fn create_spts_output(
                 SrtOutputConfig::Caller { .. } => StreamStatus::Connecting,
             };
 
-            (handle, status)
+            (handle, status, stats_cell)
         },
     };
 
@@ -150,7 +155,7 @@ pub async fn create_spts_output(
         destination: destination_addr,
         kind: OutputKind::Spts,
         status,
-        stats: Arc::new(RwLock::new(None)),
+        stats,
         abort_handle: Some(abort_handle),
         config,
         started_at: Some(std::time::SystemTime::now()),
@@ -280,16 +285,27 @@ fn spawn_spts_udp_sender(
 /// Spawn a task that filters SPTS and sends via SRT
 fn spawn_spts_srt_sender(
     mut packet_rx: broadcast::Receiver<Bytes>,
-    _config: SrtOutputConfig,
+    config: SrtOutputConfig,
     program_number: u16,
     fill_with_nulls: bool,
     input_id: i64,
     output_id: i64,
-) -> AbortHandle {
+    state_tx: Option<StateChangeSender>,
+) -> (AbortHandle, Arc<RwLock<Option<InputStats>>>) {
     info!("[Input {}] Spawning SPTS SRT sender for output {} (program {})",
           input_id, output_id, program_number);
 
     let (abort_handle, abort_registration) = AbortHandle::new_pair();
+    let stats_cell: Arc<RwLock<Option<InputStats>>> = Arc::new(RwLock::new(None));
+    let stats_clone = stats_cell.clone();
+
+    // Create SRT sink
+    let mut sink = SrtSinkWithState {
+        config: config.clone(),
+        input_id,
+        output_id,
+        state_tx: state_tx.clone(),
+    };
 
     tokio::spawn(futures::future::Abortable::new(
         async move {
@@ -298,34 +314,97 @@ fn spawn_spts_srt_sender(
 
             info!("[Output {}] SPTS SRT sender started for program {}", output_id, program_number);
 
-            // TODO: Implement SRT connection and sending
-            // For now, just log that this is not fully implemented
-            warn!("[Output {}] SPTS SRT output not fully implemented yet, filtering only", output_id);
-
-            // Main loop: receive packets and filter (but not send yet)
+            // Main connection loop (handles reconnection)
             loop {
-                match packet_rx.recv().await {
-                    Ok(data) => {
-                        // Filter packets for our program
-                        let _filtered = filter.filter_packets(&data);
-
-                        // TODO: Send filtered data via SRT
-                    }
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        warn!("[Output {}] Receiver lagged by {} messages", output_id, n);
+                // Get/establish SRT socket (handles state notifications)
+                let mut sock = match sink.get_socket().await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        error!("[Output {}] Failed to get SRT socket: {}", output_id, e);
+                        // Notify reconnecting state on error
+                        if let Some(ref tx) = state_tx {
+                            let _ = tx.send(crate::models::StateChange::OutputStateChanged {
+                                input_id,
+                                output_id,
+                                new_status: StreamStatus::Reconnecting,
+                                connected_at: None,
+                                peer_address: None,
+                            });
+                        }
+                        sleep(Duration::from_secs(2)).await;
                         continue;
                     }
-                    Err(broadcast::error::RecvError::Closed) => {
-                        info!("[Output {}] Input stream closed", output_id);
-                        break;
+                };
+
+                let mut next_stats = Instant::now();
+
+                // Send loop
+                loop {
+                    match packet_rx.recv().await {
+                        Ok(data) => {
+                            // Filter packets for our program
+                            let filtered = filter.filter_packets(&data);
+
+                            // Skip if no filtered data (all packets were filtered out)
+                            if filtered.is_empty() {
+                                continue;
+                            }
+
+                            // Send filtered data via SRT
+                            match sock.write(&filtered).await {
+                                Ok(n) if n == filtered.len() => {
+                                    // Sent successfully
+                                    metrics::record_output_bytes(&None, input_id, output_id, "spts_srt", filtered.len() as u64);
+                                    metrics::record_output_packets(&None, input_id, output_id, "spts_srt", 1);
+                                },
+                                Ok(n) => {
+                                    warn!("[Output {}] Partial send: {}/{} bytes", output_id, n, filtered.len());
+                                    metrics::record_stream_error(&None, output_id, "spts_srt", "partial_send");
+                                },
+                                Err(e) => {
+                                    error!("[Output {}] Send error: {}", output_id, e);
+                                    metrics::record_stream_error(&None, output_id, "spts_srt", "send_failed");
+                                    // Break to reconnect
+                                    break;
+                                }
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Closed) => {
+                            info!("[Output {}] Input stream closed", output_id);
+                            return;
+                        }
+                        Err(broadcast::error::RecvError::Lagged(n)) => {
+                            warn!("[Output {}] Receiver lagged by {} messages", output_id, n);
+                            continue;
+                        }
+                    }
+
+                    // Update SRT statistics periodically
+                    if next_stats.elapsed() >= Duration::from_secs(1) {
+                        if let Ok(s) = sock.socket.srt_bistats(0, 1) {
+                            *stats_clone.write().await = Some(InputStats::Srt(Box::new(s)));
+                        }
+                        next_stats = Instant::now();
                     }
                 }
-            }
 
-            info!("[Output {}] SPTS SRT sender stopped", output_id);
+                // Notify reconnecting state when connection breaks
+                if let Some(ref tx) = state_tx {
+                    let _ = tx.send(crate::models::StateChange::OutputStateChanged {
+                        input_id,
+                        output_id,
+                        new_status: StreamStatus::Reconnecting,
+                        connected_at: None,
+                        peer_address: None,
+                    });
+                }
+
+                // Wait before reconnecting
+                sleep(Duration::from_secs(2)).await;
+            }
         },
         abort_registration,
     ));
 
-    abort_handle
+    (abort_handle, stats_cell)
 }

@@ -12,6 +12,7 @@ const TS_SYNC_BYTE: u8 = 0x47;
 const PAT_PID: u16 = 0x0000;
 
 /// PID for null packets
+#[allow(dead_code)]
 const NULL_PID: u16 = 0x1FFF;
 
 /// PID for Conditional Access Table
@@ -87,9 +88,13 @@ pub struct ProgramFilter {
     program_info: Option<ProgramInfo>,
     pat_version: Option<u8>,
     pmt_version: Option<u8>,
+    #[allow(dead_code)]
     pat_continuity: u8,
+    #[allow(dead_code)]
     pmt_continuity: u8,
+    #[allow(dead_code)]
     pat_cache: Option<Bytes>,
+    #[allow(dead_code)]
     pmt_cache: Option<Bytes>,
     fill_with_nulls: bool,
 }
@@ -309,6 +314,7 @@ impl ProgramFilter {
     }
 
     /// Get current program info if available
+    #[allow(dead_code)]
     pub fn get_program_info(&self) -> Option<&ProgramInfo> {
         self.program_info.as_ref()
     }
