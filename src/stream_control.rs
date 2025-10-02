@@ -278,6 +278,17 @@ async fn start_output_internal(input_info: &mut InputInfo, output_id: i64, outpu
                 name.clone(),
                 state_tx,
             ).map_err(|e| anyhow::anyhow!("Failed to create SRT output: {}", e))?
+        },
+        CreateOutputRequest::Spts { name, program_number, fill_with_nulls, destination, .. } => {
+            crate::spts_output::create_spts_output(
+                input_info,
+                output_id,
+                name.clone(),
+                *program_number,
+                fill_with_nulls.unwrap_or(false),
+                destination.clone(),
+                state_tx,
+            ).await.map_err(|e| anyhow::anyhow!("Failed to create SPTS output: {}", e))?
         }
     };
 

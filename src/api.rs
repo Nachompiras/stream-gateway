@@ -8,6 +8,7 @@ use crate::udp_stream::{create_udp_output, spawn_udp_input_with_stats};
 use crate::srt_stream::{
     create_srt_output, SrtSourceWithState,
 };
+use crate::spts_output::create_spts_output;
 use crate::models::*;
 use crate::database::{self, check_output_exists, check_port_conflict, get_input_by_id, get_output_by_id, update_input_status_in_db, update_output_status_in_db, get_input_id_for_output};
 use crate::{ACTIVE_STREAMS, STATE_CHANGE_TX};
@@ -362,6 +363,7 @@ pub async fn create_output(
     let input_id = match &req_val {
         CreateOutputRequest::Udp { input_id, .. } => *input_id,
         CreateOutputRequest::Srt { input_id, .. } => *input_id,
+        CreateOutputRequest::Spts { input_id, .. } => *input_id,
     };
 
     // get InputInfo
@@ -393,6 +395,24 @@ pub async fn create_output(
                     },
                     _ => {} // Callers don't need auto port assignment
                 }
+            },
+            CreateOutputRequest::Spts { destination, .. } => {
+                match destination {
+                    SpsDestinationConfig::Udp { remote_port, automatic_port, .. } => {
+                        *remote_port = Some(port);
+                        *automatic_port = None;
+                    },
+                    SpsDestinationConfig::Srt { config } => {
+                        match config {
+                            SrtOutputConfig::Listener { bind_port, listen_port, automatic_port, .. } => {
+                                *bind_port = Some(port);
+                                *listen_port = Some(port);
+                                *automatic_port = None;
+                            },
+                            _ => {}
+                        }
+                    }
+                }
             }
         }
 
@@ -420,6 +440,28 @@ pub async fn create_output(
                     let port = config.get_bind_port().unwrap_or(8000);
                     (format!(":{}", port), Some(port))
                 },
+            }
+        },
+        CreateOutputRequest::Spts { destination, program_number, .. } => {
+            match destination {
+                SpsDestinationConfig::Udp { .. } => {
+                    let host = destination.get_remote_host().unwrap_or_else(|| "127.0.0.1".to_string());
+                    let port = destination.get_remote_port().unwrap_or(8000);
+                    (format!("spts:{}:{}:{}", program_number, host, port), None)
+                },
+                SpsDestinationConfig::Srt { config } => {
+                    match config {
+                        SrtOutputConfig::Caller { .. } => {
+                            let host = config.get_remote_host().unwrap_or_else(|| "127.0.0.1".to_string());
+                            let port = config.get_remote_port().unwrap_or(8000);
+                            (format!("spts:{}:{}:{}", program_number, host, port), None)
+                        },
+                        SrtOutputConfig::Listener { .. } => {
+                            let port = config.get_bind_port().unwrap_or(8000);
+                            (format!("spts:{}::{}", program_number, port), Some(port))
+                        },
+                    }
+                }
             }
         }
     };
@@ -483,6 +525,13 @@ pub async fn create_output(
                 .map_err(|e| ErrorInternalServerError(format!("Serialization error: {e}")))?);
             (final_name, kind_str, config_json)
         }
+        CreateOutputRequest::Spts { name: user_name, program_number, .. } => {
+            let auto_name = format!("SPTS Program {} Output", program_number);
+            let final_name = user_name.clone().or(Some(auto_name));
+            let config_json = Some(serde_json::to_string(&final_req)
+                .map_err(|e| ErrorInternalServerError(format!("Serialization error: {e}")))?);
+            (final_name, "spts", config_json)
+        }
     };
 
     let output_id = database::save_output_to_db(
@@ -524,6 +573,17 @@ pub async fn create_output(
 
         CreateOutputRequest::Srt { config, name: user_name, .. } =>
             create_srt_output(input_id, config.clone(), input, output_id, user_name.clone(), get_state_change_sender().await)?,
+
+        CreateOutputRequest::Spts { name: user_name, program_number, fill_with_nulls, destination, .. } =>
+            create_spts_output(
+                input,
+                output_id,
+                user_name.clone(),
+                *program_number,
+                fill_with_nulls.unwrap_or(false),
+                destination.clone(),
+                get_state_change_sender().await
+            ).await?,
     };
 
     // Insertamos el output en el Input correspondiente
@@ -654,12 +714,36 @@ pub async fn get_input(
                         },
                     };
                     (dest, kind_str)
+                },
+                CreateOutputRequest::Spts { destination, program_number, .. } => {
+                    let dest = match destination {
+                        SpsDestinationConfig::Udp { .. } => {
+                            let host = destination.get_remote_host().unwrap_or_else(|| "127.0.0.1".to_string());
+                            let port = destination.get_remote_port().unwrap_or(8000);
+                            format!("spts:{}:{}:{}", program_number, host, port)
+                        },
+                        SpsDestinationConfig::Srt { config } => {
+                            match config {
+                                SrtOutputConfig::Caller { .. } => {
+                                    let host = config.get_remote_host().unwrap_or_else(|| "unknown".to_string());
+                                    let port = config.get_remote_port().unwrap_or(0);
+                                    format!("spts:{}:{}:{}", program_number, host, port)
+                                },
+                                SrtOutputConfig::Listener { .. } => {
+                                    let port = config.get_bind_port().unwrap_or(0);
+                                    format!("spts:{}::{}", program_number, port)
+                                },
+                            }
+                        }
+                    };
+                    (dest, "spts")
                 }
             };
 
             let name = match output_config {
                 CreateOutputRequest::Udp { name, .. } => name.clone(),
                 CreateOutputRequest::Srt { name, .. } => name.clone(),
+                CreateOutputRequest::Spts { name, .. } => name.clone(),
             };
 
             outputs.push(OutputDetailResponse {
@@ -751,6 +835,29 @@ pub async fn list_outputs(_state: web::Data<AppState>) -> ActixResult<impl Respo
                         },
                     };
                     (dest, kind_str.to_string(), name.clone())
+                },
+                CreateOutputRequest::Spts { name, destination, program_number, .. } => {
+                    let dest = match destination {
+                        SpsDestinationConfig::Udp { .. } => {
+                            let host = destination.get_remote_host().unwrap_or_else(|| "127.0.0.1".to_string());
+                            let port = destination.get_remote_port().unwrap_or(8000);
+                            format!("spts:{}:{}:{}", program_number, host, port)
+                        },
+                        SpsDestinationConfig::Srt { config } => {
+                            match config {
+                                SrtOutputConfig::Caller { .. } => {
+                                    let host = config.get_remote_host().unwrap_or_else(|| "unknown".to_string());
+                                    let port = config.get_remote_port().unwrap_or(0);
+                                    format!("spts:{}:{}:{}", program_number, host, port)
+                                },
+                                SrtOutputConfig::Listener { .. } => {
+                                    let port = config.get_bind_port().unwrap_or(0);
+                                    format!("spts:{}::{}", program_number, port)
+                                },
+                            }
+                        }
+                    };
+                    (dest, "spts".to_string(), name.clone())
                 }
             };
 
@@ -888,12 +995,36 @@ pub async fn get_input_outputs(
                         },
                     };
                     (dest, kind_str)
+                },
+                CreateOutputRequest::Spts { destination, program_number, .. } => {
+                    let dest = match destination {
+                        SpsDestinationConfig::Udp { .. } => {
+                            let host = destination.get_remote_host().unwrap_or_else(|| "127.0.0.1".to_string());
+                            let port = destination.get_remote_port().unwrap_or(8000);
+                            format!("spts:{}:{}:{}", program_number, host, port)
+                        },
+                        SpsDestinationConfig::Srt { config } => {
+                            match config {
+                                SrtOutputConfig::Caller { .. } => {
+                                    let host = config.get_remote_host().unwrap_or_else(|| "unknown".to_string());
+                                    let port = config.get_remote_port().unwrap_or(0);
+                                    format!("spts:{}:{}:{}", program_number, host, port)
+                                },
+                                SrtOutputConfig::Listener { .. } => {
+                                    let port = config.get_bind_port().unwrap_or(0);
+                                    format!("spts:{}::{}", program_number, port)
+                                },
+                            }
+                        }
+                    };
+                    (dest, "spts")
                 }
             };
 
             let name = match output_config {
                 CreateOutputRequest::Udp { name, .. } => name.clone(),
                 CreateOutputRequest::Srt { name, .. } => name.clone(),
+                CreateOutputRequest::Spts { name, .. } => name.clone(),
             };
 
             outputs.push(OutputDetailResponse {
@@ -1035,12 +1166,36 @@ pub async fn get_status(_state: web::Data<AppState>) -> ActixResult<impl Respond
                         },
                     };
                     (dest, kind_str)
+                },
+                CreateOutputRequest::Spts { destination, program_number, .. } => {
+                    let dest = match destination {
+                        SpsDestinationConfig::Udp { .. } => {
+                            let host = destination.get_remote_host().unwrap_or_else(|| "127.0.0.1".to_string());
+                            let port = destination.get_remote_port().unwrap_or(8000);
+                            format!("spts:{}:{}:{}", program_number, host, port)
+                        },
+                        SpsDestinationConfig::Srt { config } => {
+                            match config {
+                                SrtOutputConfig::Caller { .. } => {
+                                    let host = config.get_remote_host().unwrap_or_else(|| "unknown".to_string());
+                                    let port = config.get_remote_port().unwrap_or(0);
+                                    format!("spts:{}:{}:{}", program_number, host, port)
+                                },
+                                SrtOutputConfig::Listener { .. } => {
+                                    let port = config.get_bind_port().unwrap_or(0);
+                                    format!("spts:{}::{}", program_number, port)
+                                },
+                            }
+                        }
+                    };
+                    (dest, "spts")
                 }
             };
 
             let name = match output_config {
                 CreateOutputRequest::Udp { name, .. } => name.clone(),
                 CreateOutputRequest::Srt { name, .. } => name.clone(),
+                CreateOutputRequest::Spts { name, .. } => name.clone(),
             };
 
             outputs_resp.push(OutputResponse {
