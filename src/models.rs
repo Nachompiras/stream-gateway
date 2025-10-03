@@ -10,6 +10,7 @@ use std::io;
 use sqlx::FromRow;
 use tokio::task::JoinHandle;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const BROADCAST_CAPACITY: usize = 1024; // Capacidad del buffer del canal broadcast
 
@@ -421,6 +422,35 @@ pub struct UdpStats {
     pub total_bytes:       u64,
     pub packets_per_sec:   u64,
     pub bitrate_bps:       u64,
+}
+
+// Lock-free UDP stats using atomics
+#[derive(Debug)]
+pub struct UdpStatsAtomic {
+    pub total_packets:     AtomicU64,
+    pub total_bytes:       AtomicU64,
+    pub packets_per_sec:   AtomicU64,
+    pub bitrate_bps:       AtomicU64,
+}
+
+impl UdpStatsAtomic {
+    pub fn new() -> Self {
+        Self {
+            total_packets: AtomicU64::new(0),
+            total_bytes: AtomicU64::new(0),
+            packets_per_sec: AtomicU64::new(0),
+            bitrate_bps: AtomicU64::new(0),
+        }
+    }
+
+    pub fn snapshot(&self) -> UdpStats {
+        UdpStats {
+            total_packets: self.total_packets.load(Ordering::Relaxed),
+            total_bytes: self.total_bytes.load(Ordering::Relaxed),
+            packets_per_sec: self.packets_per_sec.load(Ordering::Relaxed),
+            bitrate_bps: self.bitrate_bps.load(Ordering::Relaxed),
+        }
+    }
 }
 
 /// Rasgo: “dame un socket listo para recibir datos SRT”.

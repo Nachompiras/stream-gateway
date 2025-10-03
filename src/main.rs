@@ -1,6 +1,7 @@
 
 use srt_rs::{startup,cleanup};
 use actix_web::{web, App, HttpServer};
+use actix_cors::Cors;
 use tokio::signal;
 mod analysis;
 mod api;
@@ -75,6 +76,13 @@ async fn main() -> std::io::Result<()> {
 
     let server = HttpServer::new(move || {
         App::new()
+            .wrap(
+                Cors::default()
+                    .allow_any_origin()
+                    .allow_any_method()
+                    .allow_any_header()
+                    .max_age(3600)
+            )
             .app_data(app_state_for_server.clone()) // Compartir estado con los handlers
             // Input endpoints
             .service(create_input)

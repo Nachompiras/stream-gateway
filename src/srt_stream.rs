@@ -441,7 +441,7 @@ impl Forwarder {
         let input_name_clone = input_name.clone();
 
         let handle: JoinHandle<()> = tokio::spawn(async move {
-            let mut buf = vec![0u8; 2048]; // buffer de lectura
+            let mut buf = vec![0u8; 65536]; // buffer de lectura
 
             loop {
                 // --------------------------------------------------------
@@ -477,8 +477,8 @@ impl Forwarder {
                 // --------------------------------------------------------
                 // bucle de lectura del socket
                 // --------------------------------------------------------
-                loop {       
-                    buf.reserve(1316);                                                   
+                buf.reserve(1316);
+                loop {                                                                              
                     let read_res = sock.read(&mut buf).await;
 
                     //2) cada 1 s pedir bistats

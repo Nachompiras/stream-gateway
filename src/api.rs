@@ -609,29 +609,38 @@ pub async fn create_output(
 }
 
 #[actix_web::get("/inputs")]
-pub async fn list_inputs(state: web::Data<AppState>) -> ActixResult<impl Responder> {
-    let state_guard = ACTIVE_STREAMS.lock().await;
+pub async fn list_inputs(_state: web::Data<AppState>) -> ActixResult<impl Responder> {
+    // Clone necessary data while holding the lock briefly
+    let inputs_snapshot: Vec<(i64, Option<String>, String, usize, StreamStatus, Option<u16>, Option<SystemTime>, Option<String>)> = {
+        let state_guard = ACTIVE_STREAMS.lock().await;
+        state_guard.iter().map(|(input_id, input_info)| {
+            (
+                *input_id,
+                input_info.name.clone(),
+                input_kind_string(&input_info.config).to_string(),
+                input_info.output_tasks.len(),
+                input_info.status.clone(),
+                input_info.config.extract_assigned_port(),
+                input_info.connected_at,
+                input_info.source_address.clone(),
+            )
+        }).collect()
+    }; // Lock released here
+
     let mut response: Vec<InputListResponse> = Vec::new();
 
-    for (input_id, input_info) in state_guard.iter() {
-        // Get input type from database to have accurate classification
-        let input_type = if let Ok(Some(db_input)) = database::get_input_by_id(&state.pool, *input_id).await {
-            input_type_display_string(&db_input.kind).to_string()
-        } else {
-            "Unknown".to_string()
-        };
-
-        let assigned_port = input_info.config.extract_assigned_port();
+    for (input_id, name, kind, output_count, status, assigned_port, connected_at, source_address) in inputs_snapshot {
+        let input_type = input_type_display_string(&kind).to_string();
 
         response.push(InputListResponse {
-            id: *input_id,
-            name: input_info.name.clone(),
+            id: input_id,
+            name,
             input_type,
-            status: input_info.status.to_string(),
+            status: status.to_string(),
             assigned_port,
-            output_count: input_info.output_tasks.len(),
-            uptime_seconds: calculate_connection_uptime(&input_info.status, input_info.connected_at),
-            source_address: input_info.source_address.clone(),
+            output_count,
+            uptime_seconds: calculate_connection_uptime(&status, connected_at),
+            source_address,
         });
     }
 
@@ -792,108 +801,174 @@ pub async fn get_input(
 }
 
 #[actix_web::get("/outputs")]
-pub async fn list_outputs(state: web::Data<AppState>) -> ActixResult<impl Responder> {
-    let state_guard = ACTIVE_STREAMS.lock().await;
+pub async fn list_outputs(_state: web::Data<AppState>) -> ActixResult<impl Responder> {
+    // Clone necessary data while holding the lock briefly
+    let outputs_snapshot: Vec<OutputSnapshotData> = {
+        let state_guard = ACTIVE_STREAMS.lock().await;
+        let mut snapshot = Vec::new();
+
+        for (input_id, input_info) in state_guard.iter() {
+            // Collect active outputs
+            for (output_id, output_info) in input_info.output_tasks.iter() {
+                snapshot.push(OutputSnapshotData::Active {
+                    id: *output_id,
+                    name: output_info.name.clone(),
+                    input_id: *input_id,
+                    input_name: input_info.name.clone(),
+                    destination: output_info.destination.clone(),
+                    kind: output_info.kind.clone(),
+                    status: output_info.status.clone(),
+                    assigned_port: output_info.config.extract_assigned_port(),
+                    connected_at: output_info.connected_at,
+                    peer_address: output_info.peer_address.clone(),
+                    program_number: output_info.config.extract_program_number(),
+                });
+            }
+
+            // Collect stopped outputs
+            for (output_id, output_config) in input_info.stopped_outputs.iter() {
+                snapshot.push(OutputSnapshotData::Stopped {
+                    id: *output_id,
+                    input_id: *input_id,
+                    input_name: input_info.name.clone(),
+                    config: output_config.clone(),
+                });
+            }
+        }
+        snapshot
+    }; // Lock released here
+
     let mut response: Vec<OutputListResponse> = Vec::new();
 
-    for (input_id, input_info) in state_guard.iter() {
-        // Add active outputs
-        for (output_id, output_info) in input_info.output_tasks.iter() {
-            // Get config from database
-            let config = if let Ok(Some(db_output)) = database::get_output_by_id(&state.pool, *output_id).await {
-                db_output.config_json
-            } else {
-                None
-            };
-
-            response.push(OutputListResponse {
-                id: *output_id,
-                name: output_info.name.clone(),
-                input_id: *input_id,
-                input_name: input_info.name.clone(),
-                destination: output_info.destination.clone(),
-                output_type: output_kind_string(&output_info.kind).to_string(),
-                status: output_info.status.to_string(),
-                assigned_port: output_info.config.extract_assigned_port(),
-                uptime_seconds: calculate_connection_uptime(&output_info.status, output_info.connected_at),
-                peer_address: output_info.peer_address.clone(),
-                program_number: output_info.config.extract_program_number(),
-                config,
-            });
-        }
-
-        // Add stopped outputs
-        for (output_id, output_config) in input_info.stopped_outputs.iter() {
-            let (destination, output_type, name) = match output_config {
-                CreateOutputRequest::Udp { name, .. } => {
-                    let host = output_config.get_remote_host().unwrap_or_else(|| "127.0.0.1".to_string());
-                    let port = output_config.get_remote_port().unwrap_or(8000);
-                    (format!("{}:{}", host, port), "udp".to_string(), name.clone())
-                },
-                CreateOutputRequest::Srt { name, config, .. } => {
-                    let kind_str = match config {
-                        SrtOutputConfig::Caller { .. } => "srt_caller",
-                        SrtOutputConfig::Listener { .. } => "srt_listener",
-                    };
-                    let dest = match config {
-                        SrtOutputConfig::Caller { .. } => {
-                            let host = config.get_remote_host().unwrap_or_else(|| "unknown".to_string());
-                            let port = config.get_remote_port().unwrap_or(0);
-                            format!("{}:{}", host, port)
-                        },
-                        SrtOutputConfig::Listener { .. } => {
-                            let port = config.get_bind_port().unwrap_or(0);
-                            format!(":{}", port)
-                        },
-                    };
-                    (dest, kind_str.to_string(), name.clone())
-                },
-                CreateOutputRequest::Spts { name, destination, program_number, .. } => {
-                    let dest = match destination {
-                        SpsDestinationConfig::Udp { .. } => {
-                            let host = destination.get_remote_host().unwrap_or_else(|| "127.0.0.1".to_string());
-                            let port = destination.get_remote_port().unwrap_or(8000);
-                            format!("spts:{}:{}:{}", program_number, host, port)
-                        },
-                        SpsDestinationConfig::Srt { config } => {
-                            match config {
-                                SrtOutputConfig::Caller { .. } => {
-                                    let host = config.get_remote_host().unwrap_or_else(|| "unknown".to_string());
-                                    let port = config.get_remote_port().unwrap_or(0);
-                                    format!("spts:{}:{}:{}", program_number, host, port)
-                                },
-                                SrtOutputConfig::Listener { .. } => {
-                                    let port = config.get_bind_port().unwrap_or(0);
-                                    format!("spts:{}::{}", program_number, port)
-                                },
-                            }
-                        }
-                    };
-                    (dest, "spts".to_string(), name.clone())
-                }
-            };
-
-            // Serialize config for stopped outputs
-            let config_json = serde_json::to_string(output_config).ok();
-
-            response.push(OutputListResponse {
-                id: *output_id,
+    for snapshot_data in outputs_snapshot {
+        match snapshot_data {
+            OutputSnapshotData::Active {
+                id,
                 name,
-                input_id: *input_id,
-                input_name: input_info.name.clone(),
+                input_id,
+                input_name,
                 destination,
-                output_type,
-                status: "stopped".to_string(),
-                assigned_port: output_config.extract_assigned_port(),
-                uptime_seconds: None,
-                peer_address: None,
-                program_number: output_config.extract_program_number(),
-                config: config_json,
-            });
+                kind,
+                status,
+                assigned_port,
+                connected_at,
+                peer_address,
+                program_number,
+            } => {
+                response.push(OutputListResponse {
+                    id,
+                    name,
+                    input_id,
+                    input_name,
+                    destination,
+                    output_type: output_kind_string(&kind).to_string(),
+                    status: status.to_string(),
+                    assigned_port,
+                    uptime_seconds: calculate_connection_uptime(&status, connected_at),
+                    peer_address,
+                    program_number,
+                    config: None, // We'll skip DB lookup for performance
+                });
+            }
+            OutputSnapshotData::Stopped {
+                id,
+                input_id,
+                input_name,
+                config,
+            } => {
+                let (destination, output_type, name) = match &config {
+                    CreateOutputRequest::Udp { name, .. } => {
+                        let host = config.get_remote_host().unwrap_or_else(|| "127.0.0.1".to_string());
+                        let port = config.get_remote_port().unwrap_or(8000);
+                        (format!("{}:{}", host, port), "udp".to_string(), name.clone())
+                    },
+                    CreateOutputRequest::Srt { name, config: srt_config, .. } => {
+                        let kind_str = match srt_config {
+                            SrtOutputConfig::Caller { .. } => "srt_caller",
+                            SrtOutputConfig::Listener { .. } => "srt_listener",
+                        };
+                        let dest = match srt_config {
+                            SrtOutputConfig::Caller { .. } => {
+                                let host = srt_config.get_remote_host().unwrap_or_else(|| "unknown".to_string());
+                                let port = srt_config.get_remote_port().unwrap_or(0);
+                                format!("{}:{}", host, port)
+                            },
+                            SrtOutputConfig::Listener { .. } => {
+                                let port = srt_config.get_bind_port().unwrap_or(0);
+                                format!(":{}", port)
+                            },
+                        };
+                        (dest, kind_str.to_string(), name.clone())
+                    },
+                    CreateOutputRequest::Spts { name, destination, program_number, .. } => {
+                        let dest = match destination {
+                            SpsDestinationConfig::Udp { .. } => {
+                                let host = destination.get_remote_host().unwrap_or_else(|| "127.0.0.1".to_string());
+                                let port = destination.get_remote_port().unwrap_or(8000);
+                                format!("spts:{}:{}:{}", program_number, host, port)
+                            },
+                            SpsDestinationConfig::Srt { config: srt_config } => {
+                                match srt_config {
+                                    SrtOutputConfig::Caller { .. } => {
+                                        let host = srt_config.get_remote_host().unwrap_or_else(|| "unknown".to_string());
+                                        let port = srt_config.get_remote_port().unwrap_or(0);
+                                        format!("spts:{}:{}:{}", program_number, host, port)
+                                    },
+                                    SrtOutputConfig::Listener { .. } => {
+                                        let port = srt_config.get_bind_port().unwrap_or(0);
+                                        format!("spts:{}::{}", program_number, port)
+                                    },
+                                }
+                            }
+                        };
+                        (dest, "spts".to_string(), name.clone())
+                    }
+                };
+
+                let config_json = serde_json::to_string(&config).ok();
+
+                response.push(OutputListResponse {
+                    id,
+                    name,
+                    input_id,
+                    input_name,
+                    destination,
+                    output_type,
+                    status: "stopped".to_string(),
+                    assigned_port: config.extract_assigned_port(),
+                    uptime_seconds: None,
+                    peer_address: None,
+                    program_number: config.extract_program_number(),
+                    config: config_json,
+                });
+            }
         }
     }
 
     Ok(HttpResponse::Ok().json(response))
+}
+
+// Helper enum for snapshot data
+enum OutputSnapshotData {
+    Active {
+        id: i64,
+        name: Option<String>,
+        input_id: i64,
+        input_name: Option<String>,
+        destination: String,
+        kind: OutputKind,
+        status: StreamStatus,
+        assigned_port: Option<u16>,
+        connected_at: Option<SystemTime>,
+        peer_address: Option<String>,
+        program_number: Option<u16>,
+    },
+    Stopped {
+        id: i64,
+        input_id: i64,
+        input_name: Option<String>,
+        config: CreateOutputRequest,
+    },
 }
 
 #[actix_web::get("/outputs/{id}")]

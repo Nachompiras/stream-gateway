@@ -9,6 +9,7 @@ libc = "0.2.175"
 console-subscriber = "0.4.1"
 tokio = { version = "1.47.1", features = ["full","tracing"] }
 actix-web = "4.11"
+actix-cors = "0.7"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.143"
 bytes = "1.10.1" # Para manejo eficiente de buffers de bytes (zero-copy clones)

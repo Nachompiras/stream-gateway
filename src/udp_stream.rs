@@ -1,8 +1,9 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use std::sync::atomic::Ordering;
 use actix_web::error::ErrorBadRequest;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use tokio::{net::UdpSocket, sync::{broadcast::{self, Receiver}, RwLock}};
 use futures::stream::{AbortHandle, Abortable};
 use log::{info};
@@ -11,7 +12,7 @@ use crate::metrics;
 use std::time::SystemTime;
 use socket2::{Socket, Domain, Type, Protocol, SockAddr};
 use std::net::{IpAddr,Ipv4Addr};
-use tokio::time::timeout;
+use crate::GLOBAL_CANCEL_TOKEN;
 
 #[derive(Debug, Clone)]
 pub struct MulticastOutputConfig {
@@ -133,8 +134,12 @@ pub fn spawn_udp_input_with_stats(
     let (tx, _rx) = broadcast::channel::<Bytes>(1024);
     let stats: StatsCell = Arc::new(RwLock::new(None));
 
+    // Create atomic stats for lock-free updates
+    let atomic_stats = Arc::new(UdpStatsAtomic::new());
+
     let tx_for_task = tx.clone();
     let stats_task = stats.clone();
+    let atomic_stats_task = atomic_stats.clone();
     let state_tx_task = state_tx.clone();
     let bind_host_task = bind_host.clone();
     let multicast_group_task = multicast_group.clone();
@@ -175,8 +180,11 @@ pub fn spawn_udp_input_with_stats(
                 return;
             }
         };
-                   
-        let mut buf = [0u8; 2048];
+
+        // Use BytesMut for efficient memory management - pre-allocate with capacity
+        let mut buf = BytesMut::with_capacity(2048);
+        buf.resize(2048, 0);
+
         let mut total_bytes   = 0u64;
         let mut total_packets = 0u64;
         let mut window_bytes  = 0u64;
@@ -187,73 +195,86 @@ pub fn spawn_udp_input_with_stats(
         const IDLE_TIMEOUT: Duration = Duration::from_secs(10); // Timeout to go back to listening
 
         loop {
-            // Use timeout to make recv responsive to cancellation
-            match timeout(Duration::from_millis(500), sock.recv_from(&mut buf)).await {
-                Ok(Ok((n, peer_addr))) => {
-                    //println!("UDP input {listen_port}: received {n} bytes from {peer_addr}");
-                    let _ = tx_for_task.send(Bytes::copy_from_slice(&buf[..n]));
-                    total_bytes += n as u64;
-                    total_packets += 1;
+            // Use tokio::select! to handle recv and cancellation efficiently
+            tokio::select! {
+                result = sock.recv_from(&mut buf) => {
+                    match result {
+                        Ok((n, peer_addr)) => {
+                            //println!("UDP input {listen_port}: received {n} bytes from {peer_addr}");
+                            // Efficiently send the bytes by truncating and freezing
+                            buf.truncate(n);
+                            let _ = tx_for_task.send(buf.clone().freeze());
+                            // Reset buffer for next packet
+                            buf.clear();
+                            buf.resize(2048, 0);
+                            total_bytes += n as u64;
+                            total_packets += 1;
 
-                    // Record metrics for received data
-                    metrics::record_input_bytes(&name_for_task, id, "udp", n as u64);
-                    metrics::record_input_packets(&name_for_task, id, "udp", 1);
+                            // Update atomic stats - lock-free!
+                            atomic_stats_task.total_packets.store(total_packets, Ordering::Relaxed);
+                            atomic_stats_task.total_bytes.store(total_bytes, Ordering::Relaxed);
 
-                    // Update last packet time
-                    last_packet_time = Instant::now();
+                            // Record metrics for received data
+                            metrics::record_input_bytes(&name_for_task, id, "udp", n as u64);
+                            metrics::record_input_packets(&name_for_task, id, "udp", 1);
 
-                    // Transition to Connected state on first packet
-                    if !is_connected {
-                        is_connected = true;
-                        if let Some(ref tx) = state_tx_task {
-                            let _ = tx.send(StateChange::InputStateChanged {
-                                input_id: id,
-                                new_status: StreamStatus::Connected,
-                                connected_at: Some(SystemTime::now()),
-                                source_address: Some(format!("{}:{}", peer_addr.ip(), listen_port_for_task)),
-                            });
+                            // Update last packet time
+                            last_packet_time = Instant::now();
+
+                            // Transition to Connected state on first packet
+                            if !is_connected {
+                                is_connected = true;
+                                if let Some(ref tx) = state_tx_task {
+                                    let _ = tx.send(StateChange::InputStateChanged {
+                                        input_id: id,
+                                        new_status: StreamStatus::Connected,
+                                        connected_at: Some(SystemTime::now()),
+                                        source_address: Some(format!("{}:{}", peer_addr.ip(), listen_port_for_task)),
+                                    });
+                                }
+                            }
+                            window_bytes += n as u64;
+                            window_pkts += 1;
+                            /* actualizar stats cada segundo */
+                            if window_start.elapsed() >= Duration::from_secs(1) {
+                                let bitrate = window_bytes * 8; // bits/s
+                                let pps     = window_pkts;
+
+                                // Update atomic counters for windowed stats
+                                atomic_stats_task.packets_per_sec.store(pps, Ordering::Relaxed);
+                                atomic_stats_task.bitrate_bps.store(bitrate, Ordering::Relaxed);
+
+                                // Take a snapshot and update the RwLock (less frequently)
+                                let snapshot = atomic_stats_task.snapshot();
+                                *stats_task.write().await = Some(InputStats::Udp(snapshot));
+
+                                window_start = Instant::now();
+                                window_bytes = 0;
+                                window_pkts  = 0;
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("udp {listen_port}: {e}");
+                            break;
                         }
                     }
-                    window_bytes += n as u64;
-                    window_pkts += 1;
-                    /* actualizar stats cada segundo */
-                    if window_start.elapsed() >= Duration::from_secs(1) {
-                        let bitrate = window_bytes * 8; // bits/s
-                        let pps     = window_pkts;
-
-                        let snapshot = InputStats::Udp(UdpStats {
-                            total_packets,
-                            total_bytes,
-                            packets_per_sec: pps,
-                            bitrate_bps: bitrate,
+                }
+                _ = tokio::time::sleep(IDLE_TIMEOUT), if is_connected && last_packet_time.elapsed() >= IDLE_TIMEOUT => {
+                    // Transition back to listening due to inactivity
+                    is_connected = false;
+                    if let Some(ref tx) = state_tx_task {
+                        let _ = tx.send(StateChange::InputStateChanged {
+                            input_id: id,
+                            new_status: StreamStatus::Listening,
+                            connected_at: None,
+                            source_address: None,
                         });
-
-                        *stats_task.write().await = Some(snapshot);
-
-                        window_start = Instant::now();
-                        window_bytes = 0;
-                        window_pkts  = 0;
                     }
+                    println!("UDP input {}: transitioned back to listening due to inactivity", listen_port);
                 }
-                Ok(Err(e)) => {
-                    eprintln!("udp {listen_port}: {e}");
+                _ = GLOBAL_CANCEL_TOKEN.cancelled() => {
+                    println!("UDP input {}: cancelled by global token", listen_port);
                     break;
-                }
-                Err(_) => {
-                    // Timeout - check if we should transition back to listening
-                    if is_connected && last_packet_time.elapsed() >= IDLE_TIMEOUT {
-                        is_connected = false;
-                        if let Some(ref tx) = state_tx_task {
-                            let _ = tx.send(StateChange::InputStateChanged {
-                                input_id: id,
-                                new_status: StreamStatus::Listening,
-                                connected_at: None,
-                                source_address: None,
-                            });
-                        }
-                        println!("UDP input {}: transitioned back to listening due to inactivity", listen_port);
-                    }
-                    // Continue listening for packets regardless
                 }
             }
         }
