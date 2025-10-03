@@ -10,7 +10,7 @@ use crate::srt_stream::{
 };
 use crate::spts_output::create_spts_output;
 use crate::models::*;
-use crate::database::{self, check_output_exists, check_port_conflict, get_input_by_id, get_output_by_id, update_input_status_in_db, update_output_status_in_db, get_input_id_for_output};
+use crate::database::{self, check_output_exists, check_port_conflict, get_input_by_id, get_output_by_id, update_input_status_in_db, update_output_status_in_db, get_input_id_for_output, update_input_in_db, update_output_in_db};
 use crate::{ACTIVE_STREAMS, STATE_CHANGE_TX};
 use crate::analysis;
 use crate::stream_control;
@@ -281,7 +281,94 @@ async fn create_input(
 }
 
 
-#[actix_web::delete("/inputs")] 
+#[actix_web::put("/inputs/{id}")]
+pub async fn update_input(
+    state: web::Data<AppState>,
+    path: web::Path<i64>,
+    req: web::Json<UpdateInputRequest>,
+) -> ActixResult<impl Responder> {
+    let input_id = path.into_inner();
+
+    info!("Request to update input {}: {:?}", input_id, req);
+
+    // Get the input from memory to retrieve current config
+    let mut state_guard = ACTIVE_STREAMS.lock().await;
+
+    let input_info = match state_guard.get_mut(&input_id) {
+        Some(info) => info,
+        None => {
+            return Ok(HttpResponse::NotFound().body(format!("Input con ID '{}' no encontrado", input_id)));
+        }
+    };
+
+    // Update the config with new values
+    let mut updated_config = input_info.config.clone();
+
+    // Update name if provided
+    if let Some(ref new_name) = req.name {
+        input_info.name = Some(new_name.clone());
+    }
+
+    // Update SRT-specific fields if this is an SRT input
+    match &mut updated_config {
+        CreateInputRequest::Srt { ref mut config, name, .. } => {
+            // Update name in config
+            if req.name.is_some() {
+                *name = req.name.clone();
+            }
+
+            // Update SRT common config fields
+            match config {
+                SrtInputConfig::Listener { common, .. } | SrtInputConfig::Caller { common, .. } => {
+                    if let Some(latency) = req.latency_ms {
+                        common.latency_ms = Some(latency);
+                    }
+                    if req.passphrase.is_some() {
+                        common.passphrase = req.passphrase.clone();
+                    }
+                    if req.stream_id.is_some() {
+                        common.stream_id = req.stream_id.clone();
+                    }
+                }
+            }
+        },
+        CreateInputRequest::Udp { ref mut name, .. } => {
+            // Update name for UDP inputs
+            if req.name.is_some() {
+                *name = req.name.clone();
+            }
+        }
+    }
+
+    // Update the stored config
+    input_info.config = updated_config.clone();
+
+    // Serialize the updated config for database
+    let config_json = match serde_json::to_string(&updated_config) {
+        Ok(json) => json,
+        Err(e) => {
+            error!("Failed to serialize updated config: {}", e);
+            return Err(ErrorInternalServerError(format!("Failed to serialize config: {}", e)));
+        }
+    };
+
+    // Update in database
+    if let Err(e) = update_input_in_db(&state.pool, input_id, input_info.name.as_deref(), &config_json).await {
+        error!("Failed to update input in database: {}", e);
+        return Err(ErrorInternalServerError(format!("Failed to update database: {}", e)));
+    }
+
+    drop(state_guard);
+
+    info!("Input {} updated successfully", input_id);
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "message": "Input updated successfully",
+        "input_id": input_id,
+        "name": req.name
+    })))
+}
+
+#[actix_web::delete("/inputs")]
 pub async fn delete_input(
     state: web::Data<AppState>,
     req: web::Json<DeleteInputRequest>,
@@ -1140,6 +1227,280 @@ pub async fn get_input_outputs(
     } else {
         Ok(HttpResponse::NotFound().body(format!("Input con ID '{}' no encontrado", input_id)))
     }
+}
+
+#[actix_web::put("/outputs/{id}")]
+pub async fn update_output(
+    state: web::Data<AppState>,
+    path: web::Path<i64>,
+    req: web::Json<UpdateOutputRequest>,
+) -> ActixResult<impl Responder> {
+    let output_id = path.into_inner();
+
+    info!("Request to update output {}: {:?}", output_id, req);
+
+    // Get the output from memory to retrieve current config
+    let mut state_guard = ACTIVE_STREAMS.lock().await;
+
+    // Find the input that contains this output
+    let mut found_input_id = None;
+    for (input_id, input_info) in state_guard.iter_mut() {
+        // Check active outputs
+        if let Some(output_info) = input_info.output_tasks.get_mut(&output_id) {
+            found_input_id = Some(*input_id);
+
+            // Update name if provided
+            if let Some(ref new_name) = req.name {
+                output_info.name = Some(new_name.clone());
+            }
+
+            // Update the config with new values
+            let mut updated_config = output_info.config.clone();
+
+            // Update name in config
+            match &mut updated_config {
+                CreateOutputRequest::Srt { name, config, .. } => {
+                    if req.name.is_some() {
+                        *name = req.name.clone();
+                    }
+
+                    // Update SRT common config fields
+                    match config {
+                        SrtOutputConfig::Listener { common, .. } | SrtOutputConfig::Caller { common, .. } => {
+                            if let Some(latency) = req.latency_ms {
+                                common.latency_ms = Some(latency);
+                            }
+                            if req.passphrase.is_some() {
+                                common.passphrase = req.passphrase.clone();
+                            }
+                            if req.stream_id.is_some() {
+                                common.stream_id = req.stream_id.clone();
+                            }
+                        }
+                    }
+                },
+                CreateOutputRequest::Udp { name, .. } => {
+                    if req.name.is_some() {
+                        *name = req.name.clone();
+                    }
+                },
+                CreateOutputRequest::Spts { name, destination, .. } => {
+                    if req.name.is_some() {
+                        *name = req.name.clone();
+                    }
+
+                    // Update SRT config if SPTS uses SRT destination
+                    if let SpsDestinationConfig::Srt { config } = destination {
+                        match config {
+                            SrtOutputConfig::Listener { common, .. } | SrtOutputConfig::Caller { common, .. } => {
+                                if let Some(latency) = req.latency_ms {
+                                    common.latency_ms = Some(latency);
+                                }
+                                if req.passphrase.is_some() {
+                                    common.passphrase = req.passphrase.clone();
+                                }
+                                if req.stream_id.is_some() {
+                                    common.stream_id = req.stream_id.clone();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Update the stored config
+            output_info.config = updated_config.clone();
+
+            // Serialize the updated config for database
+            let config_json = match serde_json::to_string(&updated_config) {
+                Ok(json) => Some(json),
+                Err(e) => {
+                    error!("Failed to serialize updated config: {}", e);
+                    return Err(ErrorInternalServerError(format!("Failed to serialize config: {}", e)));
+                }
+            };
+
+            // Compute destination string for database (needed for outputs table)
+            let destination = output_info.destination.clone();
+
+            // Extract listen_port if it's a listener output
+            let listen_port = match &updated_config {
+                CreateOutputRequest::Srt { config, .. } => {
+                    match config {
+                        SrtOutputConfig::Listener { .. } => config.get_bind_port().map(|p| p as u16),
+                        _ => None,
+                    }
+                },
+                CreateOutputRequest::Spts { destination, .. } => {
+                    match destination {
+                        SpsDestinationConfig::Srt { config } => {
+                            match config {
+                                SrtOutputConfig::Listener { .. } => config.get_bind_port().map(|p| p as u16),
+                                _ => None,
+                            }
+                        },
+                        _ => None,
+                    }
+                },
+                _ => None,
+            };
+
+            // Update in database
+            if let Err(e) = update_output_in_db(
+                &state.pool,
+                output_id,
+                output_info.name.as_deref(),
+                config_json.as_deref(),
+                Some(&destination),
+                listen_port,
+            ).await {
+                error!("Failed to update output in database: {}", e);
+                return Err(ErrorInternalServerError(format!("Failed to update database: {}", e)));
+            }
+
+            break;
+        }
+
+        // Check stopped outputs
+        if let Some(stopped_config) = input_info.stopped_outputs.get_mut(&output_id) {
+            found_input_id = Some(*input_id);
+
+            // Update the stopped output config
+            match stopped_config {
+                CreateOutputRequest::Srt { name, config, .. } => {
+                    if req.name.is_some() {
+                        *name = req.name.clone();
+                    }
+
+                    // Update SRT common config fields
+                    match config {
+                        SrtOutputConfig::Listener { common, .. } | SrtOutputConfig::Caller { common, .. } => {
+                            if let Some(latency) = req.latency_ms {
+                                common.latency_ms = Some(latency);
+                            }
+                            if req.passphrase.is_some() {
+                                common.passphrase = req.passphrase.clone();
+                            }
+                            if req.stream_id.is_some() {
+                                common.stream_id = req.stream_id.clone();
+                            }
+                        }
+                    }
+                },
+                CreateOutputRequest::Udp { name, .. } => {
+                    if req.name.is_some() {
+                        *name = req.name.clone();
+                    }
+                },
+                CreateOutputRequest::Spts { name, destination, .. } => {
+                    if req.name.is_some() {
+                        *name = req.name.clone();
+                    }
+
+                    // Update SRT config if SPTS uses SRT destination
+                    if let SpsDestinationConfig::Srt { config } = destination {
+                        match config {
+                            SrtOutputConfig::Listener { common, .. } | SrtOutputConfig::Caller { common, .. } => {
+                                if let Some(latency) = req.latency_ms {
+                                    common.latency_ms = Some(latency);
+                                }
+                                if req.passphrase.is_some() {
+                                    common.passphrase = req.passphrase.clone();
+                                }
+                                if req.stream_id.is_some() {
+                                    common.stream_id = req.stream_id.clone();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Serialize the updated config for database
+            let config_json = match serde_json::to_string(&stopped_config) {
+                Ok(json) => Some(json),
+                Err(e) => {
+                    error!("Failed to serialize updated config: {}", e);
+                    return Err(ErrorInternalServerError(format!("Failed to serialize config: {}", e)));
+                }
+            };
+
+            // Compute destination string for database
+            let destination = match stopped_config {
+                CreateOutputRequest::Udp { .. } => {
+                    let host = stopped_config.get_remote_host().unwrap_or_else(|| "127.0.0.1".to_string());
+                    let port = stopped_config.get_remote_port().unwrap_or(8000);
+                    format!("{}:{}", host, port)
+                },
+                CreateOutputRequest::Srt { config, .. } => {
+                    match config {
+                        SrtOutputConfig::Caller { .. } => {
+                            let host = config.get_remote_host().unwrap_or_else(|| "unknown".to_string());
+                            let port = config.get_remote_port().unwrap_or(0);
+                            format!("{}:{}", host, port)
+                        },
+                        SrtOutputConfig::Listener { .. } => {
+                            let port = config.get_bind_port().unwrap_or(0);
+                            format!(":{}", port)
+                        },
+                    }
+                },
+                CreateOutputRequest::Spts { destination, program_number, .. } => {
+                    match destination {
+                        SpsDestinationConfig::Udp { .. } => {
+                            let host = destination.get_remote_host().unwrap_or_else(|| "127.0.0.1".to_string());
+                            let port = destination.get_remote_port().unwrap_or(8000);
+                            format!("spts:{}:{}:{}", program_number, host, port)
+                        },
+                        SpsDestinationConfig::Srt { config } => {
+                            match config {
+                                SrtOutputConfig::Caller { .. } => {
+                                    let host = config.get_remote_host().unwrap_or_else(|| "unknown".to_string());
+                                    let port = config.get_remote_port().unwrap_or(0);
+                                    format!("spts:{}:{}:{}", program_number, host, port)
+                                },
+                                SrtOutputConfig::Listener { .. } => {
+                                    let port = config.get_bind_port().unwrap_or(0);
+                                    format!("spts:{}::{}", program_number, port)
+                                },
+                            }
+                        }
+                    }
+                }
+            };
+
+            // Extract listen_port if it's a listener output
+            let listen_port = stopped_config.get_bind_port().map(|p| p as u16);
+
+            // Update in database
+            if let Err(e) = update_output_in_db(
+                &state.pool,
+                output_id,
+                req.name.as_deref(),
+                config_json.as_deref(),
+                Some(&destination),
+                listen_port,
+            ).await {
+                error!("Failed to update output in database: {}", e);
+                return Err(ErrorInternalServerError(format!("Failed to update database: {}", e)));
+            }
+
+            break;
+        }
+    }
+
+    drop(state_guard);
+
+    if found_input_id.is_none() {
+        return Ok(HttpResponse::NotFound().body(format!("Output con ID '{}' no encontrado", output_id)));
+    }
+
+    info!("Output {} updated successfully", output_id);
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "message": "Output updated successfully",
+        "output_id": output_id,
+        "name": req.name
+    })))
 }
 
 #[actix_web::delete("/outputs")] // Cambiado a plural

@@ -305,6 +305,25 @@ pub struct DeleteOutputRequest {
     pub output_id: i64,
 }
 
+// Update request models for editing inputs/outputs
+#[derive(Deserialize, Debug)]
+pub struct UpdateInputRequest {
+    pub name: Option<String>,
+    // Allow updating SRT-specific fields
+    pub latency_ms: Option<i32>,
+    pub passphrase: Option<String>,
+    pub stream_id: Option<String>,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct UpdateOutputRequest {
+    pub name: Option<String>,
+    // Allow updating SRT-specific fields
+    pub latency_ms: Option<i32>,
+    pub passphrase: Option<String>,
+    pub stream_id: Option<String>,
+}
+
 #[derive(Serialize)]
 pub struct InputResponse {
     pub id: i64,

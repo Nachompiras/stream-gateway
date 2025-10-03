@@ -208,3 +208,40 @@ pub async fn get_input_id_for_output(pool: &SqlitePool, output_id: i64) -> Resul
 
     Ok(row.0)
 }
+
+// Update functions for inputs and outputs
+pub async fn update_input_in_db(
+    pool: &SqlitePool,
+    input_id: i64,
+    name: Option<&str>,
+    config_json: &str,
+) -> Result<()> {
+    sqlx::query("UPDATE inputs SET name = ?, config_json = ? WHERE id = ?")
+        .bind(name)
+        .bind(config_json)
+        .bind(input_id)
+        .execute(pool)
+        .await?;
+
+    Ok(())
+}
+
+pub async fn update_output_in_db(
+    pool: &SqlitePool,
+    output_id: i64,
+    name: Option<&str>,
+    config_json: Option<&str>,
+    destination: Option<&str>,
+    listen_port: Option<u16>,
+) -> Result<()> {
+    sqlx::query("UPDATE outputs SET name = ?, config_json = ?, destination = ?, listen_port = ? WHERE id = ?")
+        .bind(name)
+        .bind(config_json)
+        .bind(destination)
+        .bind(listen_port.map(|p| p as i32))
+        .bind(output_id)
+        .execute(pool)
+        .await?;
+
+    Ok(())
+}
