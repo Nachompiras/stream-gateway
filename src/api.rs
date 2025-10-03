@@ -647,11 +647,11 @@ pub async fn get_input(
     let state_guard = ACTIVE_STREAMS.lock().await;
 
     if let Some(input_info) = state_guard.get(&input_id) {
-        // Get input type from database
-        let input_type = if let Ok(Some(db_input)) = get_input_by_id(&state.pool, input_id).await {
-            input_type_display_string(&db_input.kind).to_string()
+        // Get input type and config from database
+        let (input_type, config_json) = if let Ok(Some(db_input)) = get_input_by_id(&state.pool, input_id).await {
+            (input_type_display_string(&db_input.kind).to_string(), Some(db_input.config_json))
         } else {
-            "Unknown".to_string()
+            ("Unknown".to_string(), None)
         };
 
         // Build outputs list with detailed information
@@ -782,6 +782,7 @@ pub async fn get_input(
             outputs,
             uptime_seconds: calculate_connection_uptime(&input_info.status, input_info.connected_at),
             source_address: input_info.source_address.clone(),
+            config: config_json,
         };
 
         Ok(HttpResponse::Ok().json(response))
@@ -791,13 +792,20 @@ pub async fn get_input(
 }
 
 #[actix_web::get("/outputs")]
-pub async fn list_outputs(_state: web::Data<AppState>) -> ActixResult<impl Responder> {
+pub async fn list_outputs(state: web::Data<AppState>) -> ActixResult<impl Responder> {
     let state_guard = ACTIVE_STREAMS.lock().await;
     let mut response: Vec<OutputListResponse> = Vec::new();
 
     for (input_id, input_info) in state_guard.iter() {
         // Add active outputs
         for (output_id, output_info) in input_info.output_tasks.iter() {
+            // Get config from database
+            let config = if let Ok(Some(db_output)) = database::get_output_by_id(&state.pool, *output_id).await {
+                db_output.config_json
+            } else {
+                None
+            };
+
             response.push(OutputListResponse {
                 id: *output_id,
                 name: output_info.name.clone(),
@@ -810,6 +818,7 @@ pub async fn list_outputs(_state: web::Data<AppState>) -> ActixResult<impl Respo
                 uptime_seconds: calculate_connection_uptime(&output_info.status, output_info.connected_at),
                 peer_address: output_info.peer_address.clone(),
                 program_number: output_info.config.extract_program_number(),
+                config,
             });
         }
 
@@ -864,6 +873,9 @@ pub async fn list_outputs(_state: web::Data<AppState>) -> ActixResult<impl Respo
                 }
             };
 
+            // Serialize config for stopped outputs
+            let config_json = serde_json::to_string(output_config).ok();
+
             response.push(OutputListResponse {
                 id: *output_id,
                 name,
@@ -876,6 +888,7 @@ pub async fn list_outputs(_state: web::Data<AppState>) -> ActixResult<impl Respo
                 uptime_seconds: None,
                 peer_address: None,
                 program_number: output_config.extract_program_number(),
+                config: config_json,
             });
         }
     }

@@ -354,6 +354,7 @@ pub struct InputDetailResponse {
     pub outputs: Vec<OutputDetailResponse>,
     pub uptime_seconds: Option<u64>, // Uptime in seconds, None if stopped
     pub source_address: Option<String>, // Address of connected source (for SRT listeners)
+    pub config: Option<String>, // Full configuration JSON from database
 }
 
 #[derive(Serialize)]
@@ -384,6 +385,7 @@ pub struct OutputListResponse {
     pub uptime_seconds: Option<u64>, // Uptime in seconds, None if stopped
     pub peer_address: Option<String>, // Address of connected peer (for SRT listeners)
     pub program_number: Option<u16>, // Program number for SPTS outputs
+    pub config: Option<String>, // Full configuration JSON from database
 }
 
 /* SRT models */
