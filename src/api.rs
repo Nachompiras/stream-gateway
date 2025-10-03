@@ -1590,6 +1590,31 @@ pub async fn load_from_db(state: &AppState) -> anyhow::Result<()> {
                                 config,
                             }
                         },
+                        "spts" => {
+                            let config_json = o.config_json.unwrap_or_default();
+                            // Deserialize the entire CreateOutputRequest to get the full SPTS config
+                            let config: CreateOutputRequest = serde_json::from_str(&config_json)
+                                .unwrap_or_else(|e| {
+                                    println!("Error deserializing SPTS config for output {}: {}", o.id, e);
+                                    // Fallback to a default SPTS config
+                                    CreateOutputRequest::Spts {
+                                        input_id,
+                                        name: o.name.clone(),
+                                        program_number: 1,
+                                        fill_with_nulls: Some(false),
+                                        destination: SpsDestinationConfig::Udp {
+                                            remote_host: Some("127.0.0.1".to_string()),
+                                            remote_port: Some(8000),
+                                            automatic_port: None,
+                                            bind_host: None,
+                                            multicast_ttl: None,
+                                            multicast_interface: None,
+                                            destination_addr: Some(destination.clone()),
+                                        }
+                                    }
+                                });
+                            config
+                        },
                         _ => {
                             println!("Tipo de output desconocido: {}, saltando", o.kind);
                             continue;
@@ -1634,11 +1659,11 @@ pub async fn load_from_db(state: &AppState) -> anyhow::Result<()> {
                             Err(e) => Err(anyhow::anyhow!("Error recreating SRT Caller output: {}", e))
                         }
                     }
-                    "srt_listener" => { 
+                    "srt_listener" => {
                         let cfg: SrtCommonConfig = serde_json::from_str(
                             o.config_json.as_deref().unwrap_or("{}")
                         )?;
-                        
+
                         let listen_port = match o.listen_port {
                             Some(port) => port,
                             None => return Err(anyhow::anyhow!("Missing listen_port for SRT Listener output {}", o.id)),
@@ -1658,6 +1683,32 @@ pub async fn load_from_db(state: &AppState) -> anyhow::Result<()> {
                                 Ok(())
                             }
                             Err(e) => Err(anyhow::anyhow!("Error recreating SRT Listener output: {}", e))
+                        }
+                    }
+                    "spts" => {
+                        // Deserialize the full SPTS configuration from config_json
+                        let config_json = o.config_json.as_deref().unwrap_or("{}");
+                        let full_config: CreateOutputRequest = serde_json::from_str(config_json)?;
+
+                        // Extract SPTS-specific fields
+                        if let CreateOutputRequest::Spts { program_number, fill_with_nulls, destination, .. } = full_config {
+                            match create_spts_output(
+                                input,
+                                o.id,
+                                o.name.clone(),
+                                program_number,
+                                fill_with_nulls.unwrap_or(false),
+                                destination,
+                                get_state_change_sender().await
+                            ).await {
+                                Ok(output_info) => {
+                                    input.output_tasks.insert(o.id, output_info);
+                                    Ok(())
+                                }
+                                Err(e) => Err(anyhow::anyhow!("Error recreating SPTS output: {}", e))
+                            }
+                        } else {
+                            Err(anyhow::anyhow!("Invalid SPTS configuration for output {}", o.id))
                         }
                     }
                     _ => {
