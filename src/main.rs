@@ -9,7 +9,7 @@ mod config;
 mod interfaces;
 mod mpegts_filter;
 mod port_utils;
-mod spts_output;
+mod spts_input;
 mod state_processor;
 mod udp_stream;
 mod models;

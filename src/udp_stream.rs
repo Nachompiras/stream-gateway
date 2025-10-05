@@ -6,7 +6,7 @@ use actix_web::error::ErrorBadRequest;
 use bytes::{Bytes, BytesMut};
 use tokio::{net::UdpSocket, sync::{broadcast::{self, Receiver}, RwLock}};
 use futures::stream::{AbortHandle, Abortable};
-use log::{info};
+use log::{info, warn};
 use crate::models::*;
 use crate::metrics;
 use std::time::SystemTime;
@@ -130,8 +130,9 @@ pub fn spawn_udp_input_with_stats(
     source_specific_multicast: Option<String>,
     state_tx: Option<StateChangeSender>,
 ) -> Result<InputInfo, actix_web::Error> {
-    // canal interno
-    let (tx, _rx) = broadcast::channel::<Bytes>(1024);
+    // canal interno - increased capacity for high bitrate streams (up to 120+ Mbps)
+    // At 120Mbps with ~1500 byte packets: ~10,000 pps → 16384 slots = ~1.6s buffer
+    let (tx, _rx) = broadcast::channel::<Bytes>(16384);
     let stats: StatsCell = Arc::new(RwLock::new(None));
 
     // Create atomic stats for lock-free updates
@@ -328,6 +329,15 @@ async fn create_multicast_socket(
     #[cfg(unix)]
     {
         socket.set_reuse_port(true)?;
+    }
+
+    // Increase socket receive buffer for high bitrate streams (120+ Mbps)
+    // Default is typically 128KB-256KB, we set 8MB to handle bursts
+    const SOCKET_RECV_BUFFER_SIZE: usize = 8 * 1024 * 1024; // 8 MB
+    if let Err(e) = socket.set_recv_buffer_size(SOCKET_RECV_BUFFER_SIZE) {
+        warn!("Failed to set socket receive buffer size to {} bytes: {}", SOCKET_RECV_BUFFER_SIZE, e);
+    } else {
+        info!("Set UDP socket receive buffer to {} MB", SOCKET_RECV_BUFFER_SIZE / 1024 / 1024);
     }
 
     // For multicast reception on Linux, we should bind to the multicast group address itself

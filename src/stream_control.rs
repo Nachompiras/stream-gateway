@@ -92,10 +92,85 @@ pub async fn start_input(input_id: i64) -> Result<()> {
                 SrtInputConfig::Caller { .. } => StreamStatus::Connecting,
             };
             input_info.started_at = Some(SystemTime::now());
+        },
+        CreateInputRequest::Spts { source_input_id, program_number, fill_with_nulls, .. } => {
+            // SPTS inputs need to reconnect to their source input
+            // First verify that source input exists and is active
+            let source_exists = {
+                let streams = ACTIVE_STREAMS.lock().await;
+                streams.get(source_input_id)
+                    .map(|src| src.status.is_active())
+                    .unwrap_or(false)
+            };
+
+            if !source_exists {
+                return Err(anyhow!(
+                    "Cannot start SPTS input {}: Source input {} not found or not active. \
+                     Please start the source input first.",
+                    input_id, source_input_id
+                ));
+            }
+
+            // We need to release the current guard before acquiring ACTIVE_STREAMS again
+            // to avoid potential deadlock
+            drop(guard);
+
+            // Spawn the SPTS input - it will acquire the lock internally
+            let new_input_info = {
+                let streams = ACTIVE_STREAMS.lock().await;
+                let source_input = streams.get(source_input_id)
+                    .ok_or_else(|| anyhow!("Source input {} not found", source_input_id))?;
+
+                crate::spts_input::spawn_spts_input(
+                    source_input,
+                    input_id,
+                    *program_number,
+                    fill_with_nulls.unwrap_or(false),
+                    name.clone(),
+                    state_tx.clone(),
+                ).map_err(|e| anyhow!("Failed to spawn SPTS input: {}", e))?
+            };
+
+            // Re-acquire lock and update
+            let mut guard = ACTIVE_STREAMS.lock().await;
+            let input_info = guard.get_mut(&input_id)
+                .ok_or_else(|| anyhow!("Input {} not found after SPTS recreation", input_id))?;
+
+            input_info.task_handle = new_input_info.task_handle;
+            input_info.packet_tx = new_input_info.packet_tx;
+            input_info.stats = new_input_info.stats;
+            input_info.status = StreamStatus::Listening;
+            input_info.started_at = Some(SystemTime::now());
+
+            // Restart outputs for SPTS input
+            let mut outputs_to_start = Vec::new();
+            for (output_id, output_config) in input_info.stopped_outputs.drain() {
+                outputs_to_start.push((output_id, output_config));
+            }
+
+            for (output_id, output_config) in outputs_to_start {
+                if let Err(e) = start_output_internal(input_info, output_id, output_config).await {
+                    error!("Failed to restart output {}: {}", output_id, e);
+                }
+            }
+
+            // Restart paused analysis for SPTS input
+            let analyses_to_restart = input_info.paused_analysis.drain(..).collect::<Vec<_>>();
+            drop(guard); // Release lock before restarting analyses
+
+            for analysis_type in analyses_to_restart {
+                let analysis_type_clone = analysis_type.clone();
+                if let Err(e) = analysis::start_analysis(input_id, analysis_type).await {
+                    error!("Failed to restart analysis {:?} for input {}: {}", analysis_type_clone, input_id, e);
+                }
+            }
+
+            info!("Input {} (SPTS) restarted successfully", input_id);
+            return Ok(());
         }
     }
 
-    // Restart running outputs that were stopped when input was stopped
+    // Restart running outputs that were stopped when input was stopped (for UDP/SRT)
     let mut outputs_to_start = Vec::new();
     for (output_id, output_config) in input_info.stopped_outputs.drain() {
         outputs_to_start.push((output_id, output_config));
@@ -279,17 +354,6 @@ async fn start_output_internal(input_info: &mut InputInfo, output_id: i64, outpu
                 state_tx,
             ).map_err(|e| anyhow::anyhow!("Failed to create SRT output: {}", e))?
         },
-        CreateOutputRequest::Spts { name, program_number, fill_with_nulls, destination, .. } => {
-            crate::spts_output::create_spts_output(
-                input_info,
-                output_id,
-                name.clone(),
-                *program_number,
-                fill_with_nulls.unwrap_or(false),
-                destination.clone(),
-                state_tx,
-            ).await.map_err(|e| anyhow::anyhow!("Failed to create SPTS output: {}", e))?
-        }
     };
 
     input_info.output_tasks.insert(output_id, output_info);

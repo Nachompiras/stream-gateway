@@ -59,7 +59,6 @@ pub enum OutputKind {                 // para log o API
     Udp,
     SrtCaller,
     SrtListener,
-    Spts,
 }
 
 impl fmt::Display for OutputKind {
@@ -68,7 +67,6 @@ impl fmt::Display for OutputKind {
             OutputKind::Udp => write!(f, "UDP"),
             OutputKind::SrtCaller => write!(f, "SRT Caller"),
             OutputKind::SrtListener => write!(f, "SRT Listener"),
-            OutputKind::Spts => write!(f, "SPTS"),
         }
     }
 }
@@ -130,6 +128,14 @@ pub enum CreateInputRequest {
         name: Option<String>,
         #[serde(flatten)] // Absorbe los campos del enum interno
         config: SrtInputConfig,
+    },
+    #[serde(rename = "spts")]
+    Spts {
+        source_input_id: i64,
+        program_number: u16,
+        #[serde(default)]
+        fill_with_nulls: Option<bool>,
+        name: Option<String>,
     },
 }
 
@@ -208,16 +214,6 @@ pub enum CreateOutputRequest {
         #[serde(flatten)] // Absorbe los campos del enum interno
         config: SrtOutputConfig,
     },
-    #[serde(rename = "spts")]
-    Spts {
-        input_id: i64,
-        name: Option<String>,
-        program_number: u16,
-        #[serde(default)]
-        fill_with_nulls: Option<bool>,
-        #[serde(flatten)]
-        destination: SpsDestinationConfig,
-    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -259,41 +255,6 @@ pub enum SrtOutputConfig {
     },
 }
 
-/// Destination configuration for SPTS outputs (can be UDP or SRT)
-#[derive(Serialize, Deserialize, Debug, Clone)]
-#[serde(tag = "destination_type")]
-pub enum SpsDestinationConfig {
-    #[serde(rename = "udp")]
-    Udp {
-        // New naming scheme
-        #[serde(default)]
-        remote_host: Option<String>,
-        #[serde(default)]
-        remote_port: Option<u16>,
-        #[serde(default)]
-        automatic_port: Option<bool>,
-
-        // Network interface binding for multi-NIC support
-        #[serde(default)]
-        bind_host: Option<String>,
-
-        // Multicast output support
-        #[serde(default)]
-        multicast_ttl: Option<u8>,
-        #[serde(default)]
-        multicast_interface: Option<String>,
-
-        // Legacy fields for backward compatibility
-        #[serde(skip_serializing_if = "Option::is_none")]
-        destination_addr: Option<String>,
-    },
-    #[serde(rename = "srt")]
-    Srt {
-        #[serde(flatten)]
-        config: SrtOutputConfig,
-    },
-}
-
 #[derive(Deserialize)]
 pub struct DeleteInputRequest {
     pub input_id: i64,
@@ -329,7 +290,6 @@ pub struct OutputResponse {
     pub uptime_seconds: Option<u64>, // Uptime in seconds, None if stopped
     pub peer_address: Option<String>, // Address of connected peer (for SRT listeners)
     pub bitrate_bps: Option<u64>, // Bitrate in bits per second
-    pub program_number: Option<u16>, // Program number for SPTS outputs
 }
 
 // New response models for CRUD endpoints
@@ -370,7 +330,6 @@ pub struct OutputDetailResponse {
     pub config: Option<String>, // JSON config if needed
     pub uptime_seconds: Option<u64>, // Uptime in seconds, None if stopped
     pub peer_address: Option<String>, // Address of connected peer (for SRT listeners)
-    pub program_number: Option<u16>, // Program number for SPTS outputs
 }
 
 #[derive(Serialize)]
@@ -385,7 +344,6 @@ pub struct OutputListResponse {
     pub assigned_port: Option<u16>, // Port assigned automatically or specified
     pub uptime_seconds: Option<u64>, // Uptime in seconds, None if stopped
     pub peer_address: Option<String>, // Address of connected peer (for SRT listeners)
-    pub program_number: Option<u16>, // Program number for SPTS outputs
     pub config: Option<String>, // Full configuration JSON from database
 }
 
@@ -497,7 +455,6 @@ pub fn output_kind_string(k: &OutputKind) -> &'static str {
         OutputKind::Udp        => "udp",
         OutputKind::SrtCaller  => "srt_caller",
         OutputKind::SrtListener=> "srt_listener",
-        OutputKind::Spts       => "spts",
     }
 }
 
@@ -508,6 +465,7 @@ pub fn input_kind_string(k: &CreateInputRequest) -> &'static str {
             SrtInputConfig::Listener { .. } => "srt_listener",
             SrtInputConfig::Caller { .. }   => "srt_caller",
         },
+        CreateInputRequest::Spts { .. } => "spts",
     }
 }
 
@@ -516,6 +474,7 @@ pub fn input_type_display_string(kind: &str) -> &'static str {
         "udp" => "UDP Listener",
         "srt_listener" => "SRT Listener",
         "srt_caller" => "SRT Caller",
+        "spts" => "SPTS Filter",
         _ => "Unknown",
     }
 }
@@ -539,6 +498,7 @@ impl CreateInputRequest {
                 crate::port_utils::should_use_auto_port_input(*bind_port, *listen_port)
             },
             CreateInputRequest::Srt { config, .. } => config.is_automatic_port(),
+            CreateInputRequest::Spts { .. } => false, // SPTS inputs don't need ports
         }
     }
 
@@ -550,16 +510,18 @@ impl CreateInputRequest {
                 listen_port.or(*bind_port).unwrap_or(0)
             },
             CreateInputRequest::Srt { config, .. } => config.get_bind_port(),
+            CreateInputRequest::Spts { .. } => 0, // SPTS inputs don't bind to ports
         }
     }
     
-    /// Get the effective bind host, handling backward compatibility  
+    /// Get the effective bind host, handling backward compatibility
     pub fn get_bind_host(&self) -> String {
         match self {
             CreateInputRequest::Udp { bind_host, .. } => {
                 bind_host.clone().unwrap_or_else(|| "0.0.0.0".to_string())
             },
             CreateInputRequest::Srt { config, .. } => config.get_bind_host(),
+            CreateInputRequest::Spts { .. } => "0.0.0.0".to_string(), // SPTS inputs don't bind
         }
     }
     
@@ -568,6 +530,7 @@ impl CreateInputRequest {
         match self {
             CreateInputRequest::Udp { .. } => None, // UDP inputs don't have remote hosts
             CreateInputRequest::Srt { config, .. } => config.get_remote_host(),
+            CreateInputRequest::Spts { .. } => None, // SPTS inputs don't have remote hosts
         }
     }
     
@@ -576,6 +539,7 @@ impl CreateInputRequest {
         match self {
             CreateInputRequest::Udp { .. } => None, // UDP inputs don't have remote ports
             CreateInputRequest::Srt { config, .. } => config.get_remote_port(),
+            CreateInputRequest::Spts { .. } => None, // SPTS inputs don't have remote ports
         }
     }
 }
@@ -674,80 +638,6 @@ impl SrtInputConfig {
     }
 }
 
-impl SpsDestinationConfig {
-    /// Check if automatic port assignment is requested
-    pub fn is_automatic_port(&self) -> bool {
-        match self {
-            SpsDestinationConfig::Udp { automatic_port, remote_port, destination_addr, .. } => {
-                // If automatic_port is explicitly set to true, use auto port
-                if automatic_port == &Some(true) {
-                    return true;
-                }
-                // If automatic_port is explicitly false, use specified ports
-                if automatic_port == &Some(false) {
-                    return false;
-                }
-                // If automatic_port is None, check port values
-                crate::port_utils::should_use_auto_port_output(*remote_port, None, destination_addr.as_ref())
-            },
-            SpsDestinationConfig::Srt { config } => config.is_automatic_port(),
-        }
-    }
-
-    /// Get the effective remote host
-    pub fn get_remote_host(&self) -> Option<String> {
-        match self {
-            SpsDestinationConfig::Udp { remote_host, destination_addr, .. } => {
-                // Prefer new field, fallback to parsing legacy field
-                if let Some(host) = remote_host {
-                    if !host.is_empty() {
-                        Some(host.clone())
-                    } else {
-                        None
-                    }
-                } else if let Some(addr) = destination_addr {
-                    addr.split(':').next().map(|s| s.to_string())
-                } else {
-                    None
-                }
-            },
-            SpsDestinationConfig::Srt { config } => config.get_remote_host(),
-        }
-    }
-
-    /// Get the effective remote port
-    pub fn get_remote_port(&self) -> Option<u16> {
-        match self {
-            SpsDestinationConfig::Udp { remote_port, destination_addr, .. } => {
-                // Prefer new field, fallback to parsing legacy field
-                if let Some(port) = remote_port {
-                    if *port != 0 {
-                        Some(*port)
-                    } else {
-                        None
-                    }
-                } else if let Some(addr) = destination_addr {
-                    addr.split(':').nth(1).and_then(|s| s.parse().ok())
-                } else {
-                    None
-                }
-            },
-            SpsDestinationConfig::Srt { config } => config.get_remote_port(),
-        }
-    }
-
-    /// Extract the assigned port from configuration
-    pub fn extract_assigned_port(&self) -> Option<u16> {
-        match self {
-            SpsDestinationConfig::Udp { remote_port, .. } => {
-                // UDP outputs use remote port
-                remote_port.filter(|&p| p != 0)
-            },
-            SpsDestinationConfig::Srt { config } => config.extract_assigned_port(),
-        }
-    }
-}
-
 impl CreateOutputRequest {
     /// Check if automatic port assignment is requested
     pub fn is_automatic_port(&self) -> bool {
@@ -765,7 +655,6 @@ impl CreateOutputRequest {
                 crate::port_utils::should_use_auto_port_output(*remote_port, None, destination_addr.as_ref())
             },
             CreateOutputRequest::Srt { config, .. } => config.is_automatic_port(),
-            CreateOutputRequest::Spts { destination, .. } => destination.is_automatic_port(),
         }
     }
 
@@ -787,7 +676,6 @@ impl CreateOutputRequest {
                 }
             },
             CreateOutputRequest::Srt { config, .. } => config.get_remote_host(),
-            CreateOutputRequest::Spts { destination, .. } => destination.get_remote_host(),
         }
     }
     
@@ -809,7 +697,6 @@ impl CreateOutputRequest {
                 }
             },
             CreateOutputRequest::Srt { config, .. } => config.get_remote_port(),
-            CreateOutputRequest::Spts { destination, .. } => destination.get_remote_port(),
         }
     }
     
@@ -818,12 +705,6 @@ impl CreateOutputRequest {
         match self {
             CreateOutputRequest::Udp { .. } => None, // UDP outputs don't bind
             CreateOutputRequest::Srt { config, .. } => config.get_bind_port(),
-            CreateOutputRequest::Spts { destination, .. } => {
-                match destination {
-                    SpsDestinationConfig::Udp { .. } => None,
-                    SpsDestinationConfig::Srt { config } => config.get_bind_port(),
-                }
-            },
         }
     }
     
@@ -832,12 +713,6 @@ impl CreateOutputRequest {
         match self {
             CreateOutputRequest::Udp { bind_host, .. } => bind_host.clone(), // UDP outputs can bind to specific interface
             CreateOutputRequest::Srt { config, .. } => config.get_bind_host(),
-            CreateOutputRequest::Spts { destination, .. } => {
-                match destination {
-                    SpsDestinationConfig::Udp { bind_host, .. } => bind_host.clone(),
-                    SpsDestinationConfig::Srt { config } => config.get_bind_host(),
-                }
-            },
         }
     }
 }
@@ -1023,6 +898,7 @@ impl CreateInputRequest {
                 listen_port.or(*bind_port).filter(|&p| p != 0)
             },
             CreateInputRequest::Srt { config, .. } => config.extract_assigned_port(),
+            CreateInputRequest::Spts { .. } => None, // SPTS inputs don't have ports
         }
     }
 }
@@ -1049,15 +925,6 @@ impl CreateOutputRequest {
                 remote_port.filter(|&p| p != 0)
             },
             CreateOutputRequest::Srt { config, .. } => config.extract_assigned_port(),
-            CreateOutputRequest::Spts { destination, .. } => destination.extract_assigned_port(),
-        }
-    }
-
-    /// Extract the program number for SPTS outputs
-    pub fn extract_program_number(&self) -> Option<u16> {
-        match self {
-            CreateOutputRequest::Spts { program_number, .. } => Some(*program_number),
-            _ => None,
         }
     }
 }

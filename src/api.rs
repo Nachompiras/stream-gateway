@@ -8,7 +8,7 @@ use crate::udp_stream::{create_udp_output, spawn_udp_input_with_stats};
 use crate::srt_stream::{
     create_srt_output, SrtSourceWithState,
 };
-use crate::spts_output::create_spts_output;
+use crate::spts_input::spawn_spts_input;
 use crate::models::*;
 use crate::database::{self, check_output_exists, check_port_conflict, get_input_by_id, get_output_by_id, update_input_status_in_db, update_output_status_in_db, get_input_id_for_output};
 use crate::{ACTIVE_STREAMS, STATE_CHANGE_TX};
@@ -231,6 +231,9 @@ async fn create_input(
                     },
                     _ => {} // Callers don't need auto port assignment
                 }
+            },
+            CreateInputRequest::Spts { .. } => {
+                // SPTS inputs don't need port assignment
             }
         }
 
@@ -363,7 +366,6 @@ pub async fn create_output(
     let input_id = match &req_val {
         CreateOutputRequest::Udp { input_id, .. } => *input_id,
         CreateOutputRequest::Srt { input_id, .. } => *input_id,
-        CreateOutputRequest::Spts { input_id, .. } => *input_id,
     };
 
     // get InputInfo
@@ -396,24 +398,6 @@ pub async fn create_output(
                     _ => {} // Callers don't need auto port assignment
                 }
             },
-            CreateOutputRequest::Spts { destination, .. } => {
-                match destination {
-                    SpsDestinationConfig::Udp { remote_port, automatic_port, .. } => {
-                        *remote_port = Some(port);
-                        *automatic_port = None;
-                    },
-                    SpsDestinationConfig::Srt { config } => {
-                        match config {
-                            SrtOutputConfig::Listener { bind_port, listen_port, automatic_port, .. } => {
-                                *bind_port = Some(port);
-                                *listen_port = Some(port);
-                                *automatic_port = None;
-                            },
-                            _ => {}
-                        }
-                    }
-                }
-            }
         }
 
         Some(port)
@@ -442,28 +426,6 @@ pub async fn create_output(
                 },
             }
         },
-        CreateOutputRequest::Spts { destination, program_number, .. } => {
-            match destination {
-                SpsDestinationConfig::Udp { .. } => {
-                    let host = destination.get_remote_host().unwrap_or_else(|| "127.0.0.1".to_string());
-                    let port = destination.get_remote_port().unwrap_or(8000);
-                    (format!("spts:{}:{}:{}", program_number, host, port), None)
-                },
-                SpsDestinationConfig::Srt { config } => {
-                    match config {
-                        SrtOutputConfig::Caller { .. } => {
-                            let host = config.get_remote_host().unwrap_or_else(|| "127.0.0.1".to_string());
-                            let port = config.get_remote_port().unwrap_or(8000);
-                            (format!("spts:{}:{}:{}", program_number, host, port), None)
-                        },
-                        SrtOutputConfig::Listener { .. } => {
-                            let port = config.get_bind_port().unwrap_or(8000);
-                            (format!("spts:{}::{}", program_number, port), Some(port))
-                        },
-                    }
-                }
-            }
-        }
     };
 
     // Check if output already exists for this input + destination
@@ -525,13 +487,6 @@ pub async fn create_output(
                 .map_err(|e| ErrorInternalServerError(format!("Serialization error: {e}")))?);
             (final_name, kind_str, config_json)
         }
-        CreateOutputRequest::Spts { name: user_name, program_number, .. } => {
-            let auto_name = format!("SPTS Program {} Output", program_number);
-            let final_name = user_name.clone().or(Some(auto_name));
-            let config_json = Some(serde_json::to_string(&final_req)
-                .map_err(|e| ErrorInternalServerError(format!("Serialization error: {e}")))?);
-            (final_name, "spts", config_json)
-        }
     };
 
     let output_id = database::save_output_to_db(
@@ -573,17 +528,6 @@ pub async fn create_output(
 
         CreateOutputRequest::Srt { config, name: user_name, .. } =>
             create_srt_output(input_id, config.clone(), input, output_id, user_name.clone(), get_state_change_sender().await)?,
-
-        CreateOutputRequest::Spts { name: user_name, program_number, fill_with_nulls, destination, .. } =>
-            create_spts_output(
-                input,
-                output_id,
-                user_name.clone(),
-                *program_number,
-                fill_with_nulls.unwrap_or(false),
-                destination.clone(),
-                get_state_change_sender().await
-            ).await?,
     };
 
     // Insertamos el output en el Input correspondiente
@@ -695,7 +639,6 @@ pub async fn get_input(
                 config,
                 uptime_seconds: calculate_connection_uptime(&output_info.status, output_info.connected_at),
                 peer_address: output_info.peer_address.clone(),
-                program_number: output_info.config.extract_program_number(),
             });
         }
 
@@ -725,35 +668,11 @@ pub async fn get_input(
                     };
                     (dest, kind_str)
                 },
-                CreateOutputRequest::Spts { destination, program_number, .. } => {
-                    let dest = match destination {
-                        SpsDestinationConfig::Udp { .. } => {
-                            let host = destination.get_remote_host().unwrap_or_else(|| "127.0.0.1".to_string());
-                            let port = destination.get_remote_port().unwrap_or(8000);
-                            format!("spts:{}:{}:{}", program_number, host, port)
-                        },
-                        SpsDestinationConfig::Srt { config } => {
-                            match config {
-                                SrtOutputConfig::Caller { .. } => {
-                                    let host = config.get_remote_host().unwrap_or_else(|| "unknown".to_string());
-                                    let port = config.get_remote_port().unwrap_or(0);
-                                    format!("spts:{}:{}:{}", program_number, host, port)
-                                },
-                                SrtOutputConfig::Listener { .. } => {
-                                    let port = config.get_bind_port().unwrap_or(0);
-                                    format!("spts:{}::{}", program_number, port)
-                                },
-                            }
-                        }
-                    };
-                    (dest, "spts")
-                }
             };
 
             let name = match output_config {
                 CreateOutputRequest::Udp { name, .. } => name.clone(),
                 CreateOutputRequest::Srt { name, .. } => name.clone(),
-                CreateOutputRequest::Spts { name, .. } => name.clone(),
             };
 
             outputs.push(OutputDetailResponse {
@@ -767,7 +686,6 @@ pub async fn get_input(
                 config: Some(serde_json::to_string(output_config).unwrap_or_default()),
                 uptime_seconds: None,
                 peer_address: None,
-                program_number: output_config.extract_program_number(),
             });
         }
 
@@ -821,7 +739,6 @@ pub async fn list_outputs(_state: web::Data<AppState>) -> ActixResult<impl Respo
                     assigned_port: output_info.config.extract_assigned_port(),
                     connected_at: output_info.connected_at,
                     peer_address: output_info.peer_address.clone(),
-                    program_number: output_info.config.extract_program_number(),
                 });
             }
 
@@ -853,7 +770,6 @@ pub async fn list_outputs(_state: web::Data<AppState>) -> ActixResult<impl Respo
                 assigned_port,
                 connected_at,
                 peer_address,
-                program_number,
             } => {
                 response.push(OutputListResponse {
                     id,
@@ -866,7 +782,6 @@ pub async fn list_outputs(_state: web::Data<AppState>) -> ActixResult<impl Respo
                     assigned_port,
                     uptime_seconds: calculate_connection_uptime(&status, connected_at),
                     peer_address,
-                    program_number,
                     config: None, // We'll skip DB lookup for performance
                 });
             }
@@ -900,29 +815,6 @@ pub async fn list_outputs(_state: web::Data<AppState>) -> ActixResult<impl Respo
                         };
                         (dest, kind_str.to_string(), name.clone())
                     },
-                    CreateOutputRequest::Spts { name, destination, program_number, .. } => {
-                        let dest = match destination {
-                            SpsDestinationConfig::Udp { .. } => {
-                                let host = destination.get_remote_host().unwrap_or_else(|| "127.0.0.1".to_string());
-                                let port = destination.get_remote_port().unwrap_or(8000);
-                                format!("spts:{}:{}:{}", program_number, host, port)
-                            },
-                            SpsDestinationConfig::Srt { config: srt_config } => {
-                                match srt_config {
-                                    SrtOutputConfig::Caller { .. } => {
-                                        let host = srt_config.get_remote_host().unwrap_or_else(|| "unknown".to_string());
-                                        let port = srt_config.get_remote_port().unwrap_or(0);
-                                        format!("spts:{}:{}:{}", program_number, host, port)
-                                    },
-                                    SrtOutputConfig::Listener { .. } => {
-                                        let port = srt_config.get_bind_port().unwrap_or(0);
-                                        format!("spts:{}::{}", program_number, port)
-                                    },
-                                }
-                            }
-                        };
-                        (dest, "spts".to_string(), name.clone())
-                    }
                 };
 
                 let config_json = serde_json::to_string(&config).ok();
@@ -938,7 +830,6 @@ pub async fn list_outputs(_state: web::Data<AppState>) -> ActixResult<impl Respo
                     assigned_port: config.extract_assigned_port(),
                     uptime_seconds: None,
                     peer_address: None,
-                    program_number: config.extract_program_number(),
                     config: config_json,
                 });
             }
@@ -961,7 +852,6 @@ enum OutputSnapshotData {
         assigned_port: Option<u16>,
         connected_at: Option<SystemTime>,
         peer_address: Option<String>,
-        program_number: Option<u16>,
     },
     Stopped {
         id: i64,
@@ -1010,7 +900,6 @@ pub async fn get_output(
                 config,
                 uptime_seconds: calculate_connection_uptime(&output_info.status, output_info.connected_at),
                 peer_address: output_info.peer_address.clone(),
-                program_number: output_info.config.extract_program_number(),
             };
 
             return Ok(HttpResponse::Ok().json(response));
@@ -1060,7 +949,6 @@ pub async fn get_input_outputs(
                 config,
                 uptime_seconds: calculate_connection_uptime(&output_info.status, output_info.connected_at),
                 peer_address: output_info.peer_address.clone(),
-                program_number: output_info.config.extract_program_number(),
             });
         }
 
@@ -1090,35 +978,11 @@ pub async fn get_input_outputs(
                     };
                     (dest, kind_str)
                 },
-                CreateOutputRequest::Spts { destination, program_number, .. } => {
-                    let dest = match destination {
-                        SpsDestinationConfig::Udp { .. } => {
-                            let host = destination.get_remote_host().unwrap_or_else(|| "127.0.0.1".to_string());
-                            let port = destination.get_remote_port().unwrap_or(8000);
-                            format!("spts:{}:{}:{}", program_number, host, port)
-                        },
-                        SpsDestinationConfig::Srt { config } => {
-                            match config {
-                                SrtOutputConfig::Caller { .. } => {
-                                    let host = config.get_remote_host().unwrap_or_else(|| "unknown".to_string());
-                                    let port = config.get_remote_port().unwrap_or(0);
-                                    format!("spts:{}:{}:{}", program_number, host, port)
-                                },
-                                SrtOutputConfig::Listener { .. } => {
-                                    let port = config.get_bind_port().unwrap_or(0);
-                                    format!("spts:{}::{}", program_number, port)
-                                },
-                            }
-                        }
-                    };
-                    (dest, "spts")
-                }
             };
 
             let name = match output_config {
                 CreateOutputRequest::Udp { name, .. } => name.clone(),
                 CreateOutputRequest::Srt { name, .. } => name.clone(),
-                CreateOutputRequest::Spts { name, .. } => name.clone(),
             };
 
             outputs.push(OutputDetailResponse {
@@ -1132,7 +996,6 @@ pub async fn get_input_outputs(
                 config: Some(serde_json::to_string(output_config).unwrap_or_default()),
                 uptime_seconds: None,
                 peer_address: None,
-                program_number: output_config.extract_program_number(),
             });
         }
 
@@ -1233,7 +1096,6 @@ pub async fn get_status(_state: web::Data<AppState>) -> ActixResult<impl Respond
                 uptime_seconds: calculate_connection_uptime(&output_info.status, output_info.connected_at),
                 peer_address: output_info.peer_address.clone(),
                 bitrate_bps,
-                program_number: output_info.config.extract_program_number(),
             });
         }
 
@@ -1263,35 +1125,11 @@ pub async fn get_status(_state: web::Data<AppState>) -> ActixResult<impl Respond
                     };
                     (dest, kind_str)
                 },
-                CreateOutputRequest::Spts { destination, program_number, .. } => {
-                    let dest = match destination {
-                        SpsDestinationConfig::Udp { .. } => {
-                            let host = destination.get_remote_host().unwrap_or_else(|| "127.0.0.1".to_string());
-                            let port = destination.get_remote_port().unwrap_or(8000);
-                            format!("spts:{}:{}:{}", program_number, host, port)
-                        },
-                        SpsDestinationConfig::Srt { config } => {
-                            match config {
-                                SrtOutputConfig::Caller { .. } => {
-                                    let host = config.get_remote_host().unwrap_or_else(|| "unknown".to_string());
-                                    let port = config.get_remote_port().unwrap_or(0);
-                                    format!("spts:{}:{}:{}", program_number, host, port)
-                                },
-                                SrtOutputConfig::Listener { .. } => {
-                                    let port = config.get_bind_port().unwrap_or(0);
-                                    format!("spts:{}::{}", program_number, port)
-                                },
-                            }
-                        }
-                    };
-                    (dest, "spts")
-                }
             };
 
             let name = match output_config {
                 CreateOutputRequest::Udp { name, .. } => name.clone(),
                 CreateOutputRequest::Srt { name, .. } => name.clone(),
-                CreateOutputRequest::Spts { name, .. } => name.clone(),
             };
 
             outputs_resp.push(OutputResponse {
@@ -1305,7 +1143,6 @@ pub async fn get_status(_state: web::Data<AppState>) -> ActixResult<impl Respond
                 uptime_seconds: None,
                 peer_address: None,
                 bitrate_bps: None, // No bitrate for stopped outputs
-                program_number: output_config.extract_program_number(),
             });
         }
 
@@ -1430,11 +1267,25 @@ async fn output_stats(
 pub async fn load_from_db(state: &AppState) -> anyhow::Result<()> {
     println!("Cargando inputs desde la base de datos...");
     let rows = database::get_all_inputs(&state.pool).await?;
-    
+
     // Process inputs outside of the mutex lock first
     let mut loaded_inputs = HashMap::new();
-    
-    for r in rows {
+
+    // Separate inputs into base inputs (UDP, SRT) and SPTS inputs
+    let mut base_inputs = Vec::new();
+    let mut spts_inputs = Vec::new();
+
+    for r in &rows {
+        if r.kind == "spts" {
+            spts_inputs.push(r);
+        } else {
+            base_inputs.push(r);
+        }
+    }
+
+    // Phase 1: Load base inputs first (UDP, SRT)
+    println!("Phase 1: Loading {} base inputs (UDP, SRT)", base_inputs.len());
+    for r in base_inputs {
         println!("Procesando input ID {} de tipo {} con status {}", r.id, r.kind, r.status);
 
         // Solo recrear inputs que están activos (not stopped)
@@ -1452,6 +1303,10 @@ pub async fn load_from_db(state: &AppState) -> anyhow::Result<()> {
                     name: r.name.clone(),
                     config: serde_json::from_str(&r.config_json)?
                 },
+                "spts" => {
+                    // Deserialize SPTS configuration
+                    serde_json::from_str::<CreateInputRequest>(&r.config_json)?
+                },
                 _ => {
                     println!("Tipo de input desconocido: {}, saltando", r.kind);
                     continue;
@@ -1462,7 +1317,7 @@ pub async fn load_from_db(state: &AppState) -> anyhow::Result<()> {
             let (tx, _) = broadcast::channel(BROADCAST_CAPACITY);
             let stopped_input_info = InputInfo {
                 id: r.id,
-                name: r.name,
+                name: r.name.clone(),
                 status: StreamStatus::Stopped,
                 packet_tx: tx,
                 stats: Arc::new(RwLock::new(None)),
@@ -1510,6 +1365,87 @@ pub async fn load_from_db(state: &AppState) -> anyhow::Result<()> {
             }
             Err(e) => {
                 error!("Error recreating input {}: {}", r.id, e);
+            }
+        }
+    }
+
+    // Phase 2: Load SPTS inputs (after their source inputs exist)
+    println!("Phase 2: Loading {} SPTS inputs", spts_inputs.len());
+    for r in spts_inputs {
+        println!("Procesando SPTS input ID {} con status {}", r.id, r.status);
+
+        // For stopped SPTS inputs, create InputInfo in stopped state
+        if r.status == "stopped" {
+            println!("SPTS Input {} está en status '{}', creando entrada stopped en memoria", r.id, r.status);
+
+            let create_req: CreateInputRequest = serde_json::from_str(&r.config_json)?;
+
+            // Crear InputInfo en estado stopped
+            let (tx, _) = broadcast::channel(BROADCAST_CAPACITY);
+            let stopped_input_info = InputInfo {
+                id: r.id,
+                name: r.name.clone(),
+                status: StreamStatus::Stopped,
+                packet_tx: tx,
+                stats: Arc::new(RwLock::new(None)),
+                task_handle: None,
+                config: create_req,
+                output_tasks: HashMap::new(),
+                stopped_outputs: HashMap::new(),
+                analysis_tasks: HashMap::new(),
+                paused_analysis: Vec::new(),
+                started_at: None,
+                connected_at: None,
+                state_tx: None,
+                source_address: None,
+            };
+
+            loaded_inputs.insert(r.id, stopped_input_info);
+            continue;
+        }
+
+        // For active SPTS inputs, verify source exists and spawn
+        let create_req: CreateInputRequest = serde_json::from_str(&r.config_json)?;
+
+        // Check if source input exists
+        if let CreateInputRequest::Spts { source_input_id, .. } = &create_req {
+            if !loaded_inputs.contains_key(source_input_id) {
+                error!("Source input {} not found for SPTS input {}. Creating in stopped state.",
+                       source_input_id, r.id);
+
+                // Create in stopped state
+                let (tx, _) = broadcast::channel(BROADCAST_CAPACITY);
+                let stopped_input_info = InputInfo {
+                    id: r.id,
+                    name: r.name.clone(),
+                    status: StreamStatus::Stopped,
+                    packet_tx: tx,
+                    stats: Arc::new(RwLock::new(None)),
+                    task_handle: None,
+                    config: create_req,
+                    output_tasks: HashMap::new(),
+                    stopped_outputs: HashMap::new(),
+                    analysis_tasks: HashMap::new(),
+                    paused_analysis: Vec::new(),
+                    started_at: None,
+                    connected_at: None,
+                    state_tx: None,
+                    source_address: None,
+                };
+
+                loaded_inputs.insert(r.id, stopped_input_info);
+                continue;
+            }
+        }
+
+        // Spawn SPTS input
+        match spawn_input(create_req, r.id, r.name.clone(), None).await {
+            Ok(info) => {
+                println!("SPTS Input {} recreado exitosamente", r.id);
+                loaded_inputs.insert(r.id, info);
+            }
+            Err(e) => {
+                error!("Error recreating SPTS input {}: {}", r.id, e);
             }
         }
     }
@@ -1589,32 +1525,7 @@ pub async fn load_from_db(state: &AppState) -> anyhow::Result<()> {
                                 name: o.name.clone(),
                                 config,
                             }
-                        },
-                        "spts" => {
-                            let config_json = o.config_json.unwrap_or_default();
-                            // Deserialize the entire CreateOutputRequest to get the full SPTS config
-                            let config: CreateOutputRequest = serde_json::from_str(&config_json)
-                                .unwrap_or_else(|e| {
-                                    println!("Error deserializing SPTS config for output {}: {}", o.id, e);
-                                    // Fallback to a default SPTS config
-                                    CreateOutputRequest::Spts {
-                                        input_id,
-                                        name: o.name.clone(),
-                                        program_number: 1,
-                                        fill_with_nulls: Some(false),
-                                        destination: SpsDestinationConfig::Udp {
-                                            remote_host: Some("127.0.0.1".to_string()),
-                                            remote_port: Some(8000),
-                                            automatic_port: None,
-                                            bind_host: None,
-                                            multicast_ttl: None,
-                                            multicast_interface: None,
-                                            destination_addr: Some(destination.clone()),
-                                        }
-                                    }
-                                });
-                            config
-                        },
+                        },                        
                         _ => {
                             println!("Tipo de output desconocido: {}, saltando", o.kind);
                             continue;
@@ -1684,33 +1595,7 @@ pub async fn load_from_db(state: &AppState) -> anyhow::Result<()> {
                             }
                             Err(e) => Err(anyhow::anyhow!("Error recreating SRT Listener output: {}", e))
                         }
-                    }
-                    "spts" => {
-                        // Deserialize the full SPTS configuration from config_json
-                        let config_json = o.config_json.as_deref().unwrap_or("{}");
-                        let full_config: CreateOutputRequest = serde_json::from_str(config_json)?;
-
-                        // Extract SPTS-specific fields
-                        if let CreateOutputRequest::Spts { program_number, fill_with_nulls, destination, .. } = full_config {
-                            match create_spts_output(
-                                input,
-                                o.id,
-                                o.name.clone(),
-                                program_number,
-                                fill_with_nulls.unwrap_or(false),
-                                destination,
-                                get_state_change_sender().await
-                            ).await {
-                                Ok(output_info) => {
-                                    input.output_tasks.insert(o.id, output_info);
-                                    Ok(())
-                                }
-                                Err(e) => Err(anyhow::anyhow!("Error recreating SPTS output: {}", e))
-                            }
-                        } else {
-                            Err(anyhow::anyhow!("Invalid SPTS configuration for output {}", o.id))
-                        }
-                    }
+                    }                    
                     _ => {
                         println!("Tipo de output desconocido: {}, saltando", o.kind);
                         Ok(())
@@ -1743,6 +1628,7 @@ fn get_name_from_request(req: &CreateInputRequest) -> Option<String> {
     match req {
         CreateInputRequest::Udp { name, .. } => name.clone(),
         CreateInputRequest::Srt { name, .. } => name.clone(),
+        CreateInputRequest::Spts { name, .. } => name.clone(),
     }
 }
 
@@ -1766,6 +1652,9 @@ fn generate_input_name(req: &CreateInputRequest) -> Option<String> {
             };
             Some(name)
         }
+        CreateInputRequest::Spts { source_input_id, program_number, .. } => {
+            Some(format!("SPTS Program {} from Input {}", program_number, source_input_id))
+        }
     }
 }
 
@@ -1787,7 +1676,7 @@ async fn spawn_input(req: CreateInputRequest, id: i64, name: Option<String>, _as
         }
 
         /* ----------------------- SRT  (caller o listener) -------------- */
-        CreateInputRequest::Srt { ref config, .. } => {            
+        CreateInputRequest::Srt { ref config, .. } => {
             // Lanza el forwarder (con reconexión automática)
             let state_tx = get_state_change_sender().await;
             let source_with_state = SrtSourceWithState {
@@ -1819,6 +1708,31 @@ async fn spawn_input(req: CreateInputRequest, id: i64, name: Option<String>, _as
                 state_tx: get_state_change_sender().await, // Use global state channel
                 source_address: None, // Will be set when SRT listener accepts connection
             })
+        }
+
+        /* ----------------------------- SPTS ----------------------------- */
+        CreateInputRequest::Spts { source_input_id, program_number, fill_with_nulls, .. } => {
+            // Get the source MPTS input
+            let streams_guard = ACTIVE_STREAMS.lock().await;
+            let source_input = streams_guard.get(&source_input_id)
+                .ok_or_else(|| actix_web::error::ErrorBadRequest(
+                    format!("Source input {} not found or not active", source_input_id)
+                ))?;
+
+            // Create SPTS input that filters from the source
+            let result = spawn_spts_input(
+                source_input,
+                id,
+                program_number,
+                fill_with_nulls.unwrap_or(false),
+                name,
+                get_state_change_sender().await,
+            );
+
+            // Drop the lock before returning
+            drop(streams_guard);
+
+            result
         }
     }
 }

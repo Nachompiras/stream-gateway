@@ -220,6 +220,7 @@ fn get_input_stream_type(input_info: &InputInfo) -> &'static str {
     match &input_info.config {
         models::CreateInputRequest::Udp { .. } => "udp",
         models::CreateInputRequest::Srt { .. } => "srt",
+        models::CreateInputRequest::Spts { .. } => "spts",
     }
 }
 
@@ -227,6 +228,5 @@ fn get_output_stream_type(output_info: &OutputInfo) -> &'static str {
     match &output_info.config {
         models::CreateOutputRequest::Udp { .. } => "udp",
         models::CreateOutputRequest::Srt { .. } => "srt",
-        models::CreateOutputRequest::Spts { .. } => "spts",
     }
 }

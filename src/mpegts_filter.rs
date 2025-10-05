@@ -1,6 +1,7 @@
 use bytes::{Bytes, BytesMut, BufMut};
 use log::{debug, warn, trace};
 use std::collections::HashSet;
+use once_cell::sync::Lazy;
 
 /// MPEG-TS packet size in bytes
 pub const TS_PACKET_SIZE: usize = 188;
@@ -18,6 +19,17 @@ const NULL_PID: u16 = 0x1FFF;
 /// PID for Conditional Access Table
 const CAT_PID: u16 = 0x0001;
 
+/// Static null packet to avoid repeated allocations
+static NULL_PACKET: Lazy<Bytes> = Lazy::new(|| {
+    let mut packet = BytesMut::with_capacity(TS_PACKET_SIZE);
+    packet.put_u8(TS_SYNC_BYTE);
+    packet.put_u8(0x1F); // PID high byte
+    packet.put_u8(0xFF); // PID low byte (0x1FFF)
+    packet.put_u8(0x10); // No adaptation field, payload present, counter = 0
+    packet.resize(TS_PACKET_SIZE, 0xFF);
+    packet.freeze()
+});
+
 /// Represents a single TS packet
 #[derive(Debug, Clone)]
 pub struct TsPacket {
@@ -28,14 +40,10 @@ pub struct TsPacket {
 
 impl TsPacket {
     /// Parse a TS packet from raw bytes
+    #[inline(always)]
     pub fn parse(data: Bytes) -> Option<Self> {
-        if data.len() != TS_PACKET_SIZE {
-            warn!("Invalid TS packet size: {} bytes", data.len());
-            return None;
-        }
-
-        if data[0] != TS_SYNC_BYTE {
-            warn!("Missing TS sync byte");
+        // Fast path: validate size and sync byte without logging
+        if data.len() != TS_PACKET_SIZE || data[0] != TS_SYNC_BYTE {
             return None;
         }
 
@@ -51,26 +59,6 @@ impl TsPacket {
             payload_unit_start,
             data,
         })
-    }
-
-    /// Create a null packet
-    pub fn create_null_packet() -> Bytes {
-        let mut packet = BytesMut::with_capacity(TS_PACKET_SIZE);
-
-        // Sync byte
-        packet.put_u8(TS_SYNC_BYTE);
-
-        // PID = 0x1FFF (null packet)
-        packet.put_u8(0x1F);
-        packet.put_u8(0xFF);
-
-        // Flags and counter
-        packet.put_u8(0x10); // No adaptation field, payload present, counter = 0
-
-        // Fill rest with 0xFF
-        packet.resize(TS_PACKET_SIZE, 0xFF);
-
-        packet.freeze()
     }
 }
 
@@ -97,6 +85,7 @@ pub struct ProgramFilter {
     #[allow(dead_code)]
     pmt_cache: Option<Bytes>,
     fill_with_nulls: bool,
+    output_buffer: BytesMut,
 }
 
 impl ProgramFilter {
@@ -113,76 +102,60 @@ impl ProgramFilter {
             pat_cache: None,
             pmt_cache: None,
             fill_with_nulls,
+            output_buffer: BytesMut::new(),
         }
     }
 
     /// Filter a batch of packets and return only those belonging to the target program
     pub fn filter_packets(&mut self, input: &Bytes) -> Bytes {
-        let mut output = BytesMut::new();
+        // Clear buffer but keep capacity
+        self.output_buffer.clear();
 
         // Process packets in chunks of TS_PACKET_SIZE
         let mut offset = 0;
         while offset + TS_PACKET_SIZE <= input.len() {
             let packet_data = input.slice(offset..offset + TS_PACKET_SIZE);
 
-            if let Some(packet) = TsPacket::parse(packet_data.clone()) {
-                if self.should_include_packet(&packet) {
-                    // Update and learn from this packet
-                    self.process_packet(&packet);
+            if let Some(packet) = TsPacket::parse(packet_data) {
+                let pid = packet.pid;
+
+                // Inline should_include_packet logic for performance
+                let should_include = if pid == PAT_PID || pid == CAT_PID {
+                    true
+                } else if let Some(ref info) = self.program_info {
+                    pid == info.pmt_pid || info.pids.contains(&pid)
+                } else {
+                    false
+                };
+
+                if should_include {
+                    // Process PAT/PMT packets to learn program structure
+                    if pid == PAT_PID && packet.payload_unit_start {
+                        self.process_pat(&packet.data);
+                    } else if let Some(ref info) = self.program_info {
+                        if pid == info.pmt_pid && packet.payload_unit_start {
+                            self.process_pmt(&packet.data);
+                        }
+                    }
 
                     // Include packet in output
-                    output.put(packet.data);
+                    self.output_buffer.put(packet.data);
                 } else if self.fill_with_nulls {
-                    // Replace with null packet to maintain bitrate
-                    output.put(TsPacket::create_null_packet());
+                    // Replace with null packet to maintain bitrate (zero-cost clone)
+                    self.output_buffer.put(NULL_PACKET.clone());
                 }
             } else if self.fill_with_nulls {
                 // Invalid packet, replace with null
-                output.put(TsPacket::create_null_packet());
+                self.output_buffer.put(NULL_PACKET.clone());
             }
 
             offset += TS_PACKET_SIZE;
         }
 
-        output.freeze()
+        // Split the buffer to avoid cloning
+        self.output_buffer.split().freeze()
     }
 
-    /// Check if a packet should be included in the filtered output
-    fn should_include_packet(&self, packet: &TsPacket) -> bool {
-        // Always include PAT
-        if packet.pid == PAT_PID {
-            return true;
-        }
-
-        // Include CAT (Conditional Access Table) if present
-        if packet.pid == CAT_PID {
-            return true;
-        }
-
-        // If we haven't learned the program info yet, only include PAT
-        let Some(ref info) = self.program_info else {
-            return false;
-        };
-
-        // Include PMT for our program
-        if packet.pid == info.pmt_pid {
-            return true;
-        }
-
-        // Include any PID belonging to our program
-        info.pids.contains(&packet.pid)
-    }
-
-    /// Process and learn from a packet
-    fn process_packet(&mut self, packet: &TsPacket) {
-        if packet.pid == PAT_PID && packet.payload_unit_start {
-            self.process_pat(&packet.data);
-        } else if let Some(ref info) = self.program_info {
-            if packet.pid == info.pmt_pid && packet.payload_unit_start {
-                self.process_pmt(&packet.data);
-            }
-        }
-    }
 
     /// Process PAT (Program Association Table) to find our program's PMT PID
     fn process_pat(&mut self, data: &Bytes) {
@@ -334,17 +307,7 @@ mod tests {
 
         let packet = TsPacket::parse(data.freeze()).unwrap();
         assert_eq!(packet.pid, PAT_PID);
-    }
-
-    #[test]
-    fn test_null_packet_creation() {
-        let null_packet = TsPacket::create_null_packet();
-        assert_eq!(null_packet.len(), TS_PACKET_SIZE);
-        assert_eq!(null_packet[0], TS_SYNC_BYTE);
-
-        let parsed = TsPacket::parse(null_packet).unwrap();
-        assert_eq!(parsed.pid, NULL_PID);
-    }
+    } 
 
     #[test]
     fn test_program_filter_creation() {
