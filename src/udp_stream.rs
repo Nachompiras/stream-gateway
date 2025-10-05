@@ -90,7 +90,7 @@ pub async fn create_udp_output(
     let final_name = name.or(Some(format!("UDP Output to {}", destination_addr)));
     let packet_rx = input.packet_tx.subscribe();
     let abort_handle =
-        spawn_output_sender(packet_rx, dest_addr, input.id, output_id, bind_host.clone(),  bind_host.clone(),multicast_config.clone());
+        spawn_output_sender(packet_rx, dest_addr, input.id, output_id, final_name.clone(), bind_host.clone(), multicast_config.clone());
 
     // Increment active outputs counter
     metrics::increment_active_outputs();
@@ -330,8 +330,18 @@ async fn create_multicast_socket(
         socket.set_reuse_port(true)?;
     }
 
-    // Bind to the address and port
-    let bind_sockaddr: SockAddr = format!("{}:{}", bind_addr, port).parse::<SocketAddr>()
+    // For multicast reception on Linux, we should bind to the multicast group address itself
+    // This ensures we only receive traffic for this specific multicast group
+    // On other platforms, binding to 0.0.0.0 works, but Linux is more strict
+    let actual_bind_addr = if let Some(group_addr_str) = multicast_group {
+        // Bind directly to the multicast group address to receive only that group's traffic
+        group_addr_str
+    } else {
+        // For unicast, bind to the specified interface address
+        bind_addr
+    };
+
+    let bind_sockaddr: SockAddr = format!("{}:{}", actual_bind_addr, port).parse::<SocketAddr>()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?.into();
     socket.bind(&bind_sockaddr)?;
 
