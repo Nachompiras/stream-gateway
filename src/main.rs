@@ -86,14 +86,12 @@ async fn main() -> std::io::Result<()> {
             .app_data(app_state_for_server.clone()) // Compartir estado con los handlers
             // Input endpoints
             .service(create_input)
-            .service(update_input)
             .service(delete_input)
             .service(list_inputs)
             .service(get_input)
             .service(input_stats)
             // Output endpoints
             .service(create_output)
-            .service(update_output)
             .service(delete_output)
             .service(list_outputs)
             .service(get_output)

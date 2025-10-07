@@ -1,7 +1,7 @@
 use std::time::Duration;
 use sqlx::{migrate::MigrateDatabase, sqlite::{SqliteConnectOptions, SqliteJournalMode}, SqlitePool};
 use anyhow::Result;
-use crate::models::{CreateInputRequest, CreateOutputRequest, InputRow, OutputRow, input_kind_string};
+use crate::models::{CreateInputRequest, InputRow, OutputRow, input_kind_string};
 
 pub async fn init_database() -> Result<SqlitePool> {
     let db_url = "sqlite://./state.db";
@@ -69,15 +69,17 @@ pub async fn save_output_to_db(
     name: Option<&str>,
     input_id: i64,
     kind: &str,
+    destination: &str,
     config_json: Option<&str>,
     listen_port: Option<u16>,
 ) -> Result<i64> {
     let result = sqlx::query(
-        "INSERT INTO outputs (name, input_id, kind, config_json, listen_port, status) VALUES (?, ?, ?, ?, ?, 'connecting')"
+        "INSERT INTO outputs (name, input_id, kind, destination, config_json, listen_port, status) VALUES (?, ?, ?, ?, ?, ?, 'connecting')"
     )
     .bind(name)
     .bind(input_id)
     .bind(kind)
+    .bind(destination)
     .bind(config_json)
     .bind(listen_port.map(|p| p as i32))
     .execute(pool)
@@ -106,7 +108,7 @@ pub async fn get_all_inputs(pool: &SqlitePool) -> Result<Vec<InputRow>> {
 pub async fn get_all_outputs(pool: &SqlitePool) -> Result<Vec<OutputRow>> {
     println!("Consultando todos los outputs en la base de datos...");
     let rows = sqlx::query_as::<_, OutputRow>(
-        "SELECT id, name, input_id, kind, config_json, listen_port, status FROM outputs"
+        "SELECT id, name, input_id, kind, destination, config_json, listen_port, status FROM outputs"
     )
     .fetch_all(pool)
     .await?;
@@ -114,8 +116,21 @@ pub async fn get_all_outputs(pool: &SqlitePool) -> Result<Vec<OutputRow>> {
     Ok(rows)
 }
 
-// Removed check_output_exists function - no longer needed without destination column
-// Duplicate outputs are now allowed (same config can be used multiple times)
+pub async fn check_output_exists(
+    pool: &SqlitePool,
+    input_id: i64,
+    destination: &str,
+) -> Result<bool> {
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM outputs WHERE input_id = ? AND destination = ?"
+    )
+    .bind(input_id)
+    .bind(destination)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(count > 0)
+}
 
 pub async fn check_port_conflict(
     pool: &SqlitePool,
@@ -142,37 +157,6 @@ pub async fn check_port_conflict(
     Ok(count > 0)
 }
 
-// Check if a port is already in use by an input (for UDP listeners and SRT listeners)
-pub async fn check_input_port_conflict(
-    pool: &SqlitePool,
-    port: u16,
-    exclude_input_id: Option<i64>,
-) -> Result<bool> {
-    // Check if any input is using this port
-    // We need to parse config_json to extract the bind_port or listen_port
-    let all_inputs = get_all_inputs(pool).await?;
-
-    for input in all_inputs {
-        // Skip the input we're excluding (if updating)
-        if let Some(exclude_id) = exclude_input_id {
-            if input.id == exclude_id {
-                continue;
-            }
-        }
-
-        // Parse config and check port
-        if let Ok(config) = serde_json::from_str::<CreateInputRequest>(&input.config_json) {
-            let input_port = config.get_bind_port();
-            if input_port == port && input_port != 0 {
-                return Ok(true);
-            }
-        }
-    }
-
-    // Also check outputs that use listener ports
-    check_port_conflict(pool, port, None).await
-}
-
 pub async fn get_input_by_id(pool: &SqlitePool, input_id: i64) -> Result<Option<InputRow>> {
     let row = sqlx::query_as::<_, InputRow>(
         "SELECT id, name, kind, config_json, status FROM inputs WHERE id = ?"
@@ -186,7 +170,7 @@ pub async fn get_input_by_id(pool: &SqlitePool, input_id: i64) -> Result<Option<
 
 pub async fn get_output_by_id(pool: &SqlitePool, output_id: i64) -> Result<Option<OutputRow>> {
     let row = sqlx::query_as::<_, OutputRow>(
-        "SELECT id, name, input_id, kind, config_json, listen_port, status FROM outputs WHERE id = ?"
+        "SELECT id, name, input_id, kind, destination, config_json, listen_port, status FROM outputs WHERE id = ?"
     )
     .bind(output_id)
     .fetch_optional(pool)
@@ -223,51 +207,4 @@ pub async fn get_input_id_for_output(pool: &SqlitePool, output_id: i64) -> Resul
         .await?;
 
     Ok(row.0)
-}
-
-// Update input configuration in database
-pub async fn update_input_config_in_db(
-    pool: &SqlitePool,
-    input_id: i64,
-    request: &CreateInputRequest,
-) -> Result<()> {
-    let kind = input_kind_string(request);
-    let config_json = serde_json::to_string(request)?;
-
-    sqlx::query("UPDATE inputs SET kind = ?, config_json = ? WHERE id = ?")
-        .bind(kind)
-        .bind(config_json)
-        .bind(input_id)
-        .execute(pool)
-        .await?;
-
-    Ok(())
-}
-
-// Update output configuration in database
-pub async fn update_output_config_in_db(
-    pool: &SqlitePool,
-    output_id: i64,
-    request: &CreateOutputRequest,
-    listen_port: Option<u16>,
-) -> Result<()> {
-    let kind = match request {
-        CreateOutputRequest::Udp { .. } => "udp",
-        CreateOutputRequest::Srt { config, .. } => match config {
-            crate::models::SrtOutputConfig::Caller { .. } => "srt_caller",
-            crate::models::SrtOutputConfig::Listener { .. } => "srt_listener",
-        },
-    };
-
-    let config_json = serde_json::to_string(request)?;
-
-    sqlx::query("UPDATE outputs SET kind = ?, config_json = ?, listen_port = ? WHERE id = ?")
-        .bind(kind)
-        .bind(config_json)
-        .bind(listen_port.map(|p| p as i32))
-        .bind(output_id)
-        .execute(pool)
-        .await?;
-
-    Ok(())
 }

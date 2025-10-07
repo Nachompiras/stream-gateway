@@ -266,139 +266,12 @@ pub struct DeleteOutputRequest {
     pub output_id: i64,
 }
 
-// Update request types for editing existing inputs/outputs
-#[derive(Serialize, Deserialize, Debug, Clone)]
-#[serde(tag = "type")]
-pub enum UpdateInputRequest {
-    #[serde(rename = "udp")]
-    Udp {
-        #[serde(skip_serializing_if = "Option::is_none", alias = "bind_host")]
-        host: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none", alias = "bind_port")]
-        port: Option<u16>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        name: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        multicast_group: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        source_specific_multicast: Option<String>,
-    },
-    #[serde(rename = "srt")]
-    Srt {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        name: Option<String>,
-        #[serde(flatten)]
-        config: UpdateSrtInputConfig,
-    },
-    #[serde(rename = "spts")]
-    Spts {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        name: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        fill_with_nulls: Option<bool>,
-    },
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-#[serde(tag = "mode")]
-pub enum UpdateSrtInputConfig {
-    #[serde(rename = "listener")]
-    Listener {
-        #[serde(skip_serializing_if = "Option::is_none", alias = "bind_host")]
-        host: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none", alias = "bind_port")]
-        port: Option<u16>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        latency_ms: Option<i32>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        stream_id: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        passphrase: Option<String>,
-    },
-    #[serde(rename = "caller")]
-    Caller {
-        #[serde(skip_serializing_if = "Option::is_none", alias = "remote_host")]
-        host: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none", alias = "remote_port")]
-        port: Option<u16>,
-        #[serde(skip_serializing_if = "Option::is_none", alias = "bind_host")]
-        local_host: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        latency_ms: Option<i32>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        stream_id: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        passphrase: Option<String>,
-    },
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-#[serde(tag = "type")]
-pub enum UpdateOutputRequest {
-    #[serde(rename = "udp")]
-    Udp {
-        #[serde(skip_serializing_if = "Option::is_none", alias = "remote_host")]
-        host: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none", alias = "remote_port")]
-        port: Option<u16>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        name: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none", alias = "bind_host")]
-        local_host: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        multicast_ttl: Option<u8>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        multicast_interface: Option<String>,
-    },
-    #[serde(rename = "srt")]
-    Srt {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        name: Option<String>,
-        #[serde(flatten)]
-        config: UpdateSrtOutputConfig,
-    },
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-#[serde(tag = "mode")]
-pub enum UpdateSrtOutputConfig {
-    #[serde(rename = "listener")]
-    Listener {
-        #[serde(skip_serializing_if = "Option::is_none", alias = "bind_host")]
-        host: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none", alias = "bind_port")]
-        port: Option<u16>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        latency_ms: Option<i32>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        stream_id: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        passphrase: Option<String>,
-    },
-    #[serde(rename = "caller")]
-    Caller {
-        #[serde(skip_serializing_if = "Option::is_none", alias = "remote_host")]
-        host: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none", alias = "remote_port")]
-        port: Option<u16>,
-        #[serde(skip_serializing_if = "Option::is_none", alias = "bind_host")]
-        local_host: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        latency_ms: Option<i32>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        stream_id: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        passphrase: Option<String>,
-    },
-}
-
 #[derive(Serialize)]
 pub struct InputResponse {
     pub id: i64,
     pub name: Option<String>,
     pub status: String,
-    pub host: Option<String>, // Host address (for listeners) or remote host (for callers)
-    pub port: Option<u16>, // Port bound/connected to
+    pub assigned_port: Option<u16>, // Port assigned automatically or specified
     pub outputs: Vec<OutputResponse>, // Lista de outputs asociados
     pub uptime_seconds: Option<u64>, // Uptime in seconds, None if stopped
     pub source_address: Option<String>, // Address of connected source (for SRT listeners)
@@ -769,103 +642,77 @@ impl CreateOutputRequest {
     /// Check if automatic port assignment is requested
     pub fn is_automatic_port(&self) -> bool {
         match self {
-            CreateOutputRequest::Udp { port, _legacy_remote_port, _legacy_automatic_port, _legacy_destination_addr, .. } => {
-                // Check new field first
-                if let Some(p) = port {
-                    return *p == 0;
-                }
-                // Check legacy fields
-                if let Some(true) = _legacy_automatic_port {
+            CreateOutputRequest::Udp { automatic_port, remote_port, destination_addr, .. } => {
+                // If automatic_port is explicitly set to true, use auto port
+                if automatic_port == &Some(true) {
                     return true;
                 }
-                // Check legacy port field
-                if let Some(p) = _legacy_remote_port {
-                    return p == 0;
+                // If automatic_port is explicitly false, use specified ports
+                if automatic_port == &Some(false) {
+                    return false;
                 }
-                // Try parsing from legacy destination_addr
-                if let Some(addr) = _legacy_destination_addr {
-                    if let Some(port_str) = addr.split(':').nth(1) {
-                        if let Ok(p) = port_str.parse::<u16>() {
-                            return p == 0;
-                        }
-                    }
-                }
-                true // Default to auto if no port specified
+                // If automatic_port is None, check port values
+                crate::port_utils::should_use_auto_port_output(*remote_port, None, destination_addr.as_ref())
             },
             CreateOutputRequest::Srt { config, .. } => config.is_automatic_port(),
         }
     }
 
-    /// Get the effective host
-    pub fn get_host(&self) -> String {
+    /// Get the effective remote host
+    pub fn get_remote_host(&self) -> Option<String> {
         match self {
-            CreateOutputRequest::Udp { host, _legacy_remote_host, _legacy_destination_addr, .. } => {
-                // Prefer new field, fallback to legacy fields
-                if let Some(h) = host.clone().or_else(|| _legacy_remote_host.clone()) {
-                    if !h.is_empty() {
-                        return h;
+            CreateOutputRequest::Udp { remote_host, destination_addr, .. } => {
+                // Prefer new field, fallback to parsing legacy field
+                if let Some(host) = remote_host {
+                    if !host.is_empty() {
+                        Some(host.clone())
+                    } else {
+                        None
                     }
+                } else if let Some(addr) = destination_addr {
+                    addr.split(':').next().map(|s| s.to_string())
+                } else {
+                    None
                 }
-                // Try parsing from legacy destination_addr
-                if let Some(addr) = _legacy_destination_addr {
-                    if let Some(host_part) = addr.split(':').next() {
-                        return host_part.to_string();
+            },
+            CreateOutputRequest::Srt { config, .. } => config.get_remote_host(),
+        }
+    }
+    
+    /// Get the effective remote port
+    pub fn get_remote_port(&self) -> Option<u16> {
+        match self {
+            CreateOutputRequest::Udp { remote_port, destination_addr, .. } => {
+                // Prefer new field, fallback to parsing legacy field
+                if let Some(port) = remote_port {
+                    if *port != 0 {
+                        Some(*port)
+                    } else {
+                        None
                     }
+                } else if let Some(addr) = destination_addr {
+                    addr.split(':').nth(1).and_then(|s| s.parse().ok())
+                } else {
+                    None
                 }
-                "127.0.0.1".to_string()
             },
-            CreateOutputRequest::Srt { config, .. } => config.get_host(),
+            CreateOutputRequest::Srt { config, .. } => config.get_remote_port(),
         }
     }
-
-    /// Get the effective port
-    pub fn get_port(&self) -> u16 {
+    
+    /// Get bind port for listener outputs
+    pub fn get_bind_port(&self) -> Option<u16> {
         match self {
-            CreateOutputRequest::Udp { port, _legacy_remote_port, _legacy_destination_addr, .. } => {
-                // Prefer new field, fallback to legacy fields
-                if let Some(p) = port.or(*_legacy_remote_port) {
-                    return p;
-                }
-                // Try parsing from legacy destination_addr
-                if let Some(addr) = _legacy_destination_addr {
-                    if let Some(port_str) = addr.split(':').nth(1) {
-                        if let Ok(p) = port_str.parse() {
-                            return p;
-                        }
-                    }
-                }
-                0
-            },
-            CreateOutputRequest::Srt { config, .. } => config.get_port(),
+            CreateOutputRequest::Udp { .. } => None, // UDP outputs don't bind
+            CreateOutputRequest::Srt { config, .. } => config.get_bind_port(),
         }
     }
-
-    /// Get local bind host for UDP outputs (for multi-NIC support)
-    pub fn get_local_host(&self) -> Option<String> {
+    
+    /// Get bind host for listener outputs
+    pub fn get_bind_host(&self) -> Option<String> {
         match self {
-            CreateOutputRequest::Udp { local_host, _legacy_bind_host, .. } => {
-                local_host.clone().or_else(|| _legacy_bind_host.clone())
-            },
-            CreateOutputRequest::Srt { config, .. } => config.get_local_host(),
-        }
-    }
-
-    /// Extract port from configuration (for responses)
-    pub fn extract_port(&self) -> Option<u16> {
-        match self {
-            CreateOutputRequest::Udp { port, _legacy_remote_port, .. } => {
-                port.or(*_legacy_remote_port).filter(|&p| p != 0)
-            },
-            CreateOutputRequest::Srt { config, .. } => config.extract_port(),
-        }
-    }
-
-    pub fn extract_host(&self) -> Option<String> {
-        match self {
-            CreateOutputRequest::Udp { host, _legacy_remote_host, .. } => {
-                host.clone().or_else(|| _legacy_remote_host.clone())
-            },
-            CreateOutputRequest::Srt { config, .. } => config.extract_host(),
+            CreateOutputRequest::Udp { bind_host, .. } => bind_host.clone(), // UDP outputs can bind to specific interface
+            CreateOutputRequest::Srt { config, .. } => config.get_bind_host(),
         }
     }
 }
@@ -874,100 +721,91 @@ impl SrtOutputConfig {
     /// Check if automatic port assignment is requested
     pub fn is_automatic_port(&self) -> bool {
         match self {
-            SrtOutputConfig::Listener { port, _legacy_bind_port, _legacy_listen_port, _legacy_automatic_port, .. } => {
-                // Check new field first
-                if let Some(p) = port {
-                    return *p == 0;
-                }
-                // Check legacy fields
-                if let Some(true) = _legacy_automatic_port {
+            SrtOutputConfig::Listener { automatic_port, bind_port, listen_port, .. } => {
+                // If automatic_port is explicitly set to true, use auto port
+                if automatic_port == &Some(true) {
                     return true;
                 }
-                // Check legacy port fields
-                _legacy_listen_port.or(*_legacy_bind_port).map(|p| p == 0).unwrap_or(true)
+                // If automatic_port is explicitly false, use specified ports
+                if automatic_port == &Some(false) {
+                    return false;
+                }
+                // If automatic_port is None, check port values
+                crate::port_utils::should_use_auto_port_output(None, *bind_port, None) ||
+                crate::port_utils::should_use_auto_port_input(*bind_port, *listen_port)
             },
             SrtOutputConfig::Caller { .. } => false, // Callers connect to existing listeners, don't need auto port
         }
     }
 
-    /// Get the effective host
-    pub fn get_host(&self) -> String {
-        match self {
-            SrtOutputConfig::Listener { host, _legacy_bind_host, .. } => {
-                host.clone().or_else(|| _legacy_bind_host.clone()).unwrap_or_else(|| "0.0.0.0".to_string())
-            },
-            SrtOutputConfig::Caller { host, _legacy_remote_host, _legacy_destination_addr, .. } => {
-                // For callers, host is the remote host
-                if let Some(h) = host.clone().or_else(|| _legacy_remote_host.clone()) {
-                    if !h.is_empty() {
-                        return h;
-                    }
-                }
-                // Try parsing from legacy destination_addr
-                if let Some(addr) = _legacy_destination_addr {
-                    if let Some(host_part) = addr.split(':').next() {
-                        return host_part.to_string();
-                    }
-                }
-                "127.0.0.1".to_string()
-            },
-        }
-    }
-
-    /// Get the effective port
-    pub fn get_port(&self) -> u16 {
-        match self {
-            SrtOutputConfig::Listener { port, _legacy_bind_port, _legacy_listen_port, .. } => {
-                port.or(*_legacy_listen_port).or(*_legacy_bind_port).unwrap_or(0)
-            },
-            SrtOutputConfig::Caller { port, _legacy_remote_port, _legacy_destination_addr, .. } => {
-                // For callers, port is the remote port
-                if let Some(p) = port.or(*_legacy_remote_port) {
-                    return p;
-                }
-                // Try parsing from legacy destination_addr
-                if let Some(addr) = _legacy_destination_addr {
-                    if let Some(port_str) = addr.split(':').nth(1) {
-                        if let Ok(p) = port_str.parse() {
-                            return p;
-                        }
-                    }
-                }
-                0
-            },
-        }
-    }
-
-    /// Get local bind host for SRT caller output (for multi-NIC support)
-    pub fn get_local_host(&self) -> Option<String> {
+    /// Get remote host for SRT output
+    pub fn get_remote_host(&self) -> Option<String> {
         match self {
             SrtOutputConfig::Listener { .. } => None,
-            SrtOutputConfig::Caller { local_host, _legacy_bind_host, .. } => {
-                local_host.clone().or_else(|| _legacy_bind_host.clone())
+            SrtOutputConfig::Caller { remote_host, destination_addr, .. } => {
+                // Prefer new field, fallback to parsing legacy field
+                if let Some(host) = remote_host {
+                    if !host.is_empty() {
+                        Some(host.clone())
+                    } else {
+                        None
+                    }
+                } else if let Some(addr) = destination_addr {
+                    addr.split(':').next().map(|s| s.to_string())
+                } else {
+                    None
+                }
             },
         }
     }
 
-    /// Extract port from configuration (for responses)
-    pub fn extract_port(&self) -> Option<u16> {
+    /// Get local bind host for SRT caller output
+    pub fn get_caller_bind_host(&self) -> Option<String> {
         match self {
-            SrtOutputConfig::Listener { port, _legacy_bind_port, _legacy_listen_port, .. } => {
-                port.or(*_legacy_listen_port).or(*_legacy_bind_port).filter(|&p| p != 0)
-            },
-            SrtOutputConfig::Caller { port, _legacy_remote_port, .. } => {
-                port.or(*_legacy_remote_port).filter(|&p| p != 0)
+            SrtOutputConfig::Listener { .. } => None,
+            SrtOutputConfig::Caller { bind_host, .. } => bind_host.clone(),
+        }
+    }
+    
+    /// Get remote port for SRT output
+    pub fn get_remote_port(&self) -> Option<u16> {
+        match self {
+            SrtOutputConfig::Listener { .. } => None,
+            SrtOutputConfig::Caller { remote_port, destination_addr, .. } => {
+                // Prefer new field, fallback to parsing legacy field
+                if let Some(port) = remote_port {
+                    if *port != 0 {
+                        Some(*port)
+                    } else {
+                        None
+                    }
+                } else if let Some(addr) = destination_addr {
+                    addr.split(':').nth(1).and_then(|s| s.parse().ok())
+                } else {
+                    None
+                }
             },
         }
     }
-
-    pub fn extract_host(&self) -> Option<String> {
+    
+    /// Get bind port for SRT listener output
+    pub fn get_bind_port(&self) -> Option<u16> {
         match self {
-            SrtOutputConfig::Listener { host, _legacy_bind_host, .. } => {
-                host.clone().or_else(|| _legacy_bind_host.clone())
+            SrtOutputConfig::Listener { bind_port, listen_port, .. } => {
+                // Prefer legacy field first for backward compatibility, then new field
+                listen_port.or(*bind_port)
             },
-            SrtOutputConfig::Caller { host, _legacy_remote_host, .. } => {
-                host.clone().or_else(|| _legacy_remote_host.clone())
+            SrtOutputConfig::Caller { .. } => None,
+        }
+    }
+    
+    /// Get bind host for SRT listener output
+    pub fn get_bind_host(&self) -> Option<String> {
+        match self {
+            SrtOutputConfig::Listener { bind_host, .. } => {
+                Some(bind_host.clone().unwrap_or_else(|| "0.0.0.0".to_string()))
             },
+            SrtOutputConfig::Caller { .. } => None,
         }
     }
 }
@@ -1050,6 +888,63 @@ pub enum StateChange {
 // Type alias for the state change sender
 pub type StateChangeSender = mpsc::UnboundedSender<StateChange>;
 
+// Helper functions to extract ports from configuration JSON
+impl CreateInputRequest {
+    /// Extract the assigned port from a stored input configuration
+    pub fn extract_assigned_port(&self) -> Option<u16> {
+        match self {
+            CreateInputRequest::Udp { bind_port, listen_port, .. } => {
+                // Prefer listen_port for backward compatibility, then bind_port
+                listen_port.or(*bind_port).filter(|&p| p != 0)
+            },
+            CreateInputRequest::Srt { config, .. } => config.extract_assigned_port(),
+            CreateInputRequest::Spts { .. } => None, // SPTS inputs don't have ports
+        }
+    }
+}
+
+impl SrtInputConfig {
+    /// Extract the assigned port from SRT input configuration
+    pub fn extract_assigned_port(&self) -> Option<u16> {
+        match self {
+            SrtInputConfig::Listener { bind_port, listen_port, .. } => {
+                // Prefer listen_port for backward compatibility, then bind_port
+                listen_port.or(*bind_port).filter(|&p| p != 0)
+            },
+            SrtInputConfig::Caller { .. } => None, // Callers don't bind ports
+        }
+    }
+}
+
+impl CreateOutputRequest {
+    /// Extract the assigned port from a stored output configuration
+    pub fn extract_assigned_port(&self) -> Option<u16> {
+        match self {
+            CreateOutputRequest::Udp { remote_port, .. } => {
+                // UDP outputs use remote port
+                remote_port.filter(|&p| p != 0)
+            },
+            CreateOutputRequest::Srt { config, .. } => config.extract_assigned_port(),
+        }
+    }
+}
+
+impl SrtOutputConfig {
+    /// Extract the assigned port from SRT output configuration
+    pub fn extract_assigned_port(&self) -> Option<u16> {
+        match self {
+            SrtOutputConfig::Listener { bind_port, listen_port, .. } => {
+                // SRT listener outputs bind to ports
+                listen_port.or(*bind_port).filter(|&p| p != 0)
+            },
+            SrtOutputConfig::Caller { remote_port, .. } => {
+                // SRT caller outputs connect to remote ports
+                remote_port.filter(|&p| p != 0)
+            },
+        }
+    }
+}
+
 // MPEG-TS Analysis types and structures
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum AnalysisType {
@@ -1102,168 +997,6 @@ pub struct AnalysisStatusResponse {
 pub struct AnalysisListResponse {
     pub input_id: i64,
     pub active_analyses: Vec<AnalysisStatusResponse>,
-}
-
-// Helper functions to merge update requests with existing configurations
-impl UpdateInputRequest {
-    pub fn merge_with(&self, existing: &CreateInputRequest) -> CreateInputRequest {
-        match (self, existing) {
-            (UpdateInputRequest::Udp { host, port, name, multicast_group, source_specific_multicast },
-             CreateInputRequest::Udp { host: ex_host, port: ex_port, name: ex_name,
-                                       multicast_group: ex_mcast, source_specific_multicast: ex_ssm, .. }) => {
-                CreateInputRequest::Udp {
-                    host: host.clone().or_else(|| ex_host.clone()),
-                    port: port.or(*ex_port),
-                    name: name.clone().or_else(|| ex_name.clone()),
-                    multicast_group: multicast_group.clone().or_else(|| ex_mcast.clone()),
-                    source_specific_multicast: source_specific_multicast.clone().or_else(|| ex_ssm.clone()),
-                    // Legacy fields - don't expose in merge, they're only for backward compat deserialization
-                    _legacy_bind_host: None,
-                    _legacy_bind_port: None,
-                    _legacy_listen_port: None,
-                    _legacy_automatic_port: None,
-                }
-            },
-            (UpdateInputRequest::Srt { name, config },
-             CreateInputRequest::Srt { name: ex_name, config: ex_config }) => {
-                CreateInputRequest::Srt {
-                    name: name.clone().or_else(|| ex_name.clone()),
-                    config: config.merge_with(ex_config),
-                }
-            },
-            (UpdateInputRequest::Spts { name, fill_with_nulls },
-             CreateInputRequest::Spts { name: ex_name, source_input_id, program_number, fill_with_nulls: ex_fill }) => {
-                CreateInputRequest::Spts {
-                    source_input_id: *source_input_id,
-                    program_number: *program_number,
-                    fill_with_nulls: fill_with_nulls.or(*ex_fill),
-                    name: name.clone().or_else(|| ex_name.clone()),
-                }
-            },
-            _ => existing.clone(), // Type mismatch, return existing
-        }
-    }
-}
-
-impl UpdateSrtInputConfig {
-    pub fn merge_with(&self, existing: &SrtInputConfig) -> SrtInputConfig {
-        match (self, existing) {
-            (UpdateSrtInputConfig::Listener { host, port, latency_ms, stream_id, passphrase },
-             SrtInputConfig::Listener { host: ex_host, port: ex_port, common, .. }) => {
-                SrtInputConfig::Listener {
-                    host: host.clone().or_else(|| ex_host.clone()),
-                    port: port.or(*ex_port),
-                    common: SrtCommonConfig {
-                        latency_ms: latency_ms.or(common.latency_ms),
-                        stream_id: stream_id.clone().or_else(|| common.stream_id.clone()),
-                        passphrase: passphrase.clone().or_else(|| common.passphrase.clone()),
-                    },
-                    // Legacy fields
-                    _legacy_bind_host: None,
-                    _legacy_bind_port: None,
-                    _legacy_listen_port: None,
-                    _legacy_automatic_port: None,
-                }
-            },
-            (UpdateSrtInputConfig::Caller { host, port, local_host, latency_ms, stream_id, passphrase },
-             SrtInputConfig::Caller { host: ex_host, port: ex_port, local_host: ex_local_host, common, .. }) => {
-                SrtInputConfig::Caller {
-                    host: host.clone().or_else(|| ex_host.clone()),
-                    port: port.or(*ex_port),
-                    local_host: local_host.clone().or_else(|| ex_local_host.clone()),
-                    common: SrtCommonConfig {
-                        latency_ms: latency_ms.or(common.latency_ms),
-                        stream_id: stream_id.clone().or_else(|| common.stream_id.clone()),
-                        passphrase: passphrase.clone().or_else(|| common.passphrase.clone()),
-                    },
-                    // Legacy fields
-                    _legacy_remote_host: None,
-                    _legacy_remote_port: None,
-                    _legacy_bind_host: None,
-                    _legacy_target_addr: None,
-                }
-            },
-            _ => existing.clone(), // Mode mismatch, return existing
-        }
-    }
-}
-
-impl UpdateOutputRequest {
-    pub fn merge_with(&self, existing: &CreateOutputRequest, input_id: i64) -> CreateOutputRequest {
-        match (self, existing) {
-            (UpdateOutputRequest::Udp { host, port, name, local_host, multicast_ttl, multicast_interface },
-             CreateOutputRequest::Udp { host: ex_host, port: ex_port, name: ex_name, local_host: ex_local_host,
-                                        multicast_ttl: ex_ttl, multicast_interface: ex_iface, .. }) => {
-                CreateOutputRequest::Udp {
-                    input_id,
-                    host: host.clone().or_else(|| ex_host.clone()),
-                    port: port.or(*ex_port),
-                    name: name.clone().or_else(|| ex_name.clone()),
-                    local_host: local_host.clone().or_else(|| ex_local_host.clone()),
-                    multicast_ttl: multicast_ttl.or(*ex_ttl),
-                    multicast_interface: multicast_interface.clone().or_else(|| ex_iface.clone()),
-                    // Legacy fields
-                    _legacy_remote_host: None,
-                    _legacy_remote_port: None,
-                    _legacy_bind_host: None,
-                    _legacy_automatic_port: None,
-                    _legacy_destination_addr: None,
-                }
-            },
-            (UpdateOutputRequest::Srt { name, config },
-             CreateOutputRequest::Srt { name: ex_name, config: ex_config, .. }) => {
-                CreateOutputRequest::Srt {
-                    input_id,
-                    name: name.clone().or_else(|| ex_name.clone()),
-                    config: config.merge_with(ex_config),
-                }
-            },
-            _ => existing.clone(), // Type mismatch, return existing
-        }
-    }
-}
-
-impl UpdateSrtOutputConfig {
-    pub fn merge_with(&self, existing: &SrtOutputConfig) -> SrtOutputConfig {
-        match (self, existing) {
-            (UpdateSrtOutputConfig::Listener { host, port, latency_ms, stream_id, passphrase },
-             SrtOutputConfig::Listener { host: ex_host, port: ex_port, common, .. }) => {
-                SrtOutputConfig::Listener {
-                    host: host.clone().or_else(|| ex_host.clone()),
-                    port: port.or(*ex_port),
-                    common: SrtCommonConfig {
-                        latency_ms: latency_ms.or(common.latency_ms),
-                        stream_id: stream_id.clone().or_else(|| common.stream_id.clone()),
-                        passphrase: passphrase.clone().or_else(|| common.passphrase.clone()),
-                    },
-                    // Legacy fields
-                    _legacy_bind_host: None,
-                    _legacy_bind_port: None,
-                    _legacy_listen_port: None,
-                    _legacy_automatic_port: None,
-                }
-            },
-            (UpdateSrtOutputConfig::Caller { host, port, local_host, latency_ms, stream_id, passphrase },
-             SrtOutputConfig::Caller { host: ex_host, port: ex_port, local_host: ex_local_host, common, .. }) => {
-                SrtOutputConfig::Caller {
-                    host: host.clone().or_else(|| ex_host.clone()),
-                    port: port.or(*ex_port),
-                    local_host: local_host.clone().or_else(|| ex_local_host.clone()),
-                    common: SrtCommonConfig {
-                        latency_ms: latency_ms.or(common.latency_ms),
-                        stream_id: stream_id.clone().or_else(|| common.stream_id.clone()),
-                        passphrase: passphrase.clone().or_else(|| common.passphrase.clone()),
-                    },
-                    // Legacy fields
-                    _legacy_remote_host: None,
-                    _legacy_remote_port: None,
-                    _legacy_bind_host: None,
-                    _legacy_destination_addr: None,
-                }
-            },
-            _ => existing.clone(), // Mode mismatch, return existing
-        }
-    }
 }
 
 // Analysis data structures - serializable versions of mpegts_inspector data
