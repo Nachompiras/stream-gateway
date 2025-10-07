@@ -340,6 +340,197 @@ pub async fn delete_input(
     }
 }
 
+#[actix_web::patch("/inputs/{id}")]
+pub async fn update_input(
+    state: web::Data<AppState>,
+    path: web::Path<i64>,
+    req: web::Json<UpdateInputRequest>,
+) -> ActixResult<impl Responder> {
+    let input_id = path.into_inner();
+
+    info!("Request to update input {}: {:?}", input_id, req);
+
+    // Get current input from database
+    let current_input_row = match database::get_input_by_id(&state.pool, input_id).await {
+        Ok(Some(row)) => row,
+        Ok(None) => {
+            return Ok(HttpResponse::NotFound().body(format!("Input con ID '{}' no encontrado", input_id)));
+        }
+        Err(e) => {
+            error!("Error fetching input from database: {}", e);
+            return Err(ErrorInternalServerError(format!("Database error: {e}")));
+        }
+    };
+
+    // Deserialize current configuration
+    let current_config: CreateInputRequest = match serde_json::from_str(&current_input_row.config_json) {
+        Ok(config) => config,
+        Err(e) => {
+            error!("Error deserializing input config: {}", e);
+            return Err(ErrorInternalServerError(format!("Config deserialization error: {e}")));
+        }
+    };
+
+    // Merge update request with current configuration
+    let updated_config = req.merge_with(&current_config);
+
+    // Validate the updated configuration
+    if let Err(validation_error) = validate_udp_input_config(&updated_config) {
+        return Err(actix_web::error::ErrorBadRequest(validation_error));
+    }
+    if let Err(validation_error) = validate_srt_config(&updated_config) {
+        return Err(actix_web::error::ErrorBadRequest(validation_error));
+    }
+
+    // Check for port conflicts if port changed
+    let old_port = current_config.get_bind_port();
+    let new_port = updated_config.get_bind_port();
+    if old_port != new_port && new_port != 0 {
+        match check_input_port_conflict(&state.pool, new_port, Some(input_id)).await {
+            Ok(conflict) if conflict => {
+                return Ok(HttpResponse::Conflict().body(format!(
+                    "Puerto {} ya está en uso", new_port
+                )));
+            }
+            Ok(_) => {},
+            Err(e) => {
+                error!("Error checking port conflict: {}", e);
+                return Err(ErrorInternalServerError(format!("Database error: {e}")));
+            }
+        }
+    }
+
+    // Update configuration in database
+    if let Err(e) = database::update_input_config_in_db(&state.pool, input_id, &updated_config).await {
+        error!("Error updating input config in database: {}", e);
+        return Err(ErrorInternalServerError(format!("Database error: {e}")));
+    }
+
+    // Get lock on active streams
+    let mut state_guard = ACTIVE_STREAMS.lock().await;
+
+    // If input is currently active, restart it with new configuration
+    if let Some(mut input_info) = state_guard.remove(&input_id) {
+        info!("Restarting input {} with new configuration", input_id);
+
+        // Preserve outputs and analysis state
+        let outputs = input_info.output_tasks.clone();
+        let stopped_outputs = input_info.stopped_outputs.clone();
+        let active_analyses: Vec<AnalysisType> = input_info.analysis_tasks.values()
+            .map(|a| a.analysis_type.clone())
+            .collect();
+
+        // Stop current input task
+        if let Some(handle) = input_info.task_handle.take() {
+            handle.abort();
+        }
+
+        // Stop all output tasks (they will be recreated)
+        for (output_id, output_info) in &outputs {
+            info!("[{}] Stopping output task [{}] for restart", input_id, output_id);
+            if let Some(handle) = &output_info.abort_handle {
+                handle.abort();
+            }
+        }
+
+        // Stop all analysis tasks
+        for (_, analysis_info) in &input_info.analysis_tasks {
+            analysis_info.task_handle.abort();
+        }
+
+        // Spawn new input with updated configuration
+        let updated_name = match &updated_config {
+            CreateInputRequest::Udp { name, .. } => name.clone(),
+            CreateInputRequest::Srt { name, .. } => name.clone(),
+            CreateInputRequest::Spts { name, .. } => name.clone(),
+        }.or(current_input_row.name);
+
+        match spawn_input(updated_config.clone(), input_id, updated_name.clone(), None).await {
+            Ok(mut new_input_info) => {
+                info!("Input {} restarted successfully", input_id);
+
+                // Recreate outputs for the new input
+                for (output_id, output_info) in outputs {
+                    info!("Recreating output {} for input {}", output_id, input_id);
+
+                    let recreated_output = match &output_info.kind {
+                        OutputKind::Udp => {
+                            create_udp_output(
+                                output_info.destination.clone(),
+                                &new_input_info,
+                                output_id,
+                                output_info.name.clone(),
+                                output_info.config.get_host(),
+                                None, // multicast config would need to be extracted from output_info.config
+                                get_state_change_sender().await
+                            ).await
+                        },
+                        OutputKind::SrtCaller | OutputKind::SrtListener => {
+                            if let CreateOutputRequest::Srt { config, .. } = &output_info.config {
+                                create_srt_output(
+                                    input_id,
+                                    config.clone(),
+                                    &new_input_info,
+                                    output_id,
+                                    output_info.name.clone(),
+                                    get_state_change_sender().await
+                                )
+                            } else {
+                                Err(actix_web::error::ErrorInternalServerError("Invalid output config"))
+                            }
+                        }
+                    };
+
+                    match recreated_output {
+                        Ok(output) => {
+                            new_input_info.output_tasks.insert(output_id, output);
+                        }
+                        Err(e) => {
+                            error!("Error recreating output {}: {}", output_id, e);
+                            // Continue with other outputs
+                        }
+                    }
+                }
+
+                // Restore stopped outputs
+                new_input_info.stopped_outputs = stopped_outputs;
+
+                // Restart analyses that were active
+                for analysis_type in active_analyses {
+                    info!("Restarting {} analysis for input {}", analysis_type, input_id);
+                    // Note: This would require access to the analysis module
+                    // For now, we'll just log that analyses need to be manually restarted
+                }
+
+                state_guard.insert(input_id, new_input_info);
+
+                Ok(HttpResponse::Ok().json(serde_json::json!({
+                    "message": "Input actualizado y reiniciado",
+                    "id": input_id,
+                    "name": updated_name
+                })))
+            }
+            Err(e) => {
+                error!("Error restarting input {}: {}", input_id, e);
+
+                // Try to restore original input
+                input_info.stopped_outputs = stopped_outputs;
+                state_guard.insert(input_id, input_info);
+
+                Err(ErrorInternalServerError(format!("Failed to restart input: {e}")))
+            }
+        }
+    } else {
+        // Input is not active, just update database
+        info!("Input {} updated in database (not currently active)", input_id);
+
+        Ok(HttpResponse::Ok().json(serde_json::json!({
+            "message": "Input actualizado (no estaba activo)",
+            "id": input_id
+        })))
+    }
+}
+
 #[actix_web::post("/outputs")]
 pub async fn create_output(
     state: web::Data<AppState>,
@@ -636,7 +827,7 @@ pub async fn get_input(
                 output_type: output_kind_string(&output_info.kind).to_string(),
                 status: output_info.status.to_string(),
                 assigned_port,
-                config,
+                config: config_json,
                 uptime_seconds: calculate_connection_uptime(&output_info.status, output_info.connected_at),
                 peer_address: output_info.peer_address.clone(),
             });
@@ -719,7 +910,7 @@ pub async fn get_input(
 }
 
 #[actix_web::get("/outputs")]
-pub async fn list_outputs(_state: web::Data<AppState>) -> ActixResult<impl Responder> {
+pub async fn list_outputs(state: web::Data<AppState>) -> ActixResult<impl Responder> {
     // Clone necessary data while holding the lock briefly
     let outputs_snapshot: Vec<OutputSnapshotData> = {
         let state_guard = ACTIVE_STREAMS.lock().await;
@@ -771,6 +962,13 @@ pub async fn list_outputs(_state: web::Data<AppState>) -> ActixResult<impl Respo
                 connected_at,
                 peer_address,
             } => {
+                // Get config from database for active outputs
+                let config_json = if let Ok(Some(db_output)) = database::get_output_by_id(&state.pool, id).await {
+                    db_output.config_json
+                } else {
+                    None
+                };
+
                 response.push(OutputListResponse {
                     id,
                     name,
@@ -782,7 +980,7 @@ pub async fn list_outputs(_state: web::Data<AppState>) -> ActixResult<impl Respo
                     assigned_port,
                     uptime_seconds: calculate_connection_uptime(&status, connected_at),
                     peer_address,
-                    config: None, // We'll skip DB lookup for performance
+                    config: config_json,
                 });
             }
             OutputSnapshotData::Stopped {
@@ -872,22 +1070,9 @@ pub async fn get_output(
     // Search for the output across all inputs
     for (input_id, input_info) in state_guard.iter() {
         if let Some(output_info) = input_info.output_tasks.get(&output_id) {
-            // Get additional config from database
-            let (config, assigned_port) = if let Ok(Some(db_output)) = database::get_output_by_id(&state.pool, output_id).await {
-                let port = if let Some(config_json) = &db_output.config_json {
-                    // Extract port from configuration JSON
-                    if let Ok(config) = serde_json::from_str::<CreateOutputRequest>(config_json) {
-                        config.extract_assigned_port()
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-                (db_output.config_json, port)
-            } else {
-                (None, None)
-            };
+            // Use config from memory first, fallback to database
+            let config_json = serde_json::to_string(&output_info.config).ok();
+            let assigned_port = output_info.config.extract_assigned_port();
 
             let response = OutputDetailResponse {
                 id: output_id,
@@ -897,9 +1082,58 @@ pub async fn get_output(
                 output_type: output_kind_string(&output_info.kind).to_string(),
                 status: output_info.status.to_string(),
                 assigned_port,
-                config,
+                config: config_json,
                 uptime_seconds: calculate_connection_uptime(&output_info.status, output_info.connected_at),
                 peer_address: output_info.peer_address.clone(),
+            };
+
+            return Ok(HttpResponse::Ok().json(response));
+        }
+
+        // Check stopped outputs as well
+        if let Some(output_config) = input_info.stopped_outputs.get(&output_id) {
+            let (destination, output_type) = match output_config {
+                CreateOutputRequest::Udp { .. } => {
+                    let host = output_config.get_remote_host().unwrap_or_else(|| "127.0.0.1".to_string());
+                    let port = output_config.get_remote_port().unwrap_or(8000);
+                    (format!("{}:{}", host, port), "udp")
+                },
+                CreateOutputRequest::Srt { config, .. } => {
+                    let kind_str = match config {
+                        SrtOutputConfig::Caller { .. } => "srt_caller",
+                        SrtOutputConfig::Listener { .. } => "srt_listener",
+                    };
+                    let dest = match config {
+                        SrtOutputConfig::Caller { .. } => {
+                            let host = config.get_remote_host().unwrap_or_else(|| "unknown".to_string());
+                            let port = config.get_remote_port().unwrap_or(0);
+                            format!("{}:{}", host, port)
+                        },
+                        SrtOutputConfig::Listener { .. } => {
+                            let port = config.get_bind_port().unwrap_or(0);
+                            format!(":{}", port)
+                        },
+                    };
+                    (dest, kind_str)
+                },
+            };
+
+            let name = match output_config {
+                CreateOutputRequest::Udp { name, .. } => name.clone(),
+                CreateOutputRequest::Srt { name, .. } => name.clone(),
+            };
+
+            let response = OutputDetailResponse {
+                id: output_id,
+                name,
+                input_id: *input_id,
+                destination,
+                output_type: output_type.to_string(),
+                status: "stopped".to_string(),
+                assigned_port: output_config.extract_assigned_port(),
+                config: serde_json::to_string(output_config).ok(),
+                uptime_seconds: None,
+                peer_address: None,
             };
 
             return Ok(HttpResponse::Ok().json(response));
@@ -922,21 +1156,8 @@ pub async fn get_input_outputs(
 
         // Add active outputs
         for (output_id, output_info) in input_info.output_tasks.iter() {
-            let (config, assigned_port) = if let Ok(Some(db_output)) = database::get_output_by_id(&state.pool, *output_id).await {
-                let port = if let Some(config_json) = &db_output.config_json {
-                    // Extract port from configuration JSON
-                    if let Ok(config) = serde_json::from_str::<CreateOutputRequest>(config_json) {
-                        config.extract_assigned_port()
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-                (db_output.config_json, port)
-            } else {
-                (None, None)
-            };
+            let config_json = serde_json::to_string(&output_info.config).ok();
+            let assigned_port = output_info.config.extract_assigned_port();
 
             outputs.push(OutputDetailResponse {
                 id: *output_id,
@@ -946,7 +1167,7 @@ pub async fn get_input_outputs(
                 output_type: output_kind_string(&output_info.kind).to_string(),
                 status: output_info.status.to_string(),
                 assigned_port,
-                config,
+                config: config_json,
                 uptime_seconds: calculate_connection_uptime(&output_info.status, output_info.connected_at),
                 peer_address: output_info.peer_address.clone(),
             });
@@ -1005,7 +1226,7 @@ pub async fn get_input_outputs(
     }
 }
 
-#[actix_web::delete("/outputs")] // Cambiado a plural
+#[actix_web::delete("/outputs")]
 pub async fn delete_output(
     state: web::Data<AppState>,
     req: web::Json<DeleteOutputRequest>,
@@ -1056,6 +1277,215 @@ pub async fn delete_output(
         }
     } else {
         Ok(HttpResponse::NotFound().body(format!("Input con ID '{}' no encontrado", input_id)))
+    }
+}
+
+#[actix_web::patch("/outputs/{id}")]
+pub async fn update_output(
+    state: web::Data<AppState>,
+    path: web::Path<i64>,
+    req: web::Json<UpdateOutputRequest>,
+) -> ActixResult<impl Responder> {
+    let output_id = path.into_inner();
+
+    info!("Request to update output {}: {:?}", output_id, req);
+
+    // Get current output from database
+    let current_output_row = match database::get_output_by_id(&state.pool, output_id).await {
+        Ok(Some(row)) => row,
+        Ok(None) => {
+            return Ok(HttpResponse::NotFound().body(format!("Output con ID '{}' no encontrado", output_id)));
+        }
+        Err(e) => {
+            error!("Error fetching output from database: {}", e);
+            return Err(ErrorInternalServerError(format!("Database error: {e}")));
+        }
+    };
+
+    let input_id = current_output_row.input_id;
+
+    // Deserialize current configuration
+    let current_config: CreateOutputRequest = match &current_output_row.config_json {
+        Some(json) => match serde_json::from_str(json) {
+            Ok(config) => config,
+            Err(e) => {
+                error!("Error deserializing output config: {}", e);
+                return Err(ErrorInternalServerError(format!("Config deserialization error: {e}")));
+            }
+        },
+        None => {
+            error!("Output {} has no config_json", output_id);
+            return Err(ErrorInternalServerError("Output configuration not found"));
+        }
+    };
+
+    // Merge update request with current configuration
+    let updated_config = req.merge_with(&current_config, input_id);
+
+    // Validate the updated configuration
+    if let Err(validation_error) = validate_udp_output_config(&updated_config) {
+        return Err(actix_web::error::ErrorBadRequest(validation_error));
+    }
+    if let Err(validation_error) = validate_srt_output_config(&updated_config) {
+        return Err(actix_web::error::ErrorBadRequest(validation_error));
+    }
+
+    // Build new destination string
+    let (destination_addr, listen_port) = match &updated_config {
+        CreateOutputRequest::Udp { .. } => {
+            let host = updated_config.get_remote_host().unwrap_or_else(|| "127.0.0.1".to_string());
+            let port = updated_config.get_remote_port().unwrap_or(8000);
+            (format!("{}:{}", host, port), None)
+        },
+        CreateOutputRequest::Srt { config, .. } => {
+            match config {
+                SrtOutputConfig::Caller { .. } => {
+                    let host = config.get_remote_host().unwrap_or_else(|| "127.0.0.1".to_string());
+                    let port = config.get_remote_port().unwrap_or(8000);
+                    (format!("{}:{}", host, port), None)
+                },
+                SrtOutputConfig::Listener { .. } => {
+                    let port = config.get_bind_port().unwrap_or(8000);
+                    (format!(":{}", port), Some(port))
+                },
+            }
+        },
+    };
+
+    // Check for port conflicts if port changed (for SRT listeners)
+    if let Some(new_port) = listen_port {
+        let old_port = current_output_row.listen_port.map(|p| p as u16);
+        if old_port != Some(new_port) {
+            match check_port_conflict(&state.pool, new_port, Some(output_id)).await {
+                Ok(conflict) if conflict => {
+                    return Ok(HttpResponse::Conflict().body(format!(
+                        "Puerto {} ya está en uso", new_port
+                    )));
+                }
+                Ok(_) => {},
+                Err(e) => {
+                    error!("Error checking port conflict: {}", e);
+                    return Err(ErrorInternalServerError(format!("Database error: {e}")));
+                }
+            }
+        }
+    }
+
+    // Update configuration in database
+    if let Err(e) = database::update_output_config_in_db(&state.pool, output_id, &updated_config, &destination_addr, listen_port).await {
+        error!("Error updating output config in database: {}", e);
+        return Err(ErrorInternalServerError(format!("Database error: {e}")));
+    }
+
+    // Get lock on active streams
+    let mut state_guard = ACTIVE_STREAMS.lock().await;
+
+    // Check if input exists
+    let input_info = match state_guard.get_mut(&input_id) {
+        Some(info) => info,
+        None => {
+            info!("Output {} updated in database, but input {} is not active", output_id, input_id);
+            return Ok(HttpResponse::Ok().json(serde_json::json!({
+                "message": "Output actualizado (input no está activo)",
+                "output_id": output_id,
+                "input_id": input_id
+            })));
+        }
+    };
+
+    // If output is currently active, restart it with new configuration
+    if let Some(mut output_info) = input_info.output_tasks.remove(&output_id) {
+        info!("Restarting output {} with new configuration", output_id);
+
+        // Stop current output task
+        if let Some(handle) = output_info.abort_handle.take() {
+            handle.abort();
+        }
+
+        // Spawn new output with updated configuration
+        let updated_name = match &updated_config {
+            CreateOutputRequest::Udp { name, .. } => name.clone(),
+            CreateOutputRequest::Srt { name, .. } => name.clone(),
+        }.or(current_output_row.name);
+
+        // Recreate the output
+        let recreated_output = match &updated_config {
+            CreateOutputRequest::Udp { host, multicast_ttl, multicast_interface, remote_host, .. } => {
+                // Check if destination is multicast and create config
+                let multicast_config = if let Some(ref host) = remote_host {
+                    if let Ok(addr) = host.parse::<std::net::IpAddr>() {
+                        if addr.is_multicast() {
+                            Some(crate::udp_stream::MulticastOutputConfig {
+                                ttl: multicast_ttl.unwrap_or(1),
+                                interface: multicast_interface.clone(),
+                            })
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                create_udp_output(
+                    destination_addr.clone(),
+                    input_info,
+                    output_id,
+                    updated_name.clone(),
+                    host.clone(),
+                    multicast_config,
+                    get_state_change_sender().await
+                ).await
+            },
+            CreateOutputRequest::Srt { config, .. } => {
+                create_srt_output(
+                    input_id,
+                    config.clone(),
+                    input_info,
+                    output_id,
+                    updated_name.clone(),
+                    get_state_change_sender().await
+                )
+            }
+        };
+
+        match recreated_output {
+            Ok(new_output_info) => {
+                info!("Output {} restarted successfully", output_id);
+                input_info.output_tasks.insert(output_id, new_output_info);
+
+                Ok(HttpResponse::Ok().json(serde_json::json!({
+                    "message": "Output actualizado y reiniciado",
+                    "output_id": output_id,
+                    "input_id": input_id,
+                    "destination": destination_addr
+                })))
+            }
+            Err(e) => {
+                error!("Error restarting output {}: {}", output_id, e);
+
+                // Try to restore original output
+                output_info.config = current_config;
+                input_info.output_tasks.insert(output_id, output_info);
+
+                Err(ErrorInternalServerError(format!("Failed to restart output: {e}")))
+            }
+        }
+    } else if input_info.stopped_outputs.contains_key(&output_id) {
+        // Output is stopped, just update the stopped config
+        input_info.stopped_outputs.insert(output_id, updated_config);
+
+        info!("Stopped output {} configuration updated", output_id);
+
+        Ok(HttpResponse::Ok().json(serde_json::json!({
+            "message": "Output actualizado (no estaba activo)",
+            "output_id": output_id,
+            "input_id": input_id
+        })))
+    } else {
+        Ok(HttpResponse::NotFound().body(format!("Output con ID '{}' no encontrado para Input '{}'", output_id, input_id)))
     }
 }
 
