@@ -1,7 +1,7 @@
 use bytes::Bytes;
 use futures::stream::{AbortHandle};
 use srt_rs::{self as srt, SrtAsyncStream};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 use std::fmt;
 use tokio::sync::{broadcast, RwLock, mpsc}; // Agregamos mpsc
@@ -13,6 +13,23 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const BROADCAST_CAPACITY: usize = 1024; // Capacidad del buffer del canal broadcast
+
+// Helper function to deserialize optional strings, converting empty strings to explicit None
+// Returns Option<Option<String>> where:
+// - None = field not provided in JSON
+// - Some(None) = field provided as empty string (means "clear the field")
+// - Some(Some(value)) = field provided with a value
+fn deserialize_optional_string<'de, D>(deserializer: D) -> Result<Option<Option<String>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let opt = Option::<String>::deserialize(deserializer)?;
+    match opt {
+        None => Ok(None), // Field not provided
+        Some(s) if s.is_empty() => Ok(Some(None)), // Empty string = clear field
+        Some(s) => Ok(Some(Some(s))), // Value provided
+    }
+}
 
 // Información sobre un stream de entrada activo
 
@@ -91,6 +108,7 @@ impl SrtCommonConfig {
 
     pub fn async_builder(&self) -> srt::SrtAsyncBuilder {
         let mut b = srt::async_builder();
+        println!("Building SRT async with config: {:?}", self.passphrase);
         if let Some(lat)  = self.latency_ms { b = b.set_peer_latency(lat); }
         b = b.set_stream_id(self.stream_id.clone());
         b = b.set_passphrase(self.passphrase.clone());
@@ -264,6 +282,133 @@ pub struct DeleteInputRequest {
 pub struct DeleteOutputRequest {
     pub input_id: i64,
     pub output_id: i64,
+}
+
+// --- Estructuras para las peticiones de actualización ---
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(tag = "type")] // Usa el campo "type" para determinar qué variante deserializar
+pub enum UpdateInputRequest {
+    #[serde(rename = "udp")]
+    Udp {
+        #[serde(default)]
+        bind_host: Option<String>,
+        #[serde(default)]
+        bind_port: Option<u16>,
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        multicast_group: Option<String>,
+        #[serde(default)]
+        source_specific_multicast: Option<String>,
+    },
+    #[serde(rename = "srt")]
+    Srt {
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(flatten)]
+        config: UpdateSrtInputConfig,
+    },
+    #[serde(rename = "spts")]
+    Spts {
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        fill_with_nulls: Option<bool>,
+        // Note: source_input_id and program_number cannot be changed after creation
+    },
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(tag = "mode")]
+pub enum UpdateSrtInputConfig {
+    #[serde(rename = "listener")]
+    Listener {
+        #[serde(default)]
+        bind_host: Option<String>,
+        #[serde(default)]
+        bind_port: Option<u16>,
+        #[serde(default)]
+        latency_ms: Option<i32>,
+        #[serde(default, deserialize_with = "deserialize_optional_string")]
+        passphrase: Option<Option<String>>,
+        #[serde(default, deserialize_with = "deserialize_optional_string")]
+        stream_id: Option<Option<String>>,
+    },
+    #[serde(rename = "caller")]
+    Caller {
+        #[serde(default)]
+        remote_host: Option<String>,
+        #[serde(default)]
+        remote_port: Option<u16>,
+        #[serde(default)]
+        bind_host: Option<String>,
+        #[serde(default)]
+        latency_ms: Option<i32>,
+        #[serde(default, deserialize_with = "deserialize_optional_string")]
+        passphrase: Option<Option<String>>,
+        #[serde(default, deserialize_with = "deserialize_optional_string")]
+        stream_id: Option<Option<String>>,
+    },
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(tag = "type")]
+pub enum UpdateOutputRequest {
+    #[serde(rename = "udp")]
+    Udp {
+        #[serde(default)]
+        remote_host: Option<String>,
+        #[serde(default)]
+        remote_port: Option<u16>,
+        #[serde(default)]
+        bind_host: Option<String>,
+        #[serde(default)]
+        multicast_ttl: Option<u8>,
+        #[serde(default)]
+        multicast_interface: Option<String>,
+        #[serde(default)]
+        name: Option<String>,
+    },
+    #[serde(rename = "srt")]
+    Srt {
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(flatten)]
+        config: UpdateSrtOutputConfig,
+    },
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(tag = "mode")]
+pub enum UpdateSrtOutputConfig {
+    #[serde(rename = "listener")]
+    Listener {
+        #[serde(default)]
+        bind_host: Option<String>,
+        #[serde(default)]
+        bind_port: Option<u16>,
+        #[serde(default)]
+        latency_ms: Option<i32>,
+        #[serde(default, deserialize_with = "deserialize_optional_string")]
+        passphrase: Option<Option<String>>,
+        #[serde(default, deserialize_with = "deserialize_optional_string")]
+        stream_id: Option<Option<String>>,
+    },
+    #[serde(rename = "caller")]
+    Caller {
+        #[serde(default)]
+        remote_host: Option<String>,
+        #[serde(default)]
+        remote_port: Option<u16>,
+        #[serde(default)]
+        bind_host: Option<String>,
+        #[serde(default)]
+        latency_ms: Option<i32>,
+        #[serde(default, deserialize_with = "deserialize_optional_string")]
+        passphrase: Option<Option<String>>,
+        #[serde(default, deserialize_with = "deserialize_optional_string")]
+        stream_id: Option<Option<String>>,
+    },
 }
 
 #[derive(Serialize)]

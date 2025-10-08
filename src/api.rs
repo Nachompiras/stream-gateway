@@ -10,7 +10,7 @@ use crate::srt_stream::{
 };
 use crate::spts_input::spawn_spts_input;
 use crate::models::*;
-use crate::database::{self, check_output_exists, check_port_conflict, get_input_by_id, get_output_by_id, update_input_status_in_db, update_output_status_in_db, get_input_id_for_output};
+use crate::database::{self, check_output_exists, check_port_conflict, get_input_by_id, get_output_by_id, update_input_status_in_db, update_output_status_in_db, get_input_id_for_output, update_input_in_db, update_output_in_db};
 use crate::{ACTIVE_STREAMS, STATE_CHANGE_TX};
 use crate::analysis;
 use crate::stream_control;
@@ -340,6 +340,187 @@ pub async fn delete_input(
     }
 }
 
+/// Helper function to merge optional string fields
+/// Takes Option<Option<String>> from the update request:
+/// - None = field not provided in JSON, preserve current value
+/// - Some(None) = field provided as empty string, clear the field
+/// - Some(Some(value)) = field provided with value, update it
+fn merge_optional_field(update: &Option<Option<String>>, current: &Option<String>) -> Option<String> {
+    match update {
+        None => current.clone(), // Field not provided, keep current
+        Some(inner) => inner.clone(), // Field provided (either Some(value) or None to clear)
+    }
+}
+
+/// Helper function to merge update request with existing input config
+fn merge_input_config(current: &CreateInputRequest, update: &UpdateInputRequest) -> Result<CreateInputRequest, String> {
+    match (current, update) {
+        (CreateInputRequest::Udp { bind_host, bind_port, name, multicast_group, source_specific_multicast, .. },
+         UpdateInputRequest::Udp { bind_host: new_bind_host, bind_port: new_bind_port, name: new_name,
+                                   multicast_group: new_multicast_group, source_specific_multicast: new_ssm }) => {
+            Ok(CreateInputRequest::Udp {
+                bind_host: new_bind_host.clone().or_else(|| bind_host.clone()),
+                bind_port: new_bind_port.or(*bind_port),
+                automatic_port: None,
+                name: new_name.clone().or_else(|| name.clone()),
+                multicast_group: new_multicast_group.clone().or_else(|| multicast_group.clone()),
+                source_specific_multicast: new_ssm.clone().or_else(|| source_specific_multicast.clone()),
+                listen_port: None, // Don't preserve legacy field
+            })
+        },
+        (CreateInputRequest::Srt { name, config },
+         UpdateInputRequest::Srt { name: new_name, config: update_config }) => {
+            let merged_config = match (config, update_config) {
+                (SrtInputConfig::Listener { bind_host, bind_port, common, .. },
+                 UpdateSrtInputConfig::Listener { bind_host: new_bind_host, bind_port: new_bind_port,
+                                                  latency_ms, passphrase, stream_id }) => {
+                    SrtInputConfig::Listener {
+                        bind_host: new_bind_host.clone().or_else(|| bind_host.clone()),
+                        bind_port: new_bind_port.or(*bind_port),
+                        automatic_port: None,
+                        common: SrtCommonConfig {
+                            latency_ms: latency_ms.or(common.latency_ms),
+                            stream_id: merge_optional_field(stream_id, &common.stream_id),
+                            passphrase: merge_optional_field(passphrase, &common.passphrase),
+                        },
+                        listen_port: None, // Don't preserve legacy field
+                    }
+                },
+                (SrtInputConfig::Caller { remote_host, remote_port, bind_host, common, .. },
+                 UpdateSrtInputConfig::Caller { remote_host: new_remote_host, remote_port: new_remote_port,
+                                                bind_host: new_bind_host, latency_ms, passphrase, stream_id }) => {
+                    SrtInputConfig::Caller {
+                        remote_host: new_remote_host.clone().or_else(|| remote_host.clone()),
+                        remote_port: new_remote_port.or(*remote_port),
+                        bind_host: new_bind_host.clone().or_else(|| bind_host.clone()),
+                        common: SrtCommonConfig {
+                            latency_ms: latency_ms.or(common.latency_ms),
+                            stream_id: merge_optional_field(stream_id, &common.stream_id),
+                            passphrase: merge_optional_field(passphrase, &common.passphrase),
+                        },
+                        target_addr: None, // Don't preserve legacy field
+                    }
+                },
+                _ => return Err("Cannot change SRT mode (listener/caller) via update".to_string()),
+            };
+            Ok(CreateInputRequest::Srt {
+                name: new_name.clone().or_else(|| name.clone()),
+                config: merged_config,
+            })
+        },
+        (CreateInputRequest::Spts { source_input_id, program_number, fill_with_nulls, name },
+         UpdateInputRequest::Spts { name: new_name, fill_with_nulls: new_fill }) => {
+            Ok(CreateInputRequest::Spts {
+                source_input_id: *source_input_id, // Cannot change
+                program_number: *program_number,   // Cannot change
+                fill_with_nulls: new_fill.or(*fill_with_nulls),
+                name: new_name.clone().or_else(|| name.clone()),
+            })
+        },
+        _ => Err("Cannot change input type via update".to_string()),
+    }
+}
+
+#[actix_web::patch("/inputs/{id}")]
+pub async fn update_input(
+    state: web::Data<AppState>,
+    path: web::Path<i64>,
+    req: web::Json<UpdateInputRequest>,
+) -> ActixResult<impl Responder> {
+    let input_id = path.into_inner();
+
+    info!("Request to update input {}", input_id);
+
+    // Get current input from database
+    let current_input_row = match get_input_by_id(&state.pool, input_id).await {
+        Ok(Some(row)) => row,
+        Ok(None) => {
+            return Ok(HttpResponse::NotFound().body(format!("Input con ID '{}' no encontrado", input_id)));
+        }
+        Err(e) => {
+            error!("Error fetching input from database: {}", e);
+            return Err(ErrorInternalServerError(format!("Database error: {e}")));
+        }
+    };
+
+    // Deserialize current config
+    let current_config: CreateInputRequest = serde_json::from_str(&current_input_row.config_json)
+        .map_err(|e| ErrorInternalServerError(format!("Failed to parse current config: {e}")))?;
+
+    // Merge configurations
+    let merged_config = match merge_input_config(&current_config, &req) {
+        Ok(config) => config,
+        Err(e) => {
+            return Err(actix_web::error::ErrorBadRequest(e));
+        }
+    };
+
+    // Validate the merged configuration
+    if let Err(validation_error) = validate_udp_input_config(&merged_config) {
+        return Err(actix_web::error::ErrorBadRequest(validation_error));
+    }
+    if let Err(validation_error) = validate_srt_config(&merged_config) {
+        return Err(actix_web::error::ErrorBadRequest(validation_error));
+    }
+
+    // Get the name from merged config
+    let updated_name = get_name_from_request(&merged_config);
+
+    // Serialize merged config
+    let config_json = serde_json::to_string(&merged_config)
+        .map_err(|e| ErrorInternalServerError(format!("Serialization error: {e}")))?;
+
+    // Update in database
+    if let Err(e) = update_input_in_db(&state.pool, input_id, updated_name.as_deref(), &config_json).await {
+        error!("Error updating input in database: {}", e);
+        return Err(ErrorInternalServerError(format!("Database error: {e}")));
+    }
+
+    // Check if input is currently active
+    let is_active = {
+        let guard = ACTIVE_STREAMS.lock().await;
+        guard.get(&input_id)
+            .map(|info| info.status.is_active())
+            .unwrap_or(false)
+    };
+
+    // If input is active, stop it first
+    if is_active {
+        info!("Input {} is active, stopping before restart", input_id);
+        if let Err(e) = stream_control::stop_input(input_id).await {
+            error!("Failed to stop input {}: {}", input_id, e);
+            return Err(ErrorInternalServerError(format!("Failed to stop input: {}", e)));
+        }
+    }
+
+    // Update the config in memory
+    {
+        let mut guard = ACTIVE_STREAMS.lock().await;
+        if let Some(input_info) = guard.get_mut(&input_id) {
+            input_info.config = merged_config.clone();
+        }
+    }
+
+    // Always start the input with new config (whether it was active or stopped)
+    info!("Starting input {} with new configuration", input_id);
+    if let Err(e) = stream_control::start_input(input_id).await {
+        error!("Failed to start input {}: {}", input_id, e);
+        return Err(ErrorInternalServerError(format!("Failed to start input: {}", e)));
+    }
+
+    // Update database status
+    if let Err(e) = update_input_status_in_db(&state.pool, input_id, "listening").await {
+        error!("Failed to update input status in database: {}", e);
+    }
+
+    info!("Input {} updated and started successfully", input_id);
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "message": "Input actualizado y reiniciado",
+        "id": input_id,
+        "name": updated_name
+    })))
+}
+
 #[actix_web::post("/outputs")]
 pub async fn create_output(
     state: web::Data<AppState>,
@@ -464,7 +645,10 @@ pub async fn create_output(
         CreateOutputRequest::Udp { name: user_name, .. } => {
             let auto_name = Some(format!("UDP Output to {}", destination_addr));
             let final_name = user_name.clone().or(auto_name);
-            (final_name, "udp", None)
+            // Serialize the full CreateOutputRequest for UDP outputs
+            let config_json_str = serde_json::to_string(&final_req)
+                .map_err(|e| ErrorInternalServerError(format!("Serialization error: {e}")))?;
+            (final_name, "udp", Some(config_json_str))
         }
         CreateOutputRequest::Srt { name: user_name, config, .. } => {
             let kind_str = match config {
@@ -483,7 +667,8 @@ pub async fn create_output(
                 },
             };
             let final_name = user_name.clone().or(Some(auto_name));
-            let config_json = Some(serde_json::to_string(config)
+            // Serialize the full CreateOutputRequest, not just config
+            let config_json = Some(serde_json::to_string(&final_req)
                 .map_err(|e| ErrorInternalServerError(format!("Serialization error: {e}")))?);
             (final_name, kind_str, config_json)
         }
@@ -1059,6 +1244,236 @@ pub async fn delete_output(
     }
 }
 
+/// Helper function to merge update request with existing output config
+fn merge_output_config(current: &CreateOutputRequest, update: &UpdateOutputRequest) -> Result<CreateOutputRequest, String> {
+    match (current, update) {
+        (CreateOutputRequest::Udp { input_id, remote_host, remote_port, bind_host, multicast_ttl,
+                                     multicast_interface, name, .. },
+         UpdateOutputRequest::Udp { remote_host: new_remote_host, remote_port: new_remote_port,
+                                    bind_host: new_bind_host, multicast_ttl: new_ttl,
+                                    multicast_interface: new_interface, name: new_name }) => {
+            Ok(CreateOutputRequest::Udp {
+                input_id: *input_id, // Cannot change
+                remote_host: new_remote_host.clone().or_else(|| remote_host.clone()),
+                remote_port: new_remote_port.or(*remote_port),
+                automatic_port: None,
+                name: new_name.clone().or_else(|| name.clone()),
+                bind_host: new_bind_host.clone().or_else(|| bind_host.clone()),
+                multicast_ttl: new_ttl.or(*multicast_ttl),
+                multicast_interface: new_interface.clone().or_else(|| multicast_interface.clone()),
+                destination_addr: None, // Don't preserve legacy field
+            })
+        },
+        (CreateOutputRequest::Srt { input_id, name, config },
+         UpdateOutputRequest::Srt { name: new_name, config: update_config }) => {
+            let merged_config = match (config, update_config) {
+                (SrtOutputConfig::Listener { bind_host, bind_port, common, .. },
+                 UpdateSrtOutputConfig::Listener { bind_host: new_bind_host, bind_port: new_bind_port,
+                                                   latency_ms, passphrase, stream_id }) => {
+                    SrtOutputConfig::Listener {
+                        bind_host: new_bind_host.clone().or_else(|| bind_host.clone()),
+                        bind_port: new_bind_port.or(*bind_port),
+                        automatic_port: None,
+                        common: SrtCommonConfig {
+                            latency_ms: latency_ms.or(common.latency_ms),
+                            stream_id: merge_optional_field(stream_id, &common.stream_id),
+                            passphrase: merge_optional_field(passphrase, &common.passphrase),
+                        },
+                        listen_port: None, // Don't preserve legacy field
+                    }
+                },
+                (SrtOutputConfig::Caller { remote_host, remote_port, bind_host, common, .. },
+                 UpdateSrtOutputConfig::Caller { remote_host: new_remote_host, remote_port: new_remote_port,
+                                                 bind_host: new_bind_host, latency_ms, passphrase, stream_id }) => {
+                    SrtOutputConfig::Caller {
+                        remote_host: new_remote_host.clone().or_else(|| remote_host.clone()),
+                        remote_port: new_remote_port.or(*remote_port),
+                        bind_host: new_bind_host.clone().or_else(|| bind_host.clone()),
+                        common: SrtCommonConfig {
+                            latency_ms: latency_ms.or(common.latency_ms),
+                            stream_id: merge_optional_field(stream_id, &common.stream_id),
+                            passphrase: merge_optional_field(passphrase, &common.passphrase),
+                        },
+                        destination_addr: None, // Don't preserve legacy field
+                    }
+                },
+                _ => return Err("Cannot change SRT mode (listener/caller) via update".to_string()),
+            };
+            Ok(CreateOutputRequest::Srt {
+                input_id: *input_id, // Cannot change
+                name: new_name.clone().or_else(|| name.clone()),
+                config: merged_config,
+            })
+        },
+        _ => Err("Cannot change output type via update".to_string()),
+    }
+}
+
+#[actix_web::patch("/outputs/{id}")]
+pub async fn update_output(
+    state: web::Data<AppState>,
+    path: web::Path<i64>,
+    req: web::Json<UpdateOutputRequest>,
+) -> ActixResult<impl Responder> {
+    let output_id = path.into_inner();
+
+    info!("Request to update output {}", output_id);
+
+    // Get current output from database
+    let current_output_row = match get_output_by_id(&state.pool, output_id).await {
+        Ok(Some(row)) => row,
+        Ok(None) => {
+            return Ok(HttpResponse::NotFound().body(format!("Output con ID '{}' no encontrado", output_id)));
+        }
+        Err(e) => {
+            error!("Error fetching output from database: {}", e);
+            return Err(ErrorInternalServerError(format!("Database error: {e}")));
+        }
+    };
+
+    let input_id = current_output_row.input_id;
+
+    // Deserialize current config
+    let current_config: CreateOutputRequest = if let Some(config_json) = &current_output_row.config_json {
+        serde_json::from_str(config_json)
+            .map_err(|e| ErrorInternalServerError(format!("Failed to parse current config: {e}")))?
+    } else {
+        // For legacy outputs without config_json, reconstruct from database fields
+        match current_output_row.kind.as_str() {
+            "udp" => {
+                let destination = current_output_row.destination.clone().unwrap_or_default();
+                let parts: Vec<&str> = destination.split(':').collect();
+                let host = parts.first().map(|s| s.to_string());
+                let port = parts.get(1).and_then(|s| s.parse().ok());
+
+                CreateOutputRequest::Udp {
+                    input_id,
+                    remote_host: host,
+                    remote_port: port,
+                    automatic_port: None,
+                    name: current_output_row.name.clone(),
+                    bind_host: None,
+                    multicast_ttl: None,
+                    multicast_interface: None,
+                    destination_addr: Some(destination),
+                }
+            },
+            _ => {
+                return Err(ErrorInternalServerError("Cannot update output without config_json"));
+            }
+        }
+    };
+
+    // Merge configurations
+    let merged_config = match merge_output_config(&current_config, &req) {
+        Ok(config) => config,
+        Err(e) => {
+            return Err(actix_web::error::ErrorBadRequest(e));
+        }
+    };
+
+    // Validate the merged configuration
+    if let Err(validation_error) = validate_udp_output_config(&merged_config) {
+        return Err(actix_web::error::ErrorBadRequest(validation_error));
+    }
+    if let Err(validation_error) = validate_srt_output_config(&merged_config) {
+        return Err(actix_web::error::ErrorBadRequest(validation_error));
+    }
+
+    // Get the name from merged config
+    let updated_name = match &merged_config {
+        CreateOutputRequest::Udp { name, .. } => name.clone(),
+        CreateOutputRequest::Srt { name, .. } => name.clone(),
+    };
+
+    // Build destination string and config_json
+    let (destination_addr, listen_port, config_json) = match &merged_config {
+        CreateOutputRequest::Udp { .. } => {
+            let host = merged_config.get_remote_host().unwrap_or_else(|| "127.0.0.1".to_string());
+            let port = merged_config.get_remote_port().unwrap_or(8000);
+            // Serialize the full CreateOutputRequest for UDP
+            let config_json_str = serde_json::to_string(&merged_config)
+                .map_err(|e| ErrorInternalServerError(format!("Serialization error: {e}")))?;
+            (format!("{}:{}", host, port), None, Some(config_json_str))
+        },
+        CreateOutputRequest::Srt { config, .. } => {
+            let dest = match config {
+                SrtOutputConfig::Caller { .. } => {
+                    let host = config.get_remote_host().unwrap_or_else(|| "unknown".to_string());
+                    let port = config.get_remote_port().unwrap_or(0);
+                    format!("{}:{}", host, port)
+                },
+                SrtOutputConfig::Listener { .. } => {
+                    let port = config.get_bind_port().unwrap_or(0);
+                    format!(":{}", port)
+                },
+            };
+            // Serialize the full CreateOutputRequest, not just config
+            let config_json_str = serde_json::to_string(&merged_config)
+                .map_err(|e| ErrorInternalServerError(format!("Serialization error: {e}")))?;
+            (dest, config.get_bind_port(), Some(config_json_str))
+        },
+    };
+
+    // Update in database
+    if let Err(e) = update_output_in_db(&state.pool, output_id, updated_name.as_deref(), &destination_addr, config_json.as_deref(), listen_port).await {
+        error!("Error updating output in database: {}", e);
+        return Err(ErrorInternalServerError(format!("Database error: {e}")));
+    }
+
+    // Check if output is currently active and if input exists
+    let (is_active, input_exists) = {
+        let guard = ACTIVE_STREAMS.lock().await;
+        if let Some(input_info) = guard.get(&input_id) {
+            let is_active = input_info.output_tasks.contains_key(&output_id);
+            (is_active, true)
+        } else {
+            (false, false)
+        }
+    };
+
+    if !input_exists {
+        return Ok(HttpResponse::NotFound().body(format!("Input con ID '{}' no encontrado", input_id)));
+    }
+
+    // If output is active, stop it first
+    if is_active {
+        info!("Output {} is active, stopping before restart", output_id);
+        if let Err(e) = stream_control::stop_output(input_id, output_id).await {
+            error!("Failed to stop output {}: {}", output_id, e);
+            return Err(ErrorInternalServerError(format!("Failed to stop output: {}", e)));
+        }
+    }
+
+    // Update the config in memory (in stopped_outputs)
+    {
+        let mut guard = ACTIVE_STREAMS.lock().await;
+        if let Some(input_info) = guard.get_mut(&input_id) {
+            input_info.stopped_outputs.insert(output_id, merged_config.clone());
+        }
+    }
+
+    // Always start the output with new config (whether it was active or stopped)
+    info!("Starting output {} with new configuration", output_id);
+    if let Err(e) = stream_control::start_output(input_id, output_id).await {
+        error!("Failed to start output {}: {}", output_id, e);
+        return Err(ErrorInternalServerError(format!("Failed to start output: {}", e)));
+    }
+
+    // Update database status
+    if let Err(e) = update_output_status_in_db(&state.pool, output_id, "connecting").await {
+        error!("Failed to update output status in database: {}", e);
+    }
+
+    info!("Output {} updated and started successfully", output_id);
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "message": "Output actualizado y reiniciado",
+        "output_id": output_id,
+        "input_id": input_id,
+        "destination": destination_addr
+    })))
+}
+
 // --- Endpoint para listar Inputs y sus Outputs ---
 #[actix_web::get("/status")]
 pub async fn get_status(_state: web::Data<AppState>) -> ActixResult<impl Responder> {
@@ -1206,19 +1621,19 @@ async fn input_stats(
     let id = path.into_inner();
     let guard = ACTIVE_STREAMS.lock().await;
 
-    println!("Solicitando stats para input '{}'", id);
+    //println!("Solicitando stats para input '{}'", id);
 
     if let Some(info) = guard.get(&id) {
-        println!("Obteniendo stats para input '{}'", id);
+        //println!("Obteniendo stats para input '{}'", id);
         if let Some(stats) = info.stats.read().await.clone() {
-            println!("Stats obtenidos: {:?}", stats);
+            //println!("Stats obtenidos: {:?}", stats);
             return HttpResponse::Ok().json(stats);
         } else {
-            println!("No hay stats disponibles aún para input '{}'", id);
+            //println!("No hay stats disponibles aún para input '{}'", id);
             return HttpResponse::NoContent().finish();
         }
     }
-    println!("Input '{}' no encontrado al solicitar stats", id);
+    //println!("Input '{}' no encontrado al solicitar stats", id);
     HttpResponse::NotFound().body("input no encontrado")
 }
 
