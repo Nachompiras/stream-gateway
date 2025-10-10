@@ -1773,13 +1773,35 @@ pub async fn load_from_db(state: &AppState) -> anyhow::Result<()> {
             },
         };
 
-        match spawn_input(create_req, r.id, r.name.clone(), None).await {
+        match spawn_input(create_req.clone(), r.id, r.name.clone(), None).await {
             Ok(info) => {
                 println!("Input {} recreado exitosamente", r.id);
                 loaded_inputs.insert(r.id, info);
             }
             Err(e) => {
-                error!("Error recreating input {}: {}", r.id, e);
+                error!("Error recreating input {}: {}. Creating in error state.", r.id, e);
+
+                // Create InputInfo in error state so it can be managed via API
+                let (tx, _) = broadcast::channel(BROADCAST_CAPACITY);
+                let error_input_info = InputInfo {
+                    id: r.id,
+                    name: r.name.clone(),
+                    status: StreamStatus::Error,
+                    packet_tx: tx,
+                    stats: Arc::new(RwLock::new(None)),
+                    task_handle: None,
+                    config: create_req,
+                    output_tasks: HashMap::new(),
+                    stopped_outputs: HashMap::new(),
+                    analysis_tasks: HashMap::new(),
+                    paused_analysis: Vec::new(),
+                    started_at: None,
+                    connected_at: None,
+                    state_tx: None,
+                    source_address: None,
+                };
+
+                loaded_inputs.insert(r.id, error_input_info);
             }
         }
     }
@@ -1854,13 +1876,35 @@ pub async fn load_from_db(state: &AppState) -> anyhow::Result<()> {
         }
 
         // Spawn SPTS input
-        match spawn_input(create_req, r.id, r.name.clone(), None).await {
+        match spawn_input(create_req.clone(), r.id, r.name.clone(), None).await {
             Ok(info) => {
                 println!("SPTS Input {} recreado exitosamente", r.id);
                 loaded_inputs.insert(r.id, info);
             }
             Err(e) => {
-                error!("Error recreating SPTS input {}: {}", r.id, e);
+                error!("Error recreating SPTS input {}: {}. Creating in error state.", r.id, e);
+
+                // Create InputInfo in error state so it can be managed via API
+                let (tx, _) = broadcast::channel(BROADCAST_CAPACITY);
+                let error_input_info = InputInfo {
+                    id: r.id,
+                    name: r.name.clone(),
+                    status: StreamStatus::Error,
+                    packet_tx: tx,
+                    stats: Arc::new(RwLock::new(None)),
+                    task_handle: None,
+                    config: create_req,
+                    output_tasks: HashMap::new(),
+                    stopped_outputs: HashMap::new(),
+                    analysis_tasks: HashMap::new(),
+                    paused_analysis: Vec::new(),
+                    started_at: None,
+                    connected_at: None,
+                    state_tx: None,
+                    source_address: None,
+                };
+
+                loaded_inputs.insert(r.id, error_input_info);
             }
         }
     }

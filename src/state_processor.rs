@@ -25,7 +25,7 @@ async fn handle_input_state_change(
     connected_at: Option<std::time::SystemTime>,
     source_address: Option<String>
 ) {
-    println!("Input {} state changed to: {}", input_id, new_status);
+    println!("Input {} state changed to: {} {:?}", input_id, new_status, source_address);
     let mut streams = ACTIVE_STREAMS.lock().await;
 
     if let Some(input_info) = streams.get_mut(&input_id) {
