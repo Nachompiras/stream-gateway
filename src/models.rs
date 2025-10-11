@@ -12,7 +12,10 @@ use tokio::task::JoinHandle;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-pub const BROADCAST_CAPACITY: usize = 1024; // Capacidad del buffer del canal broadcast
+// Increased from 1024 to 16384 to match UDP/SPTS input buffer sizes
+// This prevents packet drops when SPTS filtering adds processing latency
+// At 120Mbps with 1316-byte packets: ~10,000 pps → 16384 slots = ~1.6s buffer
+pub const BROADCAST_CAPACITY: usize = 32768;
 
 // Helper function to deserialize optional strings, converting empty strings to explicit None
 // Returns Option<Option<String>> where:
@@ -109,7 +112,11 @@ impl SrtCommonConfig {
     pub fn async_builder(&self) -> srt::SrtAsyncBuilder {
         let mut b = srt::async_builder();
         println!("Building SRT async with config: {:?}", self.passphrase);
-        if let Some(lat)  = self.latency_ms { b = b.set_peer_latency(lat); }
+        if let Some(lat)  = self.latency_ms { 
+            b = b.set_peer_latency(lat); 
+            b = b.set_receive_latency(lat);            
+        }
+        
         b = b.set_stream_id(self.stream_id.clone());
         b = b.set_passphrase(self.passphrase.clone());
         b.set_live_transmission_type()

@@ -1806,8 +1806,19 @@ pub async fn load_from_db(state: &AppState) -> anyhow::Result<()> {
         }
     }
 
+    // Insert base inputs into ACTIVE_STREAMS before Phase 2
+    // This ensures SPTS inputs can find their source inputs
+    println!("Inserting {} base inputs into ACTIVE_STREAMS", loaded_inputs.len());
+    {
+        let mut inputs = ACTIVE_STREAMS.lock().await;
+        for (id, input_info) in loaded_inputs.drain() {
+            inputs.insert(id, input_info);
+        }
+    }
+
     // Phase 2: Load SPTS inputs (after their source inputs exist)
     println!("Phase 2: Loading {} SPTS inputs", spts_inputs.len());
+    let mut spts_loaded_inputs = HashMap::new();
     for r in spts_inputs {
         println!("Procesando SPTS input ID {} con status {}", r.id, r.status);
 
@@ -1837,16 +1848,20 @@ pub async fn load_from_db(state: &AppState) -> anyhow::Result<()> {
                 source_address: None,
             };
 
-            loaded_inputs.insert(r.id, stopped_input_info);
+            spts_loaded_inputs.insert(r.id, stopped_input_info);
             continue;
         }
 
         // For active SPTS inputs, verify source exists and spawn
         let create_req: CreateInputRequest = serde_json::from_str(&r.config_json)?;
 
-        // Check if source input exists
+        // Check if source input exists in ACTIVE_STREAMS (base inputs are already there)
         if let CreateInputRequest::Spts { source_input_id, .. } = &create_req {
-            if !loaded_inputs.contains_key(source_input_id) {
+            let source_exists = {
+                let inputs = ACTIVE_STREAMS.lock().await;
+                inputs.contains_key(source_input_id)
+            };
+            if !source_exists {
                 error!("Source input {} not found for SPTS input {}. Creating in stopped state.",
                        source_input_id, r.id);
 
@@ -1870,7 +1885,7 @@ pub async fn load_from_db(state: &AppState) -> anyhow::Result<()> {
                     source_address: None,
                 };
 
-                loaded_inputs.insert(r.id, stopped_input_info);
+                spts_loaded_inputs.insert(r.id, stopped_input_info);
                 continue;
             }
         }
@@ -1879,7 +1894,7 @@ pub async fn load_from_db(state: &AppState) -> anyhow::Result<()> {
         match spawn_input(create_req.clone(), r.id, r.name.clone(), None).await {
             Ok(info) => {
                 println!("SPTS Input {} recreado exitosamente", r.id);
-                loaded_inputs.insert(r.id, info);
+                spts_loaded_inputs.insert(r.id, info);
             }
             Err(e) => {
                 error!("Error recreating SPTS input {}: {}. Creating in error state.", r.id, e);
@@ -1904,7 +1919,7 @@ pub async fn load_from_db(state: &AppState) -> anyhow::Result<()> {
                     source_address: None,
                 };
 
-                loaded_inputs.insert(r.id, error_input_info);
+                spts_loaded_inputs.insert(r.id, error_input_info);
             }
         }
     }
@@ -1920,12 +1935,25 @@ pub async fn load_from_db(state: &AppState) -> anyhow::Result<()> {
         outputs_by_input.entry(o.input_id).or_default().push(o);
     }
 
+    // Insert SPTS inputs into ACTIVE_STREAMS before processing outputs
+    println!("Inserting {} SPTS inputs into ACTIVE_STREAMS", spts_loaded_inputs.len());
+    {
+        let mut inputs = ACTIVE_STREAMS.lock().await;
+        for (id, input_info) in spts_loaded_inputs {
+            inputs.insert(id, input_info);
+        }
+    }
+
     println!("Procesando outputs para cada input cargado...");
 
-    // Process outputs for each loaded input
+    // Process outputs for each loaded input (all inputs are now in ACTIVE_STREAMS)
     for (input_id, outputs) in outputs_by_input {
         println!("Procesando {} outputs para input {}", outputs.len(), input_id);
-        if let Some(input) = loaded_inputs.get_mut(&input_id) {
+
+        let mut streams_guard = ACTIVE_STREAMS.lock().await;
+        let input_opt = streams_guard.get_mut(&input_id);
+
+        if let Some(input) = input_opt {
             println!("Recreando {} outputs para input {}", outputs.len(), input_id);
             
             for o in outputs {
@@ -2068,14 +2096,9 @@ pub async fn load_from_db(state: &AppState) -> anyhow::Result<()> {
         } else {
             println!("Input {} no encontrado para outputs, saltando", input_id);
         }
-    }    
 
-    // Now acquire the mutex lock only briefly to insert all loaded inputs
-    {
-        let mut inputs = ACTIVE_STREAMS.lock().await;
-        for (id, input_info) in loaded_inputs {
-            inputs.insert(id, input_info);
-        }
+        // Release the lock at the end of each iteration
+        drop(streams_guard);
     }
 
     println!("Carga desde DB completada");

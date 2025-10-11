@@ -132,7 +132,7 @@ pub fn spawn_udp_input_with_stats(
 ) -> Result<InputInfo, actix_web::Error> {
     // canal interno - increased capacity for high bitrate streams (up to 120+ Mbps)
     // At 120Mbps with ~1500 byte packets: ~10,000 pps → 16384 slots = ~1.6s buffer
-    let (tx, _rx) = broadcast::channel::<Bytes>(16384);
+    let (tx, _rx) = broadcast::channel::<Bytes>(BROADCAST_CAPACITY);
     let stats: StatsCell = Arc::new(RwLock::new(None));
 
     // Create atomic stats for lock-free updates
@@ -332,8 +332,8 @@ async fn create_multicast_socket(
     }
 
     // Increase socket receive buffer for high bitrate streams (120+ Mbps)
-    // Default is typically 128KB-256KB, we set 8MB to handle bursts
-    const SOCKET_RECV_BUFFER_SIZE: usize = 8 * 1024 * 1024; // 8 MB
+    // Default is typically 128KB-256KB, we set 16MB to handle bursts
+    const SOCKET_RECV_BUFFER_SIZE: usize = 16 * 1024 * 1024; // 16 MB
     if let Err(e) = socket.set_recv_buffer_size(SOCKET_RECV_BUFFER_SIZE) {
         warn!("Failed to set socket receive buffer size to {} bytes: {}", SOCKET_RECV_BUFFER_SIZE, e);
     } else {
