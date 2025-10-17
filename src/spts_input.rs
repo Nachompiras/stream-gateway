@@ -1,6 +1,8 @@
 use bytes::Bytes;
 use log::{info, warn, error};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, RwLock};
 use tokio::task::JoinHandle;
 
@@ -39,7 +41,7 @@ pub fn spawn_spts_input(
 
     // Statistics cell for this SPTS input
     let stats: StatsCell = Arc::new(RwLock::new(None));
-
+    let atomic_stats = Arc::new(UdpStatsAtomic::new());
 
     // Subscribe to the source MPTS input
     let mut source_rx = source_input.packet_tx.subscribe();
@@ -48,7 +50,10 @@ pub fn spawn_spts_input(
     let tx_for_task = tx.clone();
     let state_tx_task = state_tx.clone();
     let source_input_id = source_input.id;
-
+    let atomic_stats_task = atomic_stats.clone();
+    let stats_task = stats.clone();
+    let name_for_task = name.clone();
+    
     // Spawn filtering task
     let handle: JoinHandle<()> = tokio::spawn(async move {
         info!("[SPTS {}] Starting SPTS filtering task for program {}", spts_id, program_number);
@@ -71,6 +76,9 @@ pub fn spawn_spts_input(
 
         let mut is_connected = false;
         let connected_time = std::time::SystemTime::now(); // Pre-calculate for when needed
+        let mut window_start  = Instant::now();
+        let mut window_bytes_out  = 0u64;
+        let mut window_packets_out = 0u64;                
 
         loop {
             tokio::select! {
@@ -96,47 +104,31 @@ pub fn spawn_spts_input(
                                     }
                                 }
 
+                                // Update stats with filtered data
+                                window_bytes_out += filtered.len() as u64;
+                                window_packets_out += filtered.len() as u64 / 188;
+
                                 // Broadcast filtered SPTS data (ignore send errors - no receivers is OK)
                                 let _ = tx_for_task.send(filtered);
                             }
 
-                            // Update stats every second
-                            // if window_start.elapsed() >= Duration::from_secs(1) {
+                            //Update stats every second
+                            // if window_start.elapsed() >= Duration::from_secs(2) {
                             //     let bitrate = window_bytes_out * 8; // bits/s
                             //     let pps = window_packets_out;
 
-                            //     // Update atomic counters only (no locks)
-                            //     atomic_stats_task.total_packets.store(total_packets_out, Ordering::Relaxed);
-                            //     atomic_stats_task.total_bytes.store(total_bytes_out, Ordering::Relaxed);
+                            //     // Update atomic counters only (lock-free, no blocking)
                             //     atomic_stats_task.packets_per_sec.store(pps, Ordering::Relaxed);
                             //     atomic_stats_task.bitrate_bps.store(bitrate, Ordering::Relaxed);
 
-                            //     // Clone stats for async update (non-blocking)
-                            //     let stats_clone = stats_task.clone();
-                            //     let atomic_clone = atomic_stats_task.clone();
-                            //     tokio::spawn(async move {
-                            //         let snapshot = atomic_clone.snapshot();
-                            //         *stats_clone.write().await = Some(InputStats::Udp(snapshot));
-                            //     });
-
-                            //     // Clone for async metrics (non-blocking)
-                            //     let name_clone = name_for_task.clone();
-                            //     let window_bytes = window_bytes_out;
-                            //     let window_packets = window_packets_out;
-                            //     tokio::spawn(async move {
-                            //         metrics::record_input_bytes(&name_clone, spts_id, "spts", window_bytes);
-                            //         metrics::record_input_packets(&name_clone, spts_id, "spts", window_packets);
-                            //     });
-
-                            //     // Log filtering stats periodically
-                            //     if total_packets_in > 0 {
-                            //         let filter_ratio = (total_bytes_out as f64 / total_bytes_in as f64) * 100.0;
-                            //         info!(
-                            //             "[SPTS {}] Program {}: {:.1}% of MPTS ({} → {} bytes, bitrate: {} kbps)",
-                            //             spts_id, program_number, filter_ratio,
-                            //             total_bytes_in, total_bytes_out, bitrate / 1000
-                            //         );
+                            //     // Try non-blocking write to stats cell
+                            //     let snapshot = atomic_stats_task.snapshot();
+                            //     if let Ok(mut guard) = stats_task.try_write() {
+                            //         *guard = Some(InputStats::Udp(snapshot));
                             //     }
+
+                            //     metrics::record_input_bytes(&name_for_task, spts_id, "spts", window_bytes_out);
+                            //     metrics::record_input_packets(&name_for_task, spts_id, "spts", window_packets_out);
 
                             //     window_start = Instant::now();
                             //     window_bytes_out = 0;

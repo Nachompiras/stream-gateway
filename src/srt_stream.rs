@@ -86,8 +86,12 @@ pub fn spawn_srt_output(
 
                     if next_stats.elapsed() >= Duration::from_secs(1) {
                         if let Ok(s) = sock.socket.srt_bistats(0, 1) {
-                            //println!("Output: SRT stats: {s:?}");
+                            //println!("Output: SRT stats: {s:?}");                            
                             *stats_clone.write().await = Some(InputStats::Srt(Box::new(s)));
+                            //using try_write to avoid blocking
+                            // if let Ok(mut guard) = stats_clone.try_write() {
+                            //     *guard = Some(InputStats::Srt(Box::new(s)));
+                            // }
                         }
                         next_stats = Instant::now();
                     }

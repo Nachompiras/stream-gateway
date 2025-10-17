@@ -110,22 +110,6 @@ pub fn get_filtered_interfaces(
     Ok(interfaces)
 }
 
-/// Get a list of available bind addresses as strings
-pub fn get_available_bind_addresses() -> Result<Vec<String>, String> {
-    let interfaces = get_system_interfaces()?;
-    let mut addresses = vec!["0.0.0.0".to_string(), "::".to_string()]; // Always include wildcard addresses
-
-    for interface in interfaces {
-        addresses.push(interface.ip);
-    }
-
-    // Remove duplicates and sort
-    addresses.sort();
-    addresses.dedup();
-
-    Ok(addresses)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

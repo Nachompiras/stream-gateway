@@ -268,7 +268,7 @@ impl ProgramFilter {
         let mut pids = HashSet::new();
         pids.insert(pcr_pid); // Include PCR PID
 
-        while stream_offset + 5 <= section_end {
+        while stream_offset + 5 <= section_end && stream_offset + 5 <= data.len() {
             let stream_type = data[stream_offset];
             let elementary_pid = (((data[stream_offset + 1] & 0x1F) as u16) << 8) | (data[stream_offset + 2] as u16);
             let es_info_length = (((data[stream_offset + 3] & 0x0F) as usize) << 8) | (data[stream_offset + 4] as usize);

@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 use std::sync::atomic::Ordering;
 use actix_web::error::ErrorBadRequest;
 use bytes::{Bytes, BytesMut};
+use tokio::time::sleep;
 use tokio::{net::UdpSocket, sync::{broadcast::{self, Receiver}, RwLock}};
 use futures::stream::{AbortHandle, Abortable};
 use log::{info, warn};
@@ -237,17 +238,17 @@ pub fn spawn_udp_input_with_stats(
                             window_bytes += n as u64;
                             window_pkts += 1;
                             /* actualizar stats cada segundo */
-                            if window_start.elapsed() >= Duration::from_secs(1) {
-                                let bitrate = window_bytes * 8; // bits/s
-                                let pps     = window_pkts;
-
+                            if window_start.elapsed() >= Duration::from_secs(1) {                                
                                 // Update atomic counters for windowed stats
-                                atomic_stats_task.packets_per_sec.store(pps, Ordering::Relaxed);
-                                atomic_stats_task.bitrate_bps.store(bitrate, Ordering::Relaxed);
+                                atomic_stats_task.packets_per_sec.store(window_pkts, Ordering::Relaxed);
+                                atomic_stats_task.bitrate_bps.store(window_bytes * 8, Ordering::Relaxed);
 
                                 // Take a snapshot and update the RwLock (less frequently)
                                 let snapshot = atomic_stats_task.snapshot();
                                 *stats_task.write().await = Some(InputStats::Udp(snapshot));
+                                //    if let Ok(mut guard) = stats_task.try_write() {
+                                //     *guard = Some(InputStats::Udp(snapshot));
+                                // }
 
                                 window_start = Instant::now();
                                 window_bytes = 0;
@@ -260,7 +261,7 @@ pub fn spawn_udp_input_with_stats(
                         }
                     }
                 }
-                _ = tokio::time::sleep(IDLE_TIMEOUT), if is_connected && last_packet_time.elapsed() >= IDLE_TIMEOUT => {
+                _ = sleep(IDLE_TIMEOUT), if is_connected && last_packet_time.elapsed() >= IDLE_TIMEOUT => {
                     // Transition back to listening due to inactivity
                     is_connected = false;
                     if let Some(ref tx) = state_tx_task {
