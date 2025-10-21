@@ -54,6 +54,7 @@ pub struct InputInfo {
     pub connected_at:     Option<std::time::SystemTime>, // When stream connected, None when not connected
     pub state_tx:         Option<StateChangeSender>, // Channel to notify state changes
     pub source_address:   Option<String>,          // Address of the connected source (for SRT listeners)
+    pub error_message:    Option<String>,          // Error message if stream failed to start or is in error state
 }
 
 #[derive(Debug, Clone)]
@@ -71,6 +72,7 @@ pub struct OutputInfo {
     pub connected_at: Option<std::time::SystemTime>, // When stream connected, None when not connected
     pub state_tx:     Option<StateChangeSender>, // Channel to notify state changes
     pub peer_address: Option<String>,          // Address of the connected peer (for SRT listeners)
+    pub error_message: Option<String>,         // Error message if output failed to start or is in error state
 }
 
 
@@ -428,6 +430,7 @@ pub struct InputResponse {
     pub uptime_seconds: Option<u64>, // Uptime in seconds, None if stopped
     pub source_address: Option<String>, // Address of connected source (for SRT listeners)
     pub bitrate_bps: Option<u64>, // Bitrate in bits per second
+    pub error_message: Option<String>, // Error message if stream is in error state
 }
 
 #[derive(Serialize)]
@@ -442,6 +445,7 @@ pub struct OutputResponse {
     pub uptime_seconds: Option<u64>, // Uptime in seconds, None if stopped
     pub peer_address: Option<String>, // Address of connected peer (for SRT listeners)
     pub bitrate_bps: Option<u64>, // Bitrate in bits per second
+    pub error_message: Option<String>, // Error message if output is in error state
 }
 
 // New response models for CRUD endpoints
@@ -455,6 +459,7 @@ pub struct InputListResponse {
     pub output_count: usize, // Número de outputs asociados
     pub uptime_seconds: Option<u64>, // Uptime in seconds, None if stopped
     pub source_address: Option<String>, // Address of connected source (for SRT listeners)
+    pub error_message: Option<String>, // Error message if stream is in error state
 }
 
 #[derive(Serialize)]
@@ -468,6 +473,7 @@ pub struct InputDetailResponse {
     pub uptime_seconds: Option<u64>, // Uptime in seconds, None if stopped
     pub source_address: Option<String>, // Address of connected source (for SRT listeners)
     pub config: Option<String>, // Full configuration JSON from database
+    pub error_message: Option<String>, // Error message if stream is in error state
 }
 
 #[derive(Serialize)]
@@ -482,6 +488,7 @@ pub struct OutputDetailResponse {
     pub config: Option<String>, // JSON config if needed
     pub uptime_seconds: Option<u64>, // Uptime in seconds, None if stopped
     pub peer_address: Option<String>, // Address of connected peer (for SRT listeners)
+    pub error_message: Option<String>, // Error message if output is in error state
 }
 
 #[derive(Serialize)]
@@ -496,6 +503,7 @@ pub struct OutputListResponse {
     pub assigned_port: Option<u16>, // Port assigned automatically or specified
     pub uptime_seconds: Option<u64>, // Uptime in seconds, None if stopped
     pub peer_address: Option<String>, // Address of connected peer (for SRT listeners)
+    pub error_message: Option<String>, // Error message if output is in error state
     pub config: Option<String>, // Full configuration JSON from database
 }
 

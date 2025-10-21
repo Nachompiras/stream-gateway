@@ -29,25 +29,58 @@ pub fn spawn_srt_output(
 
     let handle = tokio::spawn(
         Abortable::new(async move {
+            let mut consecutive_failures = 0u32;
+            const MAX_RETRIES: u32 = 10; // Maximum consecutive connection failures before giving up
+
             loop {
                 // 1) Obtener / reconectar socket
                 // Note: State notifications (Listening/Connecting/Connected) are handled in SrtSinkWithState::get_socket()
-                let mut sock = match sink.get_socket().await {
-                    Ok(s)  => s,
-                    Err(e) => {
-                        eprintln!("sink.get_socket(): {e}");
-                        // Notify reconnecting state on error
-                        if let Some(ref tx) = state_tx_clone {
-                            let _ = tx.send(StateChange::OutputStateChanged {
-                                input_id,
-                                output_id,
-                                new_status: StreamStatus::Reconnecting,
-                                connected_at: None,
-                                peer_address: None,
-                            });
+                let mut sock = tokio::select! {
+                    result = sink.get_socket() => {
+                        match result {
+                            Ok(s)  => {
+                                // Connection successful, reset failure counter
+                                consecutive_failures = 0;
+                                s
+                            },
+                            Err(e) => {
+                                consecutive_failures += 1;
+                                eprintln!("SRT Output: sink.get_socket() error (attempt {}/{}): {}",
+                                    consecutive_failures, MAX_RETRIES, e);
+
+                                if consecutive_failures >= MAX_RETRIES {
+                                    eprintln!("SRT Output: Maximum retry attempts ({}) reached, stopping task", MAX_RETRIES);
+                                    // Notify permanent error state
+                                    if let Some(ref tx) = state_tx_clone {
+                                        let _ = tx.send(StateChange::OutputStateChanged {
+                                            input_id,
+                                            output_id,
+                                            new_status: StreamStatus::Error,
+                                            connected_at: None,
+                                            peer_address: None,
+                                        });
+                                    }
+                                    return; // Exit task completely
+                                }
+
+                                // Notify reconnecting state on error
+                                if let Some(ref tx) = state_tx_clone {
+                                    let _ = tx.send(StateChange::OutputStateChanged {
+                                        input_id,
+                                        output_id,
+                                        new_status: StreamStatus::Reconnecting,
+                                        connected_at: None,
+                                        peer_address: None,
+                                    });
+                                }
+                                sleep(Duration::from_secs(2)).await;
+                                continue;
+                            }
                         }
-                        sleep(Duration::from_secs(2)).await;
-                        continue;
+                    }
+                    _ = crate::GLOBAL_CANCEL_TOKEN.cancelled() => {
+                        println!("SRT Output: cancelled by global token");
+                        return; // Exit task
                     }
                 };
 
@@ -56,32 +89,40 @@ pub fn spawn_srt_output(
 
                 // 2) Bucle de envío
                 loop {
-                    match rx.recv().await {
-                        Ok(pkt) => {
-                            let bytes_sent = pkt.len() as u64;                                                        
+                    tokio::select! {
+                        result = rx.recv() => {
+                            match result {
+                                Ok(pkt) => {
+                                    let bytes_sent = pkt.len() as u64;
 
-                            match sock.write(&pkt).await {
-                                Ok(n) if n == pkt.len() => {
-                                    // Sent successfully
-                                    metrics::record_output_bytes(&output_name, input_id, output_id, "srt", bytes_sent);
-                                    metrics::record_output_packets(&output_name, input_id, output_id, "srt", 1);
-                                },
-                                Ok(n) => {
-                                    eprintln!("envío parcial: {}/{} bytes", n, pkt.len());
-                                    // Record error metric for partial send
-                                    metrics::record_stream_error(&output_name, output_id, "srt", "partial_send");
-                                },
-                                Err(e) => {
-                                    eprintln!("error en envío: {e}");
-                                    // Record error metric for send failure
-                                    metrics::record_stream_error(&output_name, output_id, "srt", "send_failed");
-                                    // Break to reconnect
-                                    break;
+                                    match sock.write(&pkt).await {
+                                        Ok(n) if n == pkt.len() => {
+                                            // Sent successfully
+                                            metrics::record_output_bytes(&output_name, input_id, output_id, "srt", bytes_sent);
+                                            metrics::record_output_packets(&output_name, input_id, output_id, "srt", 1);
+                                        },
+                                        Ok(n) => {
+                                            eprintln!("envío parcial: {}/{} bytes", n, pkt.len());
+                                            // Record error metric for partial send
+                                            metrics::record_stream_error(&output_name, output_id, "srt", "partial_send");
+                                        },
+                                        Err(e) => {
+                                            eprintln!("error en envío: {e}");
+                                            // Record error metric for send failure
+                                            metrics::record_stream_error(&output_name, output_id, "srt", "send_failed");
+                                            // Break to reconnect
+                                            break;
+                                        }
+                                    }
                                 }
-                            }                           
+                                Err(broadcast::error::RecvError::Closed) => return,
+                                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                            }
                         }
-                        Err(broadcast::error::RecvError::Closed) => return,
-                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        _ = crate::GLOBAL_CANCEL_TOKEN.cancelled() => {
+                            println!("SRT Output: send loop cancelled by global token");
+                            return; // Exit task completely
+                        }
                     }
 
                     if next_stats.elapsed() >= Duration::from_secs(1) {
@@ -182,6 +223,7 @@ pub fn create_srt_output(
         connected_at: None, // Will be set when connection is established
         state_tx,
         peer_address: None, // Will be set when peer connects (for SRT listeners)
+        error_message: None,
     };
 
     println!("Output creado: {:?}", info);
@@ -446,6 +488,8 @@ impl Forwarder {
 
         let handle: JoinHandle<()> = tokio::spawn(async move {
             let mut buf = vec![0u8; 65536]; // buffer de lectura
+            let mut consecutive_failures = 0u32;
+            const MAX_RETRIES: u32 = 10; // Maximum consecutive connection failures before giving up
 
             loop {
                 // --------------------------------------------------------
@@ -453,24 +497,51 @@ impl Forwarder {
                 // --------------------------------------------------------
                 // No need to notify state here - the get_socket() implementation will handle it
 
-                let mut sock = match source.get_socket().await {
-                    Ok(s)  => {
-                        // Note: State notification (Connected with source_address) is already sent by get_socket()
-                        s
-                    },
-                    Err(e) => {
-                        eprintln!("Forwarder: get_socket() error: {e}");
-                        // Notify error or reconnecting state
-                        if let Some(ref tx) = state_tx_clone {
-                            let _ = tx.send(StateChange::InputStateChanged {
-                                input_id,
-                                new_status: StreamStatus::Error,
-                                connected_at: None,
-                                source_address: None,
-                            });
+                let mut sock = tokio::select! {
+                    result = source.get_socket() => {
+                        match result {
+                            Ok(s)  => {
+                                // Connection successful, reset failure counter
+                                consecutive_failures = 0;
+                                // Note: State notification (Connected with source_address) is already sent by get_socket()
+                                s
+                            },
+                            Err(e) => {
+                                consecutive_failures += 1;
+                                eprintln!("Forwarder: get_socket() error (attempt {}/{}): {}",
+                                    consecutive_failures, MAX_RETRIES, e);
+
+                                if consecutive_failures >= MAX_RETRIES {
+                                    eprintln!("Forwarder: Maximum retry attempts ({}) reached, stopping task", MAX_RETRIES);
+                                    // Notify permanent error state
+                                    if let Some(ref tx) = state_tx_clone {
+                                        let _ = tx.send(StateChange::InputStateChanged {
+                                            input_id,
+                                            new_status: StreamStatus::Error,
+                                            connected_at: None,
+                                            source_address: None,
+                                        });
+                                    }
+                                    return; // Exit task completely
+                                }
+
+                                // Notify reconnecting state
+                                if let Some(ref tx) = state_tx_clone {
+                                    let _ = tx.send(StateChange::InputStateChanged {
+                                        input_id,
+                                        new_status: StreamStatus::Reconnecting,
+                                        connected_at: None,
+                                        source_address: None,
+                                    });
+                                }
+                                sleep(reconnect_delay).await;
+                                continue;
+                            }
                         }
-                        sleep(reconnect_delay).await;
-                        continue;
+                    }
+                    _ = crate::GLOBAL_CANCEL_TOKEN.cancelled() => {
+                        println!("Forwarder: cancelled by global token");
+                        return; // Exit task
                     }
                 };
                 println!("Forwarder: sesión SRT abierta ✅");
@@ -482,37 +553,43 @@ impl Forwarder {
                 // bucle de lectura del socket
                 // --------------------------------------------------------
                 buf.reserve(1316);
-                loop {                                                                              
-                    let read_res = sock.read(&mut buf).await;
+                loop {
+                    tokio::select! {
+                        read_res = sock.read(&mut buf) => {
+                            //2) cada 1 s pedir bistats
+                            if next_stats.elapsed() >= Duration::from_secs(1) {
+                                if let Ok(s) = sock.socket.srt_bistats(0, 1) {
+                                    //println!("Forwarder: SRT stats: {s:?}");
+                                    *stats_clone.write().await = Some(InputStats::Srt(Box::new(s)));
+                                }
+                                next_stats = Instant::now();
+                            }
 
-                    //2) cada 1 s pedir bistats
-                    if next_stats.elapsed() >= Duration::from_secs(1) {
-                        if let Ok(s) = sock.socket.srt_bistats(0, 1) {
-                            //println!("Forwarder: SRT stats: {s:?}");
-                            *stats_clone.write().await = Some(InputStats::Srt(Box::new(s)));
+                            // 3) procesar resultado de la lectura
+                            match read_res {
+                                Ok(0) => {
+                                    println!("Forwarder: EOF, peer cerró");
+                                    break;
+                                }
+                                Ok(n) => {
+                                    // Record metrics for received data
+                                    metrics::record_input_bytes(&input_name_clone, input_id, "srt", n as u64);
+                                    metrics::record_input_packets(&input_name_clone, input_id, "srt", 1);
+
+                                    // ignorar si no hay consumidores
+                                    let _ = tx_clone.send(Bytes::copy_from_slice(&buf[..n]));
+                                }
+                                Err(e) => {
+                                    println!("Forwarder: error recv(): {e}");
+                                    break;
+                                }
+                            }
                         }
-                        next_stats = Instant::now();
+                        _ = crate::GLOBAL_CANCEL_TOKEN.cancelled() => {
+                            println!("Forwarder: read loop cancelled by global token");
+                            return; // Exit task completely
+                        }
                     }
-
-                    // 3) procesar resultado de la lectura
-                    match read_res {
-                        Ok(0) => {
-                            println!("Forwarder: EOF, peer cerró");
-                            break;
-                        }
-                        Ok(n) => {
-                            // Record metrics for received data
-                            metrics::record_input_bytes(&input_name_clone, input_id, "srt", n as u64);
-                            metrics::record_input_packets(&input_name_clone, input_id, "srt", 1);
-
-                            // ignorar si no hay consumidores
-                            let _ = tx_clone.send(Bytes::copy_from_slice(&buf[..n]));
-                        }
-                        Err(e) => {
-                            println!("Forwarder: error recv(): {e}");
-                            break;
-                        }
-                    }                
                 }
 
                 // Notify reconnecting state when connection breaks

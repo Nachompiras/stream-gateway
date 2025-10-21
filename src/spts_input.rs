@@ -113,27 +113,27 @@ pub fn spawn_spts_input(
                             }
 
                             //Update stats every second
-                            // if window_start.elapsed() >= Duration::from_secs(2) {
-                            //     let bitrate = window_bytes_out * 8; // bits/s
-                            //     let pps = window_packets_out;
+                            if window_start.elapsed() >= Duration::from_secs(2) {
+                                let bitrate = window_bytes_out * 8; // bits/s
+                                let pps = window_packets_out;
 
-                            //     // Update atomic counters only (lock-free, no blocking)
-                            //     atomic_stats_task.packets_per_sec.store(pps, Ordering::Relaxed);
-                            //     atomic_stats_task.bitrate_bps.store(bitrate, Ordering::Relaxed);
+                                // Update atomic counters only (lock-free, no blocking)
+                                atomic_stats_task.packets_per_sec.store(pps, Ordering::Relaxed);
+                                atomic_stats_task.bitrate_bps.store(bitrate, Ordering::Relaxed);
 
-                            //     // Try non-blocking write to stats cell
-                            //     let snapshot = atomic_stats_task.snapshot();
-                            //     if let Ok(mut guard) = stats_task.try_write() {
-                            //         *guard = Some(InputStats::Udp(snapshot));
-                            //     }
+                                // Try non-blocking write to stats cell
+                                let snapshot = atomic_stats_task.snapshot();
+                                if let Ok(mut guard) = stats_task.try_write() {
+                                    *guard = Some(InputStats::Udp(snapshot));
+                                }
 
-                            //     metrics::record_input_bytes(&name_for_task, spts_id, "spts", window_bytes_out);
-                            //     metrics::record_input_packets(&name_for_task, spts_id, "spts", window_packets_out);
+                                metrics::record_input_bytes(&name_for_task, spts_id, "spts", window_bytes_out);
+                                metrics::record_input_packets(&name_for_task, spts_id, "spts", window_packets_out);
 
-                            //     window_start = Instant::now();
-                            //     window_bytes_out = 0;
-                            //     window_packets_out = 0;
-                            // }
+                                window_start = Instant::now();
+                                window_bytes_out = 0;
+                                window_packets_out = 0;
+                            }
                         }
                         Err(broadcast::error::RecvError::Lagged(n)) => {
                             warn!("[SPTS {}] Lagged by {} messages from source input {}", spts_id, n, source_input_id);
@@ -191,5 +191,6 @@ pub fn spawn_spts_input(
         connected_at: None, // Will be set when first filtered packet arrives
         state_tx,
         source_address: Some(format!("MPTS Input {} Program {}", source_input.id, program_number)),
+        error_message: None,
     })
 }

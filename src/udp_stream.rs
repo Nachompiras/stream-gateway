@@ -119,6 +119,7 @@ pub async fn create_udp_output(
         connected_at: Some(std::time::SystemTime::now()), // UDP outputs are immediately connected
         state_tx,
         peer_address: None, // UDP doesn't track connected peers
+        error_message: None,
     })
 }
 
@@ -310,6 +311,7 @@ pub fn spawn_udp_input_with_stats(
         connected_at: None, // Will be set when first packet arrives
         state_tx,
         source_address: None, // UDP doesn't track individual source addresses
+        error_message: None,
     })
 }
 

@@ -24,6 +24,10 @@ use std::net::{IpAddr};
 
 pub type InputsMap = std::collections::HashMap<i64, InputInfo>;
 
+// Type alias for input snapshot data used in list_inputs endpoint
+// Represents: (id, name, kind, output_count, status, assigned_port, connected_at, source_address, error_message)
+type InputSnapshot = (i64, Option<String>, String, usize, StreamStatus, Option<u16>, Option<SystemTime>, Option<String>, Option<String>);
+
 pub struct AppState {
     pub pool: sqlx::SqlitePool,
 }
@@ -254,7 +258,7 @@ async fn create_input(
     println!("Input '{}' guardado en la base de datos con ID: {}", name.as_deref().unwrap_or("sin nombre"), id);
 
     // Now spawn the input tasks using the modified configuration
-    match spawn_input(final_req, id, name.clone(), None).await {
+    match spawn_input(final_req.clone(), id, name.clone(), None).await {
         Ok(info) => {
             println!("Input creado con ID: {}", info.id);
             
@@ -274,11 +278,42 @@ async fn create_input(
             Ok(HttpResponse::Created().json(response))
         }
         Err(e) => {
-            // If spawning fails, we should clean up the database entry
-            if let Err(db_err) = database::delete_input_from_db(&state.pool, id).await {
-                error!("Error cleaning up database after spawn failure: {}", db_err);
+            // If spawning fails, keep in DB and ACTIVE_STREAMS with error state
+            // so user can see and delete it via API
+            error!("Failed to spawn input {}: {}", id, e);
+
+            // Create InputInfo in error state
+            let (tx, _) = broadcast::channel(BROADCAST_CAPACITY);
+            let error_input_info = InputInfo {
+                id,
+                name: name.clone(),
+                status: StreamStatus::Error,
+                packet_tx: tx,
+                stats: Arc::new(RwLock::new(None)),
+                task_handle: None,
+                config: final_req.clone(),
+                output_tasks: HashMap::new(),
+                stopped_outputs: HashMap::new(),
+                analysis_tasks: HashMap::new(),
+                paused_analysis: Vec::new(),
+                started_at: None,
+                connected_at: None,
+                state_tx: get_state_change_sender().await,
+                source_address: None,
+                error_message: Some(format!("{}", e)),
+            };
+
+            // Add to ACTIVE_STREAMS so it can be managed
+            let mut guard = ACTIVE_STREAMS.lock().await;
+            guard.insert(id, error_input_info);
+
+            // Update database status to error
+            if let Err(db_err) = update_input_status_in_db(&state.pool, id, "error").await {
+                error!("Failed to update input status to error in database: {}", db_err);
             }
-            Err(ErrorInternalServerError(e))
+
+            // Return error but input is still in DB and can be deleted by user
+            Err(ErrorInternalServerError(format!("Failed to start input: {}", e)))
         },
     }
 }
@@ -740,7 +775,7 @@ pub async fn create_output(
 #[actix_web::get("/inputs")]
 pub async fn list_inputs(_state: web::Data<AppState>) -> ActixResult<impl Responder> {
     // Clone necessary data while holding the lock briefly
-    let inputs_snapshot: Vec<(i64, Option<String>, String, usize, StreamStatus, Option<u16>, Option<SystemTime>, Option<String>)> = {
+    let inputs_snapshot: Vec<InputSnapshot> = {
         let state_guard = ACTIVE_STREAMS.lock().await;
         state_guard.iter().map(|(input_id, input_info)| {
             (
@@ -752,13 +787,14 @@ pub async fn list_inputs(_state: web::Data<AppState>) -> ActixResult<impl Respon
                 input_info.config.extract_assigned_port(),
                 input_info.connected_at,
                 input_info.source_address.clone(),
+                input_info.error_message.clone(),
             )
         }).collect()
     }; // Lock released here
 
     let mut response: Vec<InputListResponse> = Vec::new();
 
-    for (input_id, name, kind, output_count, status, assigned_port, connected_at, source_address) in inputs_snapshot {
+    for (input_id, name, kind, output_count, status, assigned_port, connected_at, source_address, error_message) in inputs_snapshot {
         let input_type = input_type_display_string(&kind).to_string();
 
         response.push(InputListResponse {
@@ -770,6 +806,7 @@ pub async fn list_inputs(_state: web::Data<AppState>) -> ActixResult<impl Respon
             output_count,
             uptime_seconds: calculate_connection_uptime(&status, connected_at),
             source_address,
+            error_message,
         });
     }
 
@@ -824,6 +861,7 @@ pub async fn get_input(
                 config,
                 uptime_seconds: calculate_connection_uptime(&output_info.status, output_info.connected_at),
                 peer_address: output_info.peer_address.clone(),
+                error_message: output_info.error_message.clone(),
             });
         }
 
@@ -871,6 +909,7 @@ pub async fn get_input(
                 config: Some(serde_json::to_string(output_config).unwrap_or_default()),
                 uptime_seconds: None,
                 peer_address: None,
+                error_message: None,
             });
         }
 
@@ -895,6 +934,7 @@ pub async fn get_input(
             uptime_seconds: calculate_connection_uptime(&input_info.status, input_info.connected_at),
             source_address: input_info.source_address.clone(),
             config: config_json,
+            error_message: input_info.error_message.clone(),
         };
 
         Ok(HttpResponse::Ok().json(response))
@@ -924,6 +964,7 @@ pub async fn list_outputs(_state: web::Data<AppState>) -> ActixResult<impl Respo
                     assigned_port: output_info.config.extract_assigned_port(),
                     connected_at: output_info.connected_at,
                     peer_address: output_info.peer_address.clone(),
+                    error_message: output_info.error_message.clone(),
                 });
             }
 
@@ -955,6 +996,7 @@ pub async fn list_outputs(_state: web::Data<AppState>) -> ActixResult<impl Respo
                 assigned_port,
                 connected_at,
                 peer_address,
+                error_message,
             } => {
                 response.push(OutputListResponse {
                     id,
@@ -967,6 +1009,7 @@ pub async fn list_outputs(_state: web::Data<AppState>) -> ActixResult<impl Respo
                     assigned_port,
                     uptime_seconds: calculate_connection_uptime(&status, connected_at),
                     peer_address,
+                    error_message,
                     config: None, // We'll skip DB lookup for performance
                 });
             }
@@ -1015,6 +1058,7 @@ pub async fn list_outputs(_state: web::Data<AppState>) -> ActixResult<impl Respo
                     assigned_port: config.extract_assigned_port(),
                     uptime_seconds: None,
                     peer_address: None,
+                    error_message: None,
                     config: config_json,
                 });
             }
@@ -1037,6 +1081,7 @@ enum OutputSnapshotData {
         assigned_port: Option<u16>,
         connected_at: Option<SystemTime>,
         peer_address: Option<String>,
+        error_message: Option<String>,
     },
     Stopped {
         id: i64,
@@ -1085,6 +1130,7 @@ pub async fn get_output(
                 config,
                 uptime_seconds: calculate_connection_uptime(&output_info.status, output_info.connected_at),
                 peer_address: output_info.peer_address.clone(),
+                error_message: output_info.error_message.clone(),
             };
 
             return Ok(HttpResponse::Ok().json(response));
@@ -1134,6 +1180,7 @@ pub async fn get_input_outputs(
                 config,
                 uptime_seconds: calculate_connection_uptime(&output_info.status, output_info.connected_at),
                 peer_address: output_info.peer_address.clone(),
+                error_message: output_info.error_message.clone(),
             });
         }
 
@@ -1181,6 +1228,7 @@ pub async fn get_input_outputs(
                 config: Some(serde_json::to_string(output_config).unwrap_or_default()),
                 uptime_seconds: None,
                 peer_address: None,
+                error_message: None,
             });
         }
 
@@ -1511,6 +1559,7 @@ pub async fn get_status(_state: web::Data<AppState>) -> ActixResult<impl Respond
                 uptime_seconds: calculate_connection_uptime(&output_info.status, output_info.connected_at),
                 peer_address: output_info.peer_address.clone(),
                 bitrate_bps,
+                error_message: output_info.error_message.clone(),
             });
         }
 
@@ -1558,6 +1607,7 @@ pub async fn get_status(_state: web::Data<AppState>) -> ActixResult<impl Respond
                 uptime_seconds: None,
                 peer_address: None,
                 bitrate_bps: None, // No bitrate for stopped outputs
+                error_message: None,
             });
         }
 
@@ -1583,6 +1633,7 @@ pub async fn get_status(_state: web::Data<AppState>) -> ActixResult<impl Respond
             uptime_seconds: calculate_connection_uptime(&input_info.status, input_info.connected_at),
             source_address: input_info.source_address.clone(),
             bitrate_bps,
+            error_message: input_info.error_message.clone(),
         });
     }
 
@@ -1741,6 +1792,7 @@ pub async fn load_from_db(state: &AppState) -> anyhow::Result<()> {
                 output_tasks: HashMap::new(),
                 stopped_outputs: HashMap::new(),
                 analysis_tasks: HashMap::new(),
+                error_message: None,
                 paused_analysis: Vec::new(),
                 started_at: None, // Not started when stopped
                 connected_at: None, // Not connected when stopped
@@ -1799,6 +1851,7 @@ pub async fn load_from_db(state: &AppState) -> anyhow::Result<()> {
                     connected_at: None,
                     state_tx: None,
                     source_address: None,
+                    error_message: Some(format!("Failed to recreate input: {}", e)),
                 };
 
                 loaded_inputs.insert(r.id, error_input_info);
@@ -1846,6 +1899,7 @@ pub async fn load_from_db(state: &AppState) -> anyhow::Result<()> {
                 connected_at: None,
                 state_tx: None,
                 source_address: None,
+                error_message: None,
             };
 
             spts_loaded_inputs.insert(r.id, stopped_input_info);
@@ -1857,13 +1911,14 @@ pub async fn load_from_db(state: &AppState) -> anyhow::Result<()> {
 
         // Check if source input exists in ACTIVE_STREAMS (base inputs are already there)
         if let CreateInputRequest::Spts { source_input_id, .. } = &create_req {
+            let source_id = *source_input_id; // Copy the ID to avoid borrow issues
             let source_exists = {
                 let inputs = ACTIVE_STREAMS.lock().await;
-                inputs.contains_key(source_input_id)
+                inputs.contains_key(&source_id)
             };
             if !source_exists {
                 error!("Source input {} not found for SPTS input {}. Creating in stopped state.",
-                       source_input_id, r.id);
+                       source_id, r.id);
 
                 // Create in stopped state
                 let (tx, _) = broadcast::channel(BROADCAST_CAPACITY);
@@ -1883,6 +1938,7 @@ pub async fn load_from_db(state: &AppState) -> anyhow::Result<()> {
                     connected_at: None,
                     state_tx: None,
                     source_address: None,
+                    error_message: Some(format!("Source input {} not found", source_id)),
                 };
 
                 spts_loaded_inputs.insert(r.id, stopped_input_info);
@@ -1917,6 +1973,7 @@ pub async fn load_from_db(state: &AppState) -> anyhow::Result<()> {
                     connected_at: None,
                     state_tx: None,
                     source_address: None,
+                    error_message: Some(format!("Failed to recreate SPTS input: {}", e)),
                 };
 
                 spts_loaded_inputs.insert(r.id, error_input_info);
@@ -2189,6 +2246,7 @@ async fn spawn_input(req: CreateInputRequest, id: i64, name: Option<String>, _as
                 connected_at: None, // Will be set when connection is established
                 state_tx: get_state_change_sender().await, // Use global state channel
                 source_address: None, // Will be set when SRT listener accepts connection
+                error_message: None,
             })
         }
 
