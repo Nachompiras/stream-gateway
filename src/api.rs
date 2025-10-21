@@ -261,8 +261,8 @@ async fn create_input(
     match spawn_input(final_req.clone(), id, name.clone(), None).await {
         Ok(info) => {
             println!("Input creado con ID: {}", info.id);
-            
-            let mut guard = ACTIVE_STREAMS.lock().await;
+
+            let mut guard = ACTIVE_STREAMS.write().await;
             guard.insert(info.id, info);            
 
             println!("Input '{}' añadido al estado compartido", id);
@@ -304,7 +304,7 @@ async fn create_input(
             };
 
             // Add to ACTIVE_STREAMS so it can be managed
-            let mut guard = ACTIVE_STREAMS.lock().await;
+            let mut guard = ACTIVE_STREAMS.write().await;
             guard.insert(id, error_input_info);
 
             // Update database status to error
@@ -325,7 +325,7 @@ pub async fn delete_input(
     req: web::Json<DeleteInputRequest>,
 ) -> ActixResult<impl Responder> {
     let input_id = req.input_id;
-    let mut state_guard = ACTIVE_STREAMS.lock().await;
+    let mut state_guard = ACTIVE_STREAMS.write().await;
 
     if let Some(mut input_info) = state_guard.remove(&input_id) {
         info!("Iniciando cierre del Input '{}'", input_id);
@@ -513,7 +513,7 @@ pub async fn update_input(
 
     // Check if input is currently active
     let is_active = {
-        let guard = ACTIVE_STREAMS.lock().await;
+        let guard = ACTIVE_STREAMS.read().await;
         guard.get(&input_id)
             .map(|info| info.status.is_active())
             .unwrap_or(false)
@@ -530,7 +530,7 @@ pub async fn update_input(
 
     // Update the config in memory
     {
-        let mut guard = ACTIVE_STREAMS.lock().await;
+        let mut guard = ACTIVE_STREAMS.write().await;
         if let Some(input_info) = guard.get_mut(&input_id) {
             input_info.config = merged_config.clone();
         }
@@ -573,7 +573,7 @@ pub async fn create_output(
     }
 
     // Bloqueamos el estado una sola vez
-    let mut guard = ACTIVE_STREAMS.lock().await;
+    let mut guard = ACTIVE_STREAMS.write().await;
 
     // Clone the request so we can use it after into_inner()
     let req_val = req.into_inner();
@@ -776,7 +776,7 @@ pub async fn create_output(
 pub async fn list_inputs(_state: web::Data<AppState>) -> ActixResult<impl Responder> {
     // Clone necessary data while holding the lock briefly
     let inputs_snapshot: Vec<InputSnapshot> = {
-        let state_guard = ACTIVE_STREAMS.lock().await;
+        let state_guard = ACTIVE_STREAMS.read().await;
         state_guard.iter().map(|(input_id, input_info)| {
             (
                 *input_id,
@@ -819,7 +819,7 @@ pub async fn get_input(
     path: web::Path<i64>
 ) -> ActixResult<impl Responder> {
     let input_id = path.into_inner();
-    let state_guard = ACTIVE_STREAMS.lock().await;
+    let state_guard = ACTIVE_STREAMS.read().await;
 
     if let Some(input_info) = state_guard.get(&input_id) {
         // Get input type and config from database
@@ -947,7 +947,7 @@ pub async fn get_input(
 pub async fn list_outputs(_state: web::Data<AppState>) -> ActixResult<impl Responder> {
     // Clone necessary data while holding the lock briefly
     let outputs_snapshot: Vec<OutputSnapshotData> = {
-        let state_guard = ACTIVE_STREAMS.lock().await;
+        let state_guard = ACTIVE_STREAMS.read().await;
         let mut snapshot = Vec::new();
 
         for (input_id, input_info) in state_guard.iter() {
@@ -1097,7 +1097,7 @@ pub async fn get_output(
     path: web::Path<i64>
 ) -> ActixResult<impl Responder> {
     let output_id = path.into_inner();
-    let state_guard = ACTIVE_STREAMS.lock().await;
+    let state_guard = ACTIVE_STREAMS.read().await;
 
     // Search for the output across all inputs
     for (input_id, input_info) in state_guard.iter() {
@@ -1146,7 +1146,7 @@ pub async fn get_input_outputs(
     path: web::Path<i64>
 ) -> ActixResult<impl Responder> {
     let input_id = path.into_inner();
-    let state_guard = ACTIVE_STREAMS.lock().await;
+    let state_guard = ACTIVE_STREAMS.read().await;
 
     if let Some(input_info) = state_guard.get(&input_id) {
         let mut outputs: Vec<OutputDetailResponse> = Vec::new();
@@ -1246,7 +1246,7 @@ pub async fn delete_output(
     let input_id = req.input_id;
     let output_id = req.output_id;
 
-    let mut state_guard = ACTIVE_STREAMS.lock().await;
+    let mut state_guard = ACTIVE_STREAMS.write().await;
 
     if let Some(input_info) = state_guard.get_mut(&input_id) {
         // Try to remove from active outputs first
@@ -1471,7 +1471,7 @@ pub async fn update_output(
 
     // Check if output is currently active and if input exists
     let (is_active, input_exists) = {
-        let guard = ACTIVE_STREAMS.lock().await;
+        let guard = ACTIVE_STREAMS.read().await;
         if let Some(input_info) = guard.get(&input_id) {
             let is_active = input_info.output_tasks.contains_key(&output_id);
             (is_active, true)
@@ -1495,7 +1495,7 @@ pub async fn update_output(
 
     // Update the config in memory (in stopped_outputs)
     {
-        let mut guard = ACTIVE_STREAMS.lock().await;
+        let mut guard = ACTIVE_STREAMS.write().await;
         if let Some(input_info) = guard.get_mut(&input_id) {
             input_info.stopped_outputs.insert(output_id, merged_config.clone());
         }
@@ -1525,7 +1525,7 @@ pub async fn update_output(
 // --- Endpoint para listar Inputs y sus Outputs ---
 #[actix_web::get("/status")]
 pub async fn get_status(_state: web::Data<AppState>) -> ActixResult<impl Responder> {
-    let state_guard = ACTIVE_STREAMS.lock().await;
+    let state_guard = ACTIVE_STREAMS.read().await;
     let mut response: Vec<InputResponse> = Vec::new();
 
     for (input_id, input_info) in state_guard.iter() {
@@ -1670,7 +1670,7 @@ async fn input_stats(
     path:  web::Path<i64>,
 ) -> impl Responder {
     let id = path.into_inner();
-    let guard = ACTIVE_STREAMS.lock().await;
+    let guard = ACTIVE_STREAMS.read().await;
 
     //println!("Solicitando stats para input '{}'", id);
 
@@ -1694,7 +1694,7 @@ async fn output_stats(
     path:  web::Path<i64>,
 ) -> impl Responder {
     let output_id = path.into_inner();
-    let state_guard = ACTIVE_STREAMS.lock().await;
+    let state_guard = ACTIVE_STREAMS.read().await;
 
     // Search for the output across all inputs
     for (_, input_info) in state_guard.iter() {
@@ -1863,7 +1863,7 @@ pub async fn load_from_db(state: &AppState) -> anyhow::Result<()> {
     // This ensures SPTS inputs can find their source inputs
     println!("Inserting {} base inputs into ACTIVE_STREAMS", loaded_inputs.len());
     {
-        let mut inputs = ACTIVE_STREAMS.lock().await;
+        let mut inputs = ACTIVE_STREAMS.write().await;
         for (id, input_info) in loaded_inputs.drain() {
             inputs.insert(id, input_info);
         }
@@ -1913,7 +1913,7 @@ pub async fn load_from_db(state: &AppState) -> anyhow::Result<()> {
         if let CreateInputRequest::Spts { source_input_id, .. } = &create_req {
             let source_id = *source_input_id; // Copy the ID to avoid borrow issues
             let source_exists = {
-                let inputs = ACTIVE_STREAMS.lock().await;
+                let inputs = ACTIVE_STREAMS.read().await;
                 inputs.contains_key(&source_id)
             };
             if !source_exists {
@@ -1995,7 +1995,7 @@ pub async fn load_from_db(state: &AppState) -> anyhow::Result<()> {
     // Insert SPTS inputs into ACTIVE_STREAMS before processing outputs
     println!("Inserting {} SPTS inputs into ACTIVE_STREAMS", spts_loaded_inputs.len());
     {
-        let mut inputs = ACTIVE_STREAMS.lock().await;
+        let mut inputs = ACTIVE_STREAMS.write().await;
         for (id, input_info) in spts_loaded_inputs {
             inputs.insert(id, input_info);
         }
@@ -2007,7 +2007,7 @@ pub async fn load_from_db(state: &AppState) -> anyhow::Result<()> {
     for (input_id, outputs) in outputs_by_input {
         println!("Procesando {} outputs para input {}", outputs.len(), input_id);
 
-        let mut streams_guard = ACTIVE_STREAMS.lock().await;
+        let mut streams_guard = ACTIVE_STREAMS.write().await;
         let input_opt = streams_guard.get_mut(&input_id);
 
         if let Some(input) = input_opt {
@@ -2253,7 +2253,7 @@ async fn spawn_input(req: CreateInputRequest, id: i64, name: Option<String>, _as
         /* ----------------------------- SPTS ----------------------------- */
         CreateInputRequest::Spts { source_input_id, program_number, fill_with_nulls, .. } => {
             // Get the source MPTS input
-            let streams_guard = ACTIVE_STREAMS.lock().await;
+            let streams_guard = ACTIVE_STREAMS.read().await;
             let source_input = streams_guard.get(&source_input_id)
                 .ok_or_else(|| actix_web::error::ErrorBadRequest(
                     format!("Source input {} not found or not active", source_input_id)
@@ -2435,7 +2435,7 @@ pub async fn get_analysis_data(
     };
 
     // Get the analysis data
-    let guard = ACTIVE_STREAMS.lock().await;
+    let guard = ACTIVE_STREAMS.read().await;
     let input_info = guard.get(&input_id)
         .ok_or_else(|| actix_web::error::ErrorNotFound(format!("Input {} not found", input_id)))?;
 
@@ -2478,7 +2478,7 @@ pub async fn start_input_endpoint(
         Ok(()) => {
             // Get the actual status from the input after starting
             let status_str = {
-                let guard = ACTIVE_STREAMS.lock().await;
+                let guard = ACTIVE_STREAMS.read().await;
                 if let Some(input) = guard.get(&input_id) {
                     input.status.to_string().to_lowercase()
                 } else {
@@ -2559,7 +2559,7 @@ pub async fn start_output_endpoint(
         Ok(()) => {
             // Get the actual status from the output after starting
             let status_str = {
-                let guard = ACTIVE_STREAMS.lock().await;
+                let guard = ACTIVE_STREAMS.read().await;
                 if let Some(input) = guard.get(&input_id) {
                     if let Some(output) = input.output_tasks.get(&output_id) {
                         output.status.to_string().to_lowercase()

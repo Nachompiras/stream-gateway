@@ -13,7 +13,7 @@ use crate::analysis;
 pub async fn start_input(input_id: i64) -> Result<()> {
     info!("Starting input {}", input_id);
 
-    let mut guard = ACTIVE_STREAMS.lock().await;
+    let mut guard = ACTIVE_STREAMS.write().await;
     let input_info = guard.get_mut(&input_id)
         .ok_or_else(|| anyhow!("Input {} not found", input_id))?;
 
@@ -37,7 +37,7 @@ pub async fn start_input(input_id: i64) -> Result<()> {
     };
 
     // Re-acquire the lock
-    let mut guard = ACTIVE_STREAMS.lock().await;
+    let mut guard = ACTIVE_STREAMS.write().await;
     let input_info = guard.get_mut(&input_id)
         .ok_or_else(|| anyhow!("Input {} not found after lock re-acquisition", input_id))?;
 
@@ -95,9 +95,12 @@ pub async fn start_input(input_id: i64) -> Result<()> {
         },
         CreateInputRequest::Spts { source_input_id, program_number, fill_with_nulls, .. } => {
             // SPTS inputs need to reconnect to their source input
+            // Release the write lock before checking source (to avoid deadlock)
+            drop(guard);
+
             // First verify that source input exists and is active
             let source_exists = {
-                let streams = ACTIVE_STREAMS.lock().await;
+                let streams = ACTIVE_STREAMS.read().await;
                 streams.get(source_input_id)
                     .map(|src| src.status.is_active())
                     .unwrap_or(false)
@@ -111,13 +114,9 @@ pub async fn start_input(input_id: i64) -> Result<()> {
                 ));
             }
 
-            // We need to release the current guard before acquiring ACTIVE_STREAMS again
-            // to avoid potential deadlock
-            drop(guard);
-
             // Spawn the SPTS input - it will acquire the lock internally
             let new_input_info = {
-                let streams = ACTIVE_STREAMS.lock().await;
+                let streams = ACTIVE_STREAMS.read().await;
                 let source_input = streams.get(source_input_id)
                     .ok_or_else(|| anyhow!("Source input {} not found", source_input_id))?;
 
@@ -132,7 +131,7 @@ pub async fn start_input(input_id: i64) -> Result<()> {
             };
 
             // Re-acquire lock and update
-            let mut guard = ACTIVE_STREAMS.lock().await;
+            let mut guard = ACTIVE_STREAMS.write().await;
             let input_info = guard.get_mut(&input_id)
                 .ok_or_else(|| anyhow!("Input {} not found after SPTS recreation", input_id))?;
 
@@ -200,7 +199,7 @@ pub async fn start_input(input_id: i64) -> Result<()> {
 pub async fn stop_input(input_id: i64) -> Result<()> {
     info!("Stopping input {}", input_id);
 
-    let mut guard = ACTIVE_STREAMS.lock().await;
+    let mut guard = ACTIVE_STREAMS.write().await;
     let input_info = guard.get_mut(&input_id)
         .ok_or_else(|| anyhow!("Input {} not found", input_id))?;
 
@@ -231,14 +230,16 @@ pub async fn stop_input(input_id: i64) -> Result<()> {
     }
     input_info.stopped_outputs.extend(outputs_to_stop);
 
-    // Pause active analysis
-    let active_analysis: Vec<AnalysisType> = input_info.analysis_tasks.values().map(|info| info.analysis_type.clone())
+    // Stop active analysis tasks directly (don't call stop_analysis to avoid deadlock)
+    let active_analysis: Vec<(String, AnalysisType)> = input_info.analysis_tasks.iter()
+        .map(|(id, info)| (id.clone(), info.analysis_type.clone()))
         .collect();
 
-    for analysis_type in active_analysis {
-        if let Err(e) = analysis::stop_analysis(input_id, analysis_type.clone()).await {
-            error!("Failed to pause {} analysis for input {}: {}", analysis_type, input_id, e);
-        } else {
+    for (analysis_id, analysis_type) in active_analysis {
+        if let Some(analysis_info) = input_info.analysis_tasks.remove(&analysis_id) {
+            // Abort the task
+            analysis_info.task_handle.abort();
+            info!("Paused {} analysis (ID: {}) for input {}", analysis_type, analysis_id, input_id);
             input_info.paused_analysis.push(analysis_type);
         }
     }
@@ -253,7 +254,7 @@ pub async fn stop_input(input_id: i64) -> Result<()> {
 pub async fn start_output(input_id: i64, output_id: i64) -> Result<()> {
     info!("Starting output {} for input {}", output_id, input_id);
 
-    let mut guard = ACTIVE_STREAMS.lock().await;
+    let mut guard = ACTIVE_STREAMS.write().await;
     let input_info = guard.get_mut(&input_id)
         .ok_or_else(|| anyhow!("Input {} not found", input_id))?;
 
@@ -280,7 +281,7 @@ pub async fn start_output(input_id: i64, output_id: i64) -> Result<()> {
 pub async fn stop_output(input_id: i64, output_id: i64) -> Result<()> {
     info!("Stopping output {} for input {}", output_id, input_id);
 
-    let mut guard = ACTIVE_STREAMS.lock().await;
+    let mut guard = ACTIVE_STREAMS.write().await;
     let input_info = guard.get_mut(&input_id)
         .ok_or_else(|| anyhow!("Input {} not found", input_id))?;
 

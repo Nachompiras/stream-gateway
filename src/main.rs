@@ -17,7 +17,7 @@ mod srt_stream;
 mod stream_control;
 mod database;
 mod metrics;
-use tokio::sync::Mutex;
+use tokio::sync::{RwLock, Mutex};
 use std::{collections::HashMap, sync::Arc};
 use once_cell::sync::Lazy;
 use api::*;
@@ -29,7 +29,7 @@ use tokio::sync::mpsc;
 use crate::database::init_database;
 
 // Estado global compartido para todos los inputs/outputs
-pub static ACTIVE_STREAMS: Lazy<Arc<Mutex<InputsMap>>> = Lazy::new(|| Arc::new(Mutex::new(HashMap::new())));
+pub static ACTIVE_STREAMS: Lazy<Arc<RwLock<InputsMap>>> = Lazy::new(|| Arc::new(RwLock::new(HashMap::new())));
 pub static GLOBAL_CANCEL_TOKEN: std::sync::LazyLock<CancellationToken> = std::sync::LazyLock::new(CancellationToken::new);
 
 // Global state change notification system
@@ -147,7 +147,7 @@ async fn main() -> std::io::Result<()> {
     
     // Stop all input tasks using global state
     {
-        let mut inputs = ACTIVE_STREAMS.lock().await;
+        let mut inputs = ACTIVE_STREAMS.write().await;
         for (input_id, input_info) in inputs.drain() {
             println!("Cerrando input {}", input_id);
             if let Some(handle) = input_info.task_handle {

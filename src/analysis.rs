@@ -23,7 +23,7 @@ pub async fn start_analysis(input_id: i64, analysis_type: AnalysisType) -> Resul
 
     // Get the broadcast receiver from the input
     let rx = {
-        let guard = ACTIVE_STREAMS.lock().await;
+        let guard = ACTIVE_STREAMS.read().await;
         let input_info = guard.get(&input_id)
             .ok_or_else(|| anyhow!("Input {} not found", input_id))?;
 
@@ -61,7 +61,7 @@ pub async fn start_analysis(input_id: i64, analysis_type: AnalysisType) -> Resul
 
     // Add to the active streams map
     {
-        let mut guard = ACTIVE_STREAMS.lock().await;
+        let mut guard = ACTIVE_STREAMS.write().await;
         if let Some(input_info) = guard.get_mut(&input_id) {
             input_info.analysis_tasks.insert(analysis_id.clone(), analysis_info);
         } else {
@@ -79,7 +79,7 @@ pub async fn start_analysis(input_id: i64, analysis_type: AnalysisType) -> Resul
 pub async fn stop_analysis(input_id: i64, analysis_type: AnalysisType) -> Result<()> {
     info!("Stopping {} analysis for input {}", analysis_type, input_id);
 
-    let mut guard = ACTIVE_STREAMS.lock().await;
+    let mut guard = ACTIVE_STREAMS.write().await;
     let input_info = guard.get_mut(&input_id)
         .ok_or_else(|| anyhow!("Input {} not found", input_id))?;
 
@@ -107,7 +107,7 @@ pub async fn stop_analysis(input_id: i64, analysis_type: AnalysisType) -> Result
 pub async fn stop_all_analysis(input_id: i64) -> Result<()> {
     info!("Stopping all analysis tasks for input {}", input_id);
 
-    let mut guard = ACTIVE_STREAMS.lock().await;
+    let mut guard = ACTIVE_STREAMS.write().await;
     let input_info = guard.get_mut(&input_id)
         .ok_or_else(|| anyhow!("Input {} not found", input_id))?;
 
@@ -125,7 +125,7 @@ pub async fn stop_all_analysis(input_id: i64) -> Result<()> {
 
 /// Get list of active analyses for an input
 pub async fn get_active_analyses(input_id: i64) -> Result<Vec<(String, AnalysisType, SystemTime)>> {
-    let guard = ACTIVE_STREAMS.lock().await;
+    let guard = ACTIVE_STREAMS.read().await;
     let input_info = guard.get(&input_id)
         .ok_or_else(|| anyhow!("Input {} not found", input_id))?;
 
