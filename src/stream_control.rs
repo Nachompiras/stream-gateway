@@ -159,7 +159,8 @@ pub async fn start_input(input_id: i64) -> Result<()> {
 
             for analysis_type in analyses_to_restart {
                 let analysis_type_clone = analysis_type.clone();
-                if let Err(e) = analysis::start_analysis(input_id, analysis_type).await {
+                // Restart analysis without timeout (was paused, not originally timed)
+                if let Err(e) = analysis::start_analysis(input_id, analysis_type, None).await {
                     error!("Failed to restart analysis {:?} for input {}: {}", analysis_type_clone, input_id, e);
                 }
             }
@@ -184,7 +185,8 @@ pub async fn start_input(input_id: i64) -> Result<()> {
     // Restart paused analysis
     let paused_analysis: Vec<AnalysisType> = input_info.paused_analysis.drain(..).collect();
     for analysis_type in paused_analysis {
-        if let Err(e) = analysis::start_analysis(input_id, analysis_type.clone()).await {
+        // Restart analysis without timeout (was paused, not originally timed)
+        if let Err(e) = analysis::start_analysis(input_id, analysis_type.clone(), None).await {
             error!("Failed to restart {} analysis for input {}: {}", analysis_type, input_id, e);
             // Add back to paused list if failed
             input_info.paused_analysis.push(analysis_type);

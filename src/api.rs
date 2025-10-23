@@ -2282,10 +2282,19 @@ async fn spawn_input(req: CreateInputRequest, id: i64, name: Option<String>, _as
 #[actix_web::post("/inputs/{id}/analysis/{analysis_type}/start")]
 pub async fn start_analysis(
     path: web::Path<(i64, String)>,
+    body: Option<web::Json<StartAnalysisRequest>>,
 ) -> ActixResult<impl Responder> {
     let (input_id, analysis_type_str) = path.into_inner();
 
-    info!("Starting {} analysis for input {}", analysis_type_str, input_id);
+    // Extract timeout from request body if provided
+    let timeout_minutes = body.as_ref().and_then(|b| b.timeout_minutes);
+
+    if let Some(timeout) = timeout_minutes {
+        info!("Starting {} analysis for input {} with timeout of {} minutes",
+              analysis_type_str, input_id, timeout);
+    } else {
+        info!("Starting {} analysis for input {} (no timeout)", analysis_type_str, input_id);
+    }
 
     // Parse analysis type
     let analysis_type = match analysis_type_str.parse::<AnalysisType>() {
@@ -2297,15 +2306,21 @@ pub async fn start_analysis(
     };
 
     // Start the analysis
-    match analysis::start_analysis(input_id, analysis_type).await {
+    match analysis::start_analysis(input_id, analysis_type, timeout_minutes).await {
         Ok(analysis_id) => {
             info!("Analysis started with ID: {}", analysis_id);
-            Ok(HttpResponse::Created().json(serde_json::json!({
+            let mut response = serde_json::json!({
                 "message": "Analysis started successfully",
                 "analysis_id": analysis_id,
                 "input_id": input_id,
                 "analysis_type": analysis_type_str
-            })))
+            });
+
+            if let Some(timeout) = timeout_minutes {
+                response["timeout_minutes"] = serde_json::json!(timeout);
+            }
+
+            Ok(HttpResponse::Created().json(response))
         }
         Err(e) => {
             error!("Failed to start analysis: {}", e);
@@ -2380,8 +2395,9 @@ pub async fn get_analysis_status(
     match analysis::get_active_analyses(input_id).await {
         Ok(analyses) => {
             let mut active_analyses = Vec::new();
+            let now = std::time::SystemTime::now();
 
-            for (id, analysis_type, created_at) in analyses {
+            for (id, analysis_type, created_at, timeout_minutes, expires_at) in analyses {
                 // Convert SystemTime to ISO 8601 string
                 let created_at_str = match created_at.duration_since(std::time::UNIX_EPOCH) {
                     Ok(duration) => {
@@ -2394,12 +2410,33 @@ pub async fn get_analysis_status(
                     Err(_) => "unknown".to_string(),
                 };
 
+                // Convert expires_at to ISO 8601 string if present
+                let expires_at_str = expires_at.and_then(|exp| {
+                    exp.duration_since(std::time::UNIX_EPOCH).ok().map(|duration| {
+                        let secs = duration.as_secs();
+                        let nanos = duration.subsec_nanos();
+                        chrono::DateTime::from_timestamp(secs as i64, nanos)
+                            .unwrap_or_default()
+                            .to_rfc3339()
+                    })
+                });
+
+                // Calculate remaining minutes if timeout is set
+                let remaining_minutes = expires_at.and_then(|exp| {
+                    exp.duration_since(now).ok().map(|duration| {
+                        duration.as_secs() / 60
+                    })
+                });
+
                 active_analyses.push(AnalysisStatusResponse {
                     id,
                     analysis_type: analysis_type.to_string(),
                     input_id,
                     status: "running".to_string(),
                     created_at: created_at_str,
+                    timeout_minutes,
+                    expires_at: expires_at_str,
+                    remaining_minutes,
                 });
             }
 

@@ -14,12 +14,17 @@ use crate::ACTIVE_STREAMS;
 use mpegts_inspector::inspector::{self, CodecInfo, InspectorReport};
 
 /// Start MPEG-TS analysis for a specific input
-pub async fn start_analysis(input_id: i64, analysis_type: AnalysisType) -> Result<String> {
+pub async fn start_analysis(input_id: i64, analysis_type: AnalysisType, timeout_minutes: Option<u64>) -> Result<String> {
     // Generate unique ID for this analysis task
     let analysis_id = Uuid::new_v4().to_string();
 
-    info!("Starting {} analysis for input {} with ID {}",
-          analysis_type, input_id, analysis_id);
+    if let Some(timeout) = timeout_minutes {
+        info!("Starting {} analysis for input {} with ID {} (timeout: {} minutes)",
+              analysis_type, input_id, analysis_id, timeout);
+    } else {
+        info!("Starting {} analysis for input {} with ID {} (no timeout)",
+              analysis_type, input_id, analysis_id);
+    }
 
     // Get the broadcast receiver from the input
     let rx = {
@@ -43,10 +48,19 @@ pub async fn start_analysis(input_id: i64, analysis_type: AnalysisType) -> Resul
     // Create shared report data container
     let report_data = Arc::new(RwLock::new(None));
 
+    // Calculate expiration time if timeout is set
+    let (expires_at, timeout_duration) = if let Some(minutes) = timeout_minutes {
+        let duration = std::time::Duration::from_secs(minutes * 60);
+        let expires = SystemTime::now() + duration;
+        (Some(expires), Some(duration))
+    } else {
+        (None, None)
+    };
+
     // Spawn the analysis task based on type
     let task_handle = match analysis_type {
-        AnalysisType::Mux => spawn_mux_analysis(rx, input_id, analysis_id.clone(), report_data.clone()).await?,
-        AnalysisType::Tr101 => spawn_tr101_analysis(rx, input_id, analysis_id.clone(), report_data.clone()).await?,
+        AnalysisType::Mux => spawn_mux_analysis(rx, input_id, analysis_id.clone(), report_data.clone(), timeout_duration).await?,
+        AnalysisType::Tr101 => spawn_tr101_analysis(rx, input_id, analysis_id.clone(), report_data.clone(), timeout_duration).await?,
     };
 
     // Create AnalysisInfo and add to the input's analysis_tasks
@@ -57,6 +71,8 @@ pub async fn start_analysis(input_id: i64, analysis_type: AnalysisType) -> Resul
         task_handle,
         created_at: SystemTime::now(),
         report_data,
+        timeout_minutes,
+        expires_at,
     };
 
     // Add to the active streams map
@@ -69,8 +85,13 @@ pub async fn start_analysis(input_id: i64, analysis_type: AnalysisType) -> Resul
         }
     }
 
-    info!("Successfully started {} analysis for input {} with ID {}",
-          analysis_type, input_id, analysis_id);
+    if let Some(timeout) = timeout_minutes {
+        info!("Successfully started {} analysis for input {} with ID {} (will stop after {} minutes)",
+              analysis_type, input_id, analysis_id, timeout);
+    } else {
+        info!("Successfully started {} analysis for input {} with ID {}",
+              analysis_type, input_id, analysis_id);
+    }
 
     Ok(analysis_id)
 }
@@ -124,13 +145,19 @@ pub async fn stop_all_analysis(input_id: i64) -> Result<()> {
 }
 
 /// Get list of active analyses for an input
-pub async fn get_active_analyses(input_id: i64) -> Result<Vec<(String, AnalysisType, SystemTime)>> {
+pub async fn get_active_analyses(input_id: i64) -> Result<Vec<(String, AnalysisType, SystemTime, Option<u64>, Option<SystemTime>)>> {
     let guard = ACTIVE_STREAMS.read().await;
     let input_info = guard.get(&input_id)
         .ok_or_else(|| anyhow!("Input {} not found", input_id))?;
 
     let analyses = input_info.analysis_tasks.iter()
-        .map(|(id, info)| (id.clone(), info.analysis_type.clone(), info.created_at))
+        .map(|(id, info)| (
+            id.clone(),
+            info.analysis_type.clone(),
+            info.created_at,
+            info.timeout_minutes,
+            info.expires_at
+        ))
         .collect();
 
     Ok(analyses)
@@ -141,7 +168,8 @@ async fn spawn_mux_analysis(
     mut rx: broadcast::Receiver<Bytes>,
     input_id: i64,
     analysis_id: String,
-    report_data: Arc<RwLock<Option<AnalysisDataReport>>>
+    report_data: Arc<RwLock<Option<AnalysisDataReport>>>,
+    timeout_duration: Option<std::time::Duration>
 ) -> Result<JoinHandle<()>> {
     let handle = tokio::spawn(async move {
         info!("Starting MUX analysis task {} for input {}", analysis_id, input_id);
@@ -162,7 +190,7 @@ async fn spawn_mux_analysis(
         // Clone for moving into the callback
         let report_data_clone = report_data.clone();
 
-        match inspector::run_from_broadcast(
+        let analysis_future = inspector::run_from_broadcast(
             rx_vec,
             2,
             false,
@@ -199,12 +227,34 @@ async fn spawn_mux_analysis(
                 println!("⚠️ Timing: PCR accuracy errors: {}", report.tr101_metrics.pcr_accuracy_errors);
             }
             // Priority 3 errors (like service_id_mismatch) are automatically filtered out
-        }).await {
-            Ok(_) => {
-                info!("MUX analysis task {} for input {} completed successfully", analysis_id, input_id);
-            },
-            Err(e) => {
-                error!("MUX analysis task {} for input {} failed: {}", analysis_id, input_id, e);
+        });
+
+        // Apply timeout if configured
+        if let Some(timeout) = timeout_duration {
+            match tokio::time::timeout(timeout, analysis_future).await {
+                Ok(inner_result) => {
+                    match inner_result {
+                        Ok(_) => {
+                            info!("MUX analysis task {} for input {} completed successfully", analysis_id, input_id);
+                        },
+                        Err(e) => {
+                            error!("MUX analysis task {} for input {} failed: {}", analysis_id, input_id, e);
+                        }
+                    }
+                },
+                Err(_) => {
+                    info!("MUX analysis task {} for input {} stopped due to timeout", analysis_id, input_id);
+                }
+            }
+        } else {
+            // No timeout, run indefinitely
+            match analysis_future.await {
+                Ok(_) => {
+                    info!("MUX analysis task {} for input {} completed successfully", analysis_id, input_id);
+                },
+                Err(e) => {
+                    error!("MUX analysis task {} for input {} failed: {}", analysis_id, input_id, e);
+                }
             }
         }
 
@@ -219,7 +269,8 @@ async fn spawn_tr101_analysis(
     mut rx: broadcast::Receiver<Bytes>,
     input_id: i64,
     analysis_id: String,
-    report_data: Arc<RwLock<Option<AnalysisDataReport>>>
+    report_data: Arc<RwLock<Option<AnalysisDataReport>>>,
+    timeout_duration: Option<std::time::Duration>
 ) -> Result<JoinHandle<()>> {
     let handle = tokio::spawn(async move {
         info!("Starting TR-101 analysis task {} for input {}", analysis_id, input_id);
@@ -240,7 +291,7 @@ async fn spawn_tr101_analysis(
         // Clone for moving into the callback
         let report_data_clone = report_data.clone();
 
-        match inspector::run_from_broadcast(rx_vec, 2, true, move |report: InspectorReport| {
+        let analysis_future = inspector::run_from_broadcast(rx_vec, 2, true, move |report: InspectorReport| {
         // Convert and store the report data
         let analysis_data = convert_inspector_report(&report);
 
@@ -273,12 +324,34 @@ async fn spawn_tr101_analysis(
                 println!("⚠️ Timing: PCR accuracy errors: {}", report.tr101_metrics.pcr_accuracy_errors);
             }
             // Priority 3 errors (like service_id_mismatch) are automatically filtered out
-        }).await {
-            Ok(_) => {
-                info!("TR-101 analysis task {} for input {} completed successfully", analysis_id, input_id);
-            },
-            Err(e) => {
-                error!("TR-101 analysis task {} for input {} failed: {}", analysis_id, input_id, e);
+        });
+
+        // Apply timeout if configured
+        if let Some(timeout) = timeout_duration {
+            match tokio::time::timeout(timeout, analysis_future).await {
+                Ok(inner_result) => {
+                    match inner_result {
+                        Ok(_) => {
+                            info!("TR-101 analysis task {} for input {} completed successfully", analysis_id, input_id);
+                        },
+                        Err(e) => {
+                            error!("TR-101 analysis task {} for input {} failed: {}", analysis_id, input_id, e);
+                        }
+                    }
+                },
+                Err(_) => {
+                    info!("TR-101 analysis task {} for input {} stopped due to timeout", analysis_id, input_id);
+                }
+            }
+        } else {
+            // No timeout, run indefinitely
+            match analysis_future.await {
+                Ok(_) => {
+                    info!("TR-101 analysis task {} for input {} completed successfully", analysis_id, input_id);
+                },
+                Err(e) => {
+                    error!("TR-101 analysis task {} for input {} failed: {}", analysis_id, input_id, e);
+                }
             }
         }
 

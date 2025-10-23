@@ -1141,9 +1141,17 @@ pub struct AnalysisInfo {
     pub task_handle: JoinHandle<()>,
     pub created_at: std::time::SystemTime,
     pub report_data: Arc<RwLock<Option<AnalysisDataReport>>>, // Latest analysis data
+    pub timeout_minutes: Option<u64>, // Optional timeout in minutes
+    pub expires_at: Option<std::time::SystemTime>, // When the analysis will expire (if timeout is set)
 }
 
 // API request/response models for analysis endpoints
+#[derive(Deserialize)]
+pub struct StartAnalysisRequest {
+    #[serde(default)]
+    pub timeout_minutes: Option<u64>, // Optional timeout in minutes
+}
+
 #[derive(Serialize)]
 pub struct AnalysisStatusResponse {
     pub id: String,
@@ -1151,6 +1159,9 @@ pub struct AnalysisStatusResponse {
     pub input_id: i64,
     pub status: String, // "running", "stopped", "error"
     pub created_at: String, // ISO 8601 format
+    pub timeout_minutes: Option<u64>, // Timeout in minutes (if configured)
+    pub expires_at: Option<String>, // ISO 8601 format (if timeout is set)
+    pub remaining_minutes: Option<u64>, // Minutes remaining until expiration (if timeout is set)
 }
 
 #[derive(Serialize)]
