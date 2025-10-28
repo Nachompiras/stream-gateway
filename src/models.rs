@@ -97,10 +97,48 @@ impl fmt::Display for OutputKind {
 pub struct SrtCommonConfig {
     pub latency_ms: Option<i32>,
     pub stream_id: Option<String>,
-    pub passphrase: Option<String>,    
+    pub passphrase: Option<String>,
+    pub expected_bitrate_kbps: Option<u32>,  // Expected bitrate in Kbps for automatic buffer sizing
+}
+
+// Buffer sizes calculated from bitrate and latency
+#[derive(Debug, Clone)]
+struct BufferSizes {
+    rcv_buf: i32,
+    snd_buf: i32,
+    fc: i32,
+    udp_rcv_buf: i32,
+    udp_snd_buf: i32,
 }
 
 impl SrtCommonConfig {
+    /// Calculate optimal SRT buffer sizes based on bitrate and latency
+    /// Formula: RcvBuf = (Bitrate × Latency × 1.25) / 8
+    fn calculate_buffer_sizes(bitrate_kbps: u32, latency_ms: i32) -> BufferSizes {
+        let bitrate_bps = (bitrate_kbps as f64) * 1000.0;
+        let latency_sec = (latency_ms as f64) / 1000.0;
+
+        // RcvBuf = (Bitrate × Latency × 1.25) / 8
+        // The 1.25 factor provides overhead for retransmissions
+        let rcv_buf = ((bitrate_bps * latency_sec * 1.25) / 8.0) as i32;
+        let snd_buf = rcv_buf;  // Same size for send buffer
+
+        // FC (Flight Flag Size) = buffer size / packet size
+        // Standard SRT packet size is 1316 bytes
+        let fc = rcv_buf / 1316;
+
+        // UDP buffers = 2× SRT buffers to handle burst traffic
+        let udp_rcv_buf = rcv_buf * 2;
+        let udp_snd_buf = snd_buf * 2;
+
+        BufferSizes {
+            rcv_buf,
+            snd_buf,
+            fc,
+            udp_rcv_buf,
+            udp_snd_buf,
+        }
+    }
     /// Devuelve un `srt::Builder` ya pre-configurado con los campos de
     /// `self`.
     pub fn builder(&self) -> srt::SrtBuilder {
@@ -113,12 +151,34 @@ impl SrtCommonConfig {
 
     pub fn async_builder(&self) -> srt::SrtAsyncBuilder {
         let mut b = srt::async_builder();
-        println!("Building SRT async with config: {:?}", self.passphrase);
-        if let Some(lat)  = self.latency_ms { 
-            b = b.set_peer_latency(lat); 
-            b = b.set_receive_latency(lat);            
+
+        if let Some(lat) = self.latency_ms {
+            b = b.set_peer_latency(lat);
+            b = b.set_receive_latency(lat);
+
+            // Calculate and apply buffers if bitrate is specified
+            if let Some(bitrate_kbps) = self.expected_bitrate_kbps {
+                let buffers = Self::calculate_buffer_sizes(bitrate_kbps, lat);
+
+                println!("SRT buffer configuration for {}Kbps @ {}ms latency:", bitrate_kbps, lat);
+                println!("  RcvBuf: {} bytes ({:.2} MB)",
+                         buffers.rcv_buf, buffers.rcv_buf as f64 / 1_048_576.0);
+                println!("  SndBuf: {} bytes ({:.2} MB)",
+                         buffers.snd_buf, buffers.snd_buf as f64 / 1_048_576.0);
+                println!("  FC: {} packets", buffers.fc);
+                println!("  UDP RcvBuf: {} bytes ({:.2} MB)",
+                         buffers.udp_rcv_buf, buffers.udp_rcv_buf as f64 / 1_048_576.0);
+                println!("  UDP SndBuf: {} bytes ({:.2} MB)",
+                         buffers.udp_snd_buf, buffers.udp_snd_buf as f64 / 1_048_576.0);
+
+                b = b.set_receive_buffer(buffers.rcv_buf);
+                b = b.set_send_buffer(buffers.snd_buf);
+                b = b.set_flight_flag_size(buffers.fc);
+                b = b.set_udp_receive_buffer(buffers.udp_rcv_buf);
+                b = b.set_udp_send_buffer(buffers.udp_snd_buf);
+            }
         }
-        
+
         b = b.set_stream_id(self.stream_id.clone());
         b = b.set_passphrase(self.passphrase.clone());
         b.set_live_transmission_type()
@@ -342,6 +402,8 @@ pub enum UpdateSrtInputConfig {
         passphrase: Option<Option<String>>,
         #[serde(default, deserialize_with = "deserialize_optional_string")]
         stream_id: Option<Option<String>>,
+        #[serde(default)]
+        expected_bitrate_kbps: Option<u32>,
     },
     #[serde(rename = "caller")]
     Caller {
@@ -357,6 +419,8 @@ pub enum UpdateSrtInputConfig {
         passphrase: Option<Option<String>>,
         #[serde(default, deserialize_with = "deserialize_optional_string")]
         stream_id: Option<Option<String>>,
+        #[serde(default)]
+        expected_bitrate_kbps: Option<u32>,
     },
 }
 
@@ -402,6 +466,8 @@ pub enum UpdateSrtOutputConfig {
         passphrase: Option<Option<String>>,
         #[serde(default, deserialize_with = "deserialize_optional_string")]
         stream_id: Option<Option<String>>,
+        #[serde(default)]
+        expected_bitrate_kbps: Option<u32>,
     },
     #[serde(rename = "caller")]
     Caller {
@@ -417,6 +483,8 @@ pub enum UpdateSrtOutputConfig {
         passphrase: Option<Option<String>>,
         #[serde(default, deserialize_with = "deserialize_optional_string")]
         stream_id: Option<Option<String>>,
+        #[serde(default)]
+        expected_bitrate_kbps: Option<u32>,
     },
 }
 

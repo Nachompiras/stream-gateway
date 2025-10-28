@@ -408,7 +408,7 @@ fn merge_input_config(current: &CreateInputRequest, update: &UpdateInputRequest)
             let merged_config = match (config, update_config) {
                 (SrtInputConfig::Listener { bind_host, bind_port, common, .. },
                  UpdateSrtInputConfig::Listener { bind_host: new_bind_host, bind_port: new_bind_port,
-                                                  latency_ms, passphrase, stream_id }) => {
+                                                  latency_ms, passphrase, stream_id, expected_bitrate_kbps }) => {
                     SrtInputConfig::Listener {
                         bind_host: new_bind_host.clone().or_else(|| bind_host.clone()),
                         bind_port: new_bind_port.or(*bind_port),
@@ -417,13 +417,14 @@ fn merge_input_config(current: &CreateInputRequest, update: &UpdateInputRequest)
                             latency_ms: latency_ms.or(common.latency_ms),
                             stream_id: merge_optional_field(stream_id, &common.stream_id),
                             passphrase: merge_optional_field(passphrase, &common.passphrase),
+                            expected_bitrate_kbps: expected_bitrate_kbps.or(common.expected_bitrate_kbps),
                         },
                         listen_port: None, // Don't preserve legacy field
                     }
                 },
                 (SrtInputConfig::Caller { remote_host, remote_port, bind_host, common, .. },
                  UpdateSrtInputConfig::Caller { remote_host: new_remote_host, remote_port: new_remote_port,
-                                                bind_host: new_bind_host, latency_ms, passphrase, stream_id }) => {
+                                                bind_host: new_bind_host, latency_ms, passphrase, stream_id, expected_bitrate_kbps }) => {
                     SrtInputConfig::Caller {
                         remote_host: new_remote_host.clone().or_else(|| remote_host.clone()),
                         remote_port: new_remote_port.or(*remote_port),
@@ -432,6 +433,7 @@ fn merge_input_config(current: &CreateInputRequest, update: &UpdateInputRequest)
                             latency_ms: latency_ms.or(common.latency_ms),
                             stream_id: merge_optional_field(stream_id, &common.stream_id),
                             passphrase: merge_optional_field(passphrase, &common.passphrase),
+                            expected_bitrate_kbps: expected_bitrate_kbps.or(common.expected_bitrate_kbps),
                         },
                         target_addr: None, // Don't preserve legacy field
                     }
@@ -1317,7 +1319,7 @@ fn merge_output_config(current: &CreateOutputRequest, update: &UpdateOutputReque
             let merged_config = match (config, update_config) {
                 (SrtOutputConfig::Listener { bind_host, bind_port, common, .. },
                  UpdateSrtOutputConfig::Listener { bind_host: new_bind_host, bind_port: new_bind_port,
-                                                   latency_ms, passphrase, stream_id }) => {
+                                                   latency_ms, passphrase, stream_id, expected_bitrate_kbps }) => {
                     SrtOutputConfig::Listener {
                         bind_host: new_bind_host.clone().or_else(|| bind_host.clone()),
                         bind_port: new_bind_port.or(*bind_port),
@@ -1326,13 +1328,14 @@ fn merge_output_config(current: &CreateOutputRequest, update: &UpdateOutputReque
                             latency_ms: latency_ms.or(common.latency_ms),
                             stream_id: merge_optional_field(stream_id, &common.stream_id),
                             passphrase: merge_optional_field(passphrase, &common.passphrase),
+                            expected_bitrate_kbps: expected_bitrate_kbps.or(common.expected_bitrate_kbps),
                         },
                         listen_port: None, // Don't preserve legacy field
                     }
                 },
                 (SrtOutputConfig::Caller { remote_host, remote_port, bind_host, common, .. },
                  UpdateSrtOutputConfig::Caller { remote_host: new_remote_host, remote_port: new_remote_port,
-                                                 bind_host: new_bind_host, latency_ms, passphrase, stream_id }) => {
+                                                 bind_host: new_bind_host, latency_ms, passphrase, stream_id, expected_bitrate_kbps }) => {
                     SrtOutputConfig::Caller {
                         remote_host: new_remote_host.clone().or_else(|| remote_host.clone()),
                         remote_port: new_remote_port.or(*remote_port),
@@ -1341,6 +1344,7 @@ fn merge_output_config(current: &CreateOutputRequest, update: &UpdateOutputReque
                             latency_ms: latency_ms.or(common.latency_ms),
                             stream_id: merge_optional_field(stream_id, &common.stream_id),
                             passphrase: merge_optional_field(passphrase, &common.passphrase),
+                            expected_bitrate_kbps: expected_bitrate_kbps.or(common.expected_bitrate_kbps),
                         },
                         destination_addr: None, // Don't preserve legacy field
                     }
