@@ -27,6 +27,13 @@ pub fn spawn_srt_output(
     let stats_clone  = stats_cell.clone();
     let state_tx_clone = state_tx.clone();
 
+    // Create log prefix for consistent identification
+    let log_prefix = if let Some(ref name) = output_name {
+        format!("[Output ID:{} \"{}\"]", output_id, name)
+    } else {
+        format!("[Output ID:{}]", output_id)
+    };
+
     let handle = tokio::spawn(
         Abortable::new(async move {
             let mut consecutive_failures = 0u32;
@@ -41,15 +48,21 @@ pub fn spawn_srt_output(
                             Ok(s)  => {
                                 // Connection successful, reset failure counter
                                 consecutive_failures = 0;
+
+                                // Log socket ID for correlation with SRT library logs
+                                let socket_id = s.socket.id;
+                                println!("{} Socket @{}: Connection established", log_prefix, socket_id);
+
                                 s
                             },
                             Err(e) => {
                                 consecutive_failures += 1;
-                                eprintln!("SRT Output: sink.get_socket() error (attempt {}/{}): {}",
-                                    consecutive_failures, MAX_RETRIES, e);
+                                eprintln!("{} Connection error (attempt {}/{}): {}",
+                                    log_prefix, consecutive_failures, MAX_RETRIES, e);
 
                                 if consecutive_failures >= MAX_RETRIES {
-                                    eprintln!("SRT Output: Maximum retry attempts ({}) reached, stopping task", MAX_RETRIES);
+                                    eprintln!("{} Maximum retry attempts ({}) reached, stopping task",
+                                        log_prefix, MAX_RETRIES);
                                     // Notify permanent error state
                                     if let Some(ref tx) = state_tx_clone {
                                         let _ = tx.send(StateChange::OutputStateChanged {
@@ -79,13 +92,16 @@ pub fn spawn_srt_output(
                         }
                     }
                     _ = crate::GLOBAL_CANCEL_TOKEN.cancelled() => {
-                        println!("SRT Output: cancelled by global token");
+                        println!("{} Cancelled by global token", log_prefix);
                         return; // Exit task
                     }
                 };
 
                 // para refrescar stats cada segundo sin segunda tarea
                 let mut next_stats = Instant::now();
+
+                // Store socket ID for logging in the send loop
+                let socket_id = sock.socket.id;
 
                 // 2) Bucle de envío
                 loop {
@@ -102,12 +118,12 @@ pub fn spawn_srt_output(
                                             metrics::record_output_packets(&output_name, input_id, output_id, "srt", 1);
                                         },
                                         Ok(n) => {
-                                            eprintln!("envío parcial: {}/{} bytes", n, pkt.len());
+                                            eprintln!("{} Socket @{}: Partial send {}/{} bytes", log_prefix, socket_id, n, pkt.len());
                                             // Record error metric for partial send
                                             metrics::record_stream_error(&output_name, output_id, "srt", "partial_send");
                                         },
                                         Err(e) => {
-                                            eprintln!("error en envío: {e}");
+                                            eprintln!("{} Socket @{}: Send error: {}", log_prefix, socket_id, e);
                                             // Record error metric for send failure
                                             metrics::record_stream_error(&output_name, output_id, "srt", "send_failed");
                                             // Break to reconnect
@@ -115,12 +131,15 @@ pub fn spawn_srt_output(
                                         }
                                     }
                                 }
-                                Err(broadcast::error::RecvError::Closed) => return,
+                                Err(broadcast::error::RecvError::Closed) => {
+                                    println!("{} Broadcast channel closed", log_prefix);
+                                    return;
+                                },
                                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
                             }
                         }
                         _ = crate::GLOBAL_CANCEL_TOKEN.cancelled() => {
-                            println!("SRT Output: send loop cancelled by global token");
+                            println!("{} Send loop cancelled by global token", log_prefix);
                             return; // Exit task completely
                         }
                     }
@@ -264,7 +283,7 @@ impl SrtSource for SrtSourceWithState {
                 let host = self.config.get_bind_host();
                 let port = self.config.get_bind_port();
                 let addr = format!("{}:{}", host, port);
-                println!("SRT listener ► esperando conexiones en {addr}");
+                println!("[Input ID:{}] SRT listener: waiting for connections on {}", self.input_id, addr);
 
                 // 1) builder asíncrono  (¡no bloquea!)
                 let listener = common
@@ -281,7 +300,9 @@ impl SrtSource for SrtSourceWithState {
                     .await?;                  // <───  100 % async
 
                 let peer_str = peer.to_string();
-                println!("SRT listener: aceptada conexión de {peer_str}");
+                let socket_id = stream_async.socket.id;
+                println!("[Input ID:{}] SRT listener Socket @{}: Accepted connection from {}",
+                    self.input_id, socket_id, peer_str);
 
                 // Notify connected state with source address
                 if let Some(ref tx) = self.state_tx {
@@ -323,7 +344,7 @@ impl SrtSource for SrtSourceWithState {
                         let bind_addr = format!("{}:0", bind_host); // Use port 0 for automatic assignment
                         // Note: SRT library may not support local bind for callers in all versions
                         // This is a placeholder for when the feature is available
-                        println!("SRT Caller: attempting to bind to local address {}", bind_addr);
+                        println!("[Input ID:{}] SRT caller: attempting to bind to local address {}", self.input_id, bind_addr);
                         // builder = builder.set_local_addr(&bind_addr); // Uncomment if supported
                     }
                 }
@@ -333,7 +354,8 @@ impl SrtSource for SrtSourceWithState {
                     .await
                     .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
-                println!("Caller: conectado a {addr}");
+                let socket_id = stream_async.socket.id;
+                println!("[Input ID:{}] SRT caller Socket @{}: Connected to {}", self.input_id, socket_id, addr);
 
                 // Notify connected state
                 if let Some(ref tx) = self.state_tx {
@@ -383,7 +405,7 @@ impl SrtSink for SrtSinkWithState {
                 if let Some(bind_host) = bind_host {
                     if !bind_host.is_empty() && bind_host != "0.0.0.0" {
                         let bind_addr = format!("{}:0", bind_host); // Use port 0 for automatic assignment
-                        println!("SRT Output Caller: attempting to bind to local address {}", bind_addr);
+                        println!("[Output ID:{}] SRT caller: attempting to bind to local address {}", self.output_id, bind_addr);
                         // builder = builder.set_local_addr(&bind_addr); // Uncomment if supported
                     }
                 }
@@ -393,7 +415,8 @@ impl SrtSink for SrtSinkWithState {
                     .await
                     .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
-                println!("Caller: conectado a {addr}");
+                let socket_id = stream_async.socket.id;
+                println!("[Output ID:{}] SRT caller Socket @{}: Connected to {}", self.output_id, socket_id, addr);
 
                 // Notify connected state
                 if let Some(ref tx) = self.state_tx {
@@ -438,7 +461,7 @@ impl SrtSink for SrtSinkWithState {
                     .listen(&bind, 2, None)
                     .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
-                println!("output listener ► esperando conexiones en {}", bind);
+                println!("[Output ID:{}] SRT listener: waiting for connections on {}", self.output_id, bind);
 
                 // await on accept() - fully async
                 let (stream_async, peer) = listener
@@ -446,7 +469,9 @@ impl SrtSink for SrtSinkWithState {
                     .await?;
 
                 let peer_str = peer.to_string();
-                println!("output listener ► peer {peer_str}");
+                let socket_id = stream_async.socket.id;
+                println!("[Output ID:{}] SRT listener Socket @{}: Accepted connection from {}",
+                    self.output_id, socket_id, peer_str);
 
                 // Notify peer address when connected
                 if let Some(ref tx) = self.state_tx {
@@ -486,6 +511,13 @@ impl Forwarder {
         let state_tx_clone = state_tx.clone();
         let input_name_clone = input_name.clone();
 
+        // Create log prefix for consistent identification
+        let log_prefix = if let Some(ref name) = input_name {
+            format!("[Input ID:{} \"{}\"]", input_id, name)
+        } else {
+            format!("[Input ID:{}]", input_id)
+        };
+
         let handle: JoinHandle<()> = tokio::spawn(async move {
             let mut buf = vec![0u8; 65536]; // buffer de lectura
             let mut consecutive_failures = 0u32;
@@ -503,16 +535,22 @@ impl Forwarder {
                             Ok(s)  => {
                                 // Connection successful, reset failure counter
                                 consecutive_failures = 0;
+
+                                // Log socket ID for correlation with SRT library logs
+                                let socket_id = s.socket.id;
+                                println!("{} Socket @{}: SRT session opened", log_prefix, socket_id);
+
                                 // Note: State notification (Connected with source_address) is already sent by get_socket()
                                 s
                             },
                             Err(e) => {
                                 consecutive_failures += 1;
-                                eprintln!("Forwarder: get_socket() error (attempt {}/{}): {}",
-                                    consecutive_failures, MAX_RETRIES, e);
+                                eprintln!("{} Connection error (attempt {}/{}): {}",
+                                    log_prefix, consecutive_failures, MAX_RETRIES, e);
 
                                 if consecutive_failures >= MAX_RETRIES {
-                                    eprintln!("Forwarder: Maximum retry attempts ({}) reached, stopping task", MAX_RETRIES);
+                                    eprintln!("{} Maximum retry attempts ({}) reached, stopping task",
+                                        log_prefix, MAX_RETRIES);
                                     // Notify permanent error state
                                     if let Some(ref tx) = state_tx_clone {
                                         let _ = tx.send(StateChange::InputStateChanged {
@@ -540,14 +578,16 @@ impl Forwarder {
                         }
                     }
                     _ = crate::GLOBAL_CANCEL_TOKEN.cancelled() => {
-                        println!("Forwarder: cancelled by global token");
+                        println!("{} Cancelled by global token", log_prefix);
                         return; // Exit task
                     }
                 };
-                println!("Forwarder: sesión SRT abierta ✅");
 
                 // para refrescar stats cada segundo sin segunda tarea
                 let mut next_stats = Instant::now();
+
+                // Store socket ID for logging in the read loop
+                let socket_id = sock.socket.id;
 
                 // --------------------------------------------------------
                 // bucle de lectura del socket
@@ -559,7 +599,7 @@ impl Forwarder {
                             //2) cada 1 s pedir bistats
                             if next_stats.elapsed() >= Duration::from_secs(1) {
                                 if let Ok(s) = sock.socket.srt_bistats(0, 1) {
-                                    //println!("Forwarder: SRT stats: {s:?}");
+                                    //println!("{} Socket @{}: SRT stats: {:?}", log_prefix, socket_id, s);
                                     *stats_clone.write().await = Some(InputStats::Srt(Box::new(s)));
                                 }
                                 next_stats = Instant::now();
@@ -568,7 +608,7 @@ impl Forwarder {
                             // 3) procesar resultado de la lectura
                             match read_res {
                                 Ok(0) => {
-                                    println!("Forwarder: EOF, peer cerró");
+                                    println!("{} Socket @{}: EOF, peer closed connection", log_prefix, socket_id);
                                     break;
                                 }
                                 Ok(n) => {
@@ -580,13 +620,13 @@ impl Forwarder {
                                     let _ = tx_clone.send(Bytes::copy_from_slice(&buf[..n]));
                                 }
                                 Err(e) => {
-                                    println!("Forwarder: error recv(): {e}");
+                                    eprintln!("{} Socket @{}: Read error: {}", log_prefix, socket_id, e);
                                     break;
                                 }
                             }
                         }
                         _ = crate::GLOBAL_CANCEL_TOKEN.cancelled() => {
-                            println!("Forwarder: read loop cancelled by global token");
+                            println!("{} Read loop cancelled by global token", log_prefix);
                             return; // Exit task completely
                         }
                     }
@@ -603,11 +643,10 @@ impl Forwarder {
                 }
 
                 println!(
-                    "Forwarder: reconectando en {:?}…",
-                    reconnect_delay
+                    "{} Socket @{}: Connection closed, reconnecting in {:?}",
+                    log_prefix, socket_id, reconnect_delay
                 );
                 sleep(reconnect_delay).await;
-                println!("Forwarder: sesión SRT cerrada ❌");
             }
         });
 
