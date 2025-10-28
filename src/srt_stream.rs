@@ -146,8 +146,10 @@ pub fn spawn_srt_output(
 
                     if next_stats.elapsed() >= Duration::from_secs(1) {
                         if let Ok(s) = sock.socket.srt_bistats(0, 1) {
-                            //println!("Output: SRT stats: {s:?}");                            
+                            //println!("Output: SRT stats: {s:?}");
                             *stats_clone.write().await = Some(InputStats::Srt(Box::new(s)));
+                            // Record SRT metrics for Prometheus
+                            metrics::record_srt_stats(&output_name, output_id, "srt", "output", &s);
                             //using try_write to avoid blocking
                             // if let Ok(mut guard) = stats_clone.try_write() {
                             //     *guard = Some(InputStats::Srt(Box::new(s)));
@@ -601,6 +603,8 @@ impl Forwarder {
                                 if let Ok(s) = sock.socket.srt_bistats(0, 1) {
                                     //println!("{} Socket @{}: SRT stats: {:?}", log_prefix, socket_id, s);
                                     *stats_clone.write().await = Some(InputStats::Srt(Box::new(s)));
+                                    // Record SRT metrics for Prometheus
+                                    metrics::record_srt_stats(&input_name_clone, input_id, "srt", "input", &s);
                                 }
                                 next_stats = Instant::now();
                             }

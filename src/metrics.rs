@@ -93,6 +93,237 @@ pub static CONNECTION_DURATIONS: Lazy<HistogramVec> = Lazy::new(|| {
     histogram
 });
 
+// ==================== SRT-specific metrics ====================
+
+// SRT Traffic metrics (Gauges for cumulative values reported by SRT)
+pub static SRT_PACKETS_SENT_TOTAL: Lazy<GaugeVec> = Lazy::new(|| {
+    let gauge = GaugeVec::new(
+        prometheus::Opts::new("srt_packets_sent_total", "Total SRT packets sent (cumulative from SRT stats)"),
+        &["stream_name", "stream_id", "stream_type", "direction"]
+    ).unwrap();
+    METRICS_REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
+pub static SRT_PACKETS_RECEIVED_TOTAL: Lazy<GaugeVec> = Lazy::new(|| {
+    let gauge = GaugeVec::new(
+        prometheus::Opts::new("srt_packets_received_total", "Total SRT packets received (cumulative from SRT stats)"),
+        &["stream_name", "stream_id", "stream_type", "direction"]
+    ).unwrap();
+    METRICS_REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
+pub static SRT_BYTES_SENT_TOTAL: Lazy<GaugeVec> = Lazy::new(|| {
+    let gauge = GaugeVec::new(
+        prometheus::Opts::new("srt_bytes_sent_total", "Total SRT bytes sent (cumulative from SRT stats)"),
+        &["stream_name", "stream_id", "stream_type", "direction"]
+    ).unwrap();
+    METRICS_REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
+pub static SRT_BYTES_RECEIVED_TOTAL: Lazy<GaugeVec> = Lazy::new(|| {
+    let gauge = GaugeVec::new(
+        prometheus::Opts::new("srt_bytes_received_total", "Total SRT bytes received (cumulative from SRT stats)"),
+        &["stream_name", "stream_id", "stream_type", "direction"]
+    ).unwrap();
+    METRICS_REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
+// SRT Quality/Loss metrics
+pub static SRT_PACKETS_LOST_SENT_TOTAL: Lazy<GaugeVec> = Lazy::new(|| {
+    let gauge = GaugeVec::new(
+        prometheus::Opts::new("srt_packets_lost_sent_total", "Total SRT packets lost during sending"),
+        &["stream_name", "stream_id", "stream_type", "direction"]
+    ).unwrap();
+    METRICS_REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
+pub static SRT_PACKETS_LOST_RECEIVED_TOTAL: Lazy<GaugeVec> = Lazy::new(|| {
+    let gauge = GaugeVec::new(
+        prometheus::Opts::new("srt_packets_lost_received_total", "Total SRT packets lost during receiving"),
+        &["stream_name", "stream_id", "stream_type", "direction"]
+    ).unwrap();
+    METRICS_REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
+pub static SRT_PACKETS_RETRANSMITTED_TOTAL: Lazy<GaugeVec> = Lazy::new(|| {
+    let gauge = GaugeVec::new(
+        prometheus::Opts::new("srt_packets_retransmitted_total", "Total SRT packets retransmitted"),
+        &["stream_name", "stream_id", "stream_type", "direction"]
+    ).unwrap();
+    METRICS_REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
+pub static SRT_PACKETS_DROPPED_SENT_TOTAL: Lazy<GaugeVec> = Lazy::new(|| {
+    let gauge = GaugeVec::new(
+        prometheus::Opts::new("srt_packets_dropped_sent_total", "Total SRT packets dropped during sending"),
+        &["stream_name", "stream_id", "stream_type", "direction"]
+    ).unwrap();
+    METRICS_REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
+pub static SRT_PACKETS_DROPPED_RECEIVED_TOTAL: Lazy<GaugeVec> = Lazy::new(|| {
+    let gauge = GaugeVec::new(
+        prometheus::Opts::new("srt_packets_dropped_received_total", "Total SRT packets dropped during receiving"),
+        &["stream_name", "stream_id", "stream_type", "direction"]
+    ).unwrap();
+    METRICS_REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
+pub static SRT_BYTES_LOST_RECEIVED_TOTAL: Lazy<GaugeVec> = Lazy::new(|| {
+    let gauge = GaugeVec::new(
+        prometheus::Opts::new("srt_bytes_lost_received_total", "Total SRT bytes lost during receiving"),
+        &["stream_name", "stream_id", "stream_type", "direction"]
+    ).unwrap();
+    METRICS_REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
+pub static SRT_BYTES_DROPPED_SENT_TOTAL: Lazy<GaugeVec> = Lazy::new(|| {
+    let gauge = GaugeVec::new(
+        prometheus::Opts::new("srt_bytes_dropped_sent_total", "Total SRT bytes dropped during sending"),
+        &["stream_name", "stream_id", "stream_type", "direction"]
+    ).unwrap();
+    METRICS_REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
+pub static SRT_BYTES_DROPPED_RECEIVED_TOTAL: Lazy<GaugeVec> = Lazy::new(|| {
+    let gauge = GaugeVec::new(
+        prometheus::Opts::new("srt_bytes_dropped_received_total", "Total SRT bytes dropped during receiving"),
+        &["stream_name", "stream_id", "stream_type", "direction"]
+    ).unwrap();
+    METRICS_REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
+// SRT Performance metrics
+pub static SRT_SEND_RATE_MBPS: Lazy<GaugeVec> = Lazy::new(|| {
+    let gauge = GaugeVec::new(
+        prometheus::Opts::new("srt_send_rate_mbps", "SRT sending rate in Mbps"),
+        &["stream_name", "stream_id", "stream_type", "direction"]
+    ).unwrap();
+    METRICS_REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
+pub static SRT_RECEIVE_RATE_MBPS: Lazy<GaugeVec> = Lazy::new(|| {
+    let gauge = GaugeVec::new(
+        prometheus::Opts::new("srt_receive_rate_mbps", "SRT receiving rate in Mbps"),
+        &["stream_name", "stream_id", "stream_type", "direction"]
+    ).unwrap();
+    METRICS_REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
+pub static SRT_RTT_MS: Lazy<GaugeVec> = Lazy::new(|| {
+    let gauge = GaugeVec::new(
+        prometheus::Opts::new("srt_rtt_ms", "SRT Round Trip Time in milliseconds"),
+        &["stream_name", "stream_id", "stream_type", "direction"]
+    ).unwrap();
+    METRICS_REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
+pub static SRT_BANDWIDTH_MBPS: Lazy<GaugeVec> = Lazy::new(|| {
+    let gauge = GaugeVec::new(
+        prometheus::Opts::new("srt_bandwidth_mbps", "SRT estimated bandwidth in Mbps"),
+        &["stream_name", "stream_id", "stream_type", "direction"]
+    ).unwrap();
+    METRICS_REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
+pub static SRT_FLIGHT_SIZE_PACKETS: Lazy<GaugeVec> = Lazy::new(|| {
+    let gauge = GaugeVec::new(
+        prometheus::Opts::new("srt_flight_size_packets", "SRT number of packets in flight"),
+        &["stream_name", "stream_id", "stream_type", "direction"]
+    ).unwrap();
+    METRICS_REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
+// SRT Buffer metrics
+pub static SRT_SEND_BUFFER_PACKETS: Lazy<GaugeVec> = Lazy::new(|| {
+    let gauge = GaugeVec::new(
+        prometheus::Opts::new("srt_send_buffer_packets", "SRT send buffer size in packets"),
+        &["stream_name", "stream_id", "stream_type", "direction"]
+    ).unwrap();
+    METRICS_REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
+pub static SRT_SEND_BUFFER_BYTES: Lazy<GaugeVec> = Lazy::new(|| {
+    let gauge = GaugeVec::new(
+        prometheus::Opts::new("srt_send_buffer_bytes", "SRT send buffer size in bytes"),
+        &["stream_name", "stream_id", "stream_type", "direction"]
+    ).unwrap();
+    METRICS_REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
+pub static SRT_SEND_BUFFER_MS: Lazy<GaugeVec> = Lazy::new(|| {
+    let gauge = GaugeVec::new(
+        prometheus::Opts::new("srt_send_buffer_ms", "SRT send buffer size in milliseconds"),
+        &["stream_name", "stream_id", "stream_type", "direction"]
+    ).unwrap();
+    METRICS_REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
+pub static SRT_RECEIVE_BUFFER_PACKETS: Lazy<GaugeVec> = Lazy::new(|| {
+    let gauge = GaugeVec::new(
+        prometheus::Opts::new("srt_receive_buffer_packets", "SRT receive buffer size in packets"),
+        &["stream_name", "stream_id", "stream_type", "direction"]
+    ).unwrap();
+    METRICS_REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
+pub static SRT_RECEIVE_BUFFER_BYTES: Lazy<GaugeVec> = Lazy::new(|| {
+    let gauge = GaugeVec::new(
+        prometheus::Opts::new("srt_receive_buffer_bytes", "SRT receive buffer size in bytes"),
+        &["stream_name", "stream_id", "stream_type", "direction"]
+    ).unwrap();
+    METRICS_REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
+pub static SRT_RECEIVE_BUFFER_MS: Lazy<GaugeVec> = Lazy::new(|| {
+    let gauge = GaugeVec::new(
+        prometheus::Opts::new("srt_receive_buffer_ms", "SRT receive buffer size in milliseconds"),
+        &["stream_name", "stream_id", "stream_type", "direction"]
+    ).unwrap();
+    METRICS_REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
+pub static SRT_SEND_BUFFER_AVAILABLE_BYTES: Lazy<GaugeVec> = Lazy::new(|| {
+    let gauge = GaugeVec::new(
+        prometheus::Opts::new("srt_send_buffer_available_bytes", "SRT send buffer available space in bytes"),
+        &["stream_name", "stream_id", "stream_type", "direction"]
+    ).unwrap();
+    METRICS_REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
+pub static SRT_RECEIVE_BUFFER_AVAILABLE_BYTES: Lazy<GaugeVec> = Lazy::new(|| {
+    let gauge = GaugeVec::new(
+        prometheus::Opts::new("srt_receive_buffer_available_bytes", "SRT receive buffer available space in bytes"),
+        &["stream_name", "stream_id", "stream_type", "direction"]
+    ).unwrap();
+    METRICS_REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
 // Utility functions for metrics collection
 pub fn get_metrics_text() -> Result<String, prometheus::Error> {
     let encoder = TextEncoder::new();
@@ -241,4 +472,126 @@ pub fn record_connection_duration_event(
     CONNECTION_DURATIONS
         .with_label_values(&[normalized_name.as_str(), stream_type, direction])
         .observe(duration_seconds);
+}
+
+// Record SRT statistics from SrtStats structure
+pub fn record_srt_stats(
+    stream_name: &Option<String>,
+    stream_id: i64,
+    stream_type: &str,
+    direction: &str,
+    stats: &srt_rs::SrtStats
+) {
+    let normalized_name = normalize_stream_name(stream_name, stream_id);
+    let stream_id_str = stream_id.to_string();
+    let labels = &[
+        normalized_name.as_str(),
+        stream_id_str.as_str(),
+        stream_type,
+        direction
+    ];
+
+    // Traffic metrics - cumulative counters from SRT
+    SRT_PACKETS_SENT_TOTAL
+        .with_label_values(labels)
+        .set(stats.pktSentTotal as f64);
+
+    SRT_PACKETS_RECEIVED_TOTAL
+        .with_label_values(labels)
+        .set(stats.pktRecvTotal as f64);
+
+    SRT_BYTES_SENT_TOTAL
+        .with_label_values(labels)
+        .set(stats.byteSentTotal as f64);
+
+    SRT_BYTES_RECEIVED_TOTAL
+        .with_label_values(labels)
+        .set(stats.byteRecvTotal as f64);
+
+    // Quality/Loss metrics
+    SRT_PACKETS_LOST_SENT_TOTAL
+        .with_label_values(labels)
+        .set(stats.pktSndLossTotal as f64);
+
+    SRT_PACKETS_LOST_RECEIVED_TOTAL
+        .with_label_values(labels)
+        .set(stats.pktRcvLossTotal as f64);
+
+    SRT_PACKETS_RETRANSMITTED_TOTAL
+        .with_label_values(labels)
+        .set(stats.pktRetransTotal as f64);
+
+    SRT_PACKETS_DROPPED_SENT_TOTAL
+        .with_label_values(labels)
+        .set(stats.pktSndDropTotal as f64);
+
+    SRT_PACKETS_DROPPED_RECEIVED_TOTAL
+        .with_label_values(labels)
+        .set(stats.pktRcvDropTotal as f64);
+
+    SRT_BYTES_LOST_RECEIVED_TOTAL
+        .with_label_values(labels)
+        .set(stats.byteRcvLossTotal as f64);
+
+    SRT_BYTES_DROPPED_SENT_TOTAL
+        .with_label_values(labels)
+        .set(stats.byteSndDropTotal as f64);
+
+    SRT_BYTES_DROPPED_RECEIVED_TOTAL
+        .with_label_values(labels)
+        .set(stats.byteRcvDropTotal as f64);
+
+    // Performance metrics - instantaneous gauges
+    SRT_SEND_RATE_MBPS
+        .with_label_values(labels)
+        .set(stats.mbpsSendRate);
+
+    SRT_RECEIVE_RATE_MBPS
+        .with_label_values(labels)
+        .set(stats.mbpsRecvRate);
+
+    SRT_RTT_MS
+        .with_label_values(labels)
+        .set(stats.msRTT);
+
+    SRT_BANDWIDTH_MBPS
+        .with_label_values(labels)
+        .set(stats.mbpsBandwidth);
+
+    SRT_FLIGHT_SIZE_PACKETS
+        .with_label_values(labels)
+        .set(stats.pktFlightSize as f64);
+
+    // Buffer metrics
+    SRT_SEND_BUFFER_PACKETS
+        .with_label_values(labels)
+        .set(stats.pktSndBuf as f64);
+
+    SRT_SEND_BUFFER_BYTES
+        .with_label_values(labels)
+        .set(stats.byteSndBuf as f64);
+
+    SRT_SEND_BUFFER_MS
+        .with_label_values(labels)
+        .set(stats.msSndBuf as f64);
+
+    SRT_RECEIVE_BUFFER_PACKETS
+        .with_label_values(labels)
+        .set(stats.pktRcvBuf as f64);
+
+    SRT_RECEIVE_BUFFER_BYTES
+        .with_label_values(labels)
+        .set(stats.byteRcvBuf as f64);
+
+    SRT_RECEIVE_BUFFER_MS
+        .with_label_values(labels)
+        .set(stats.msRcvBuf as f64);
+
+    SRT_SEND_BUFFER_AVAILABLE_BYTES
+        .with_label_values(labels)
+        .set(stats.byteAvailSndBuf as f64);
+
+    SRT_RECEIVE_BUFFER_AVAILABLE_BYTES
+        .with_label_values(labels)
+        .set(stats.byteAvailRcvBuf as f64);
 }
