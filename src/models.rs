@@ -93,12 +93,22 @@ impl fmt::Display for OutputKind {
     }
 }
 
+// FEC (Forward Error Correction) configuration for SRT streams
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct FecConfig {
+    pub cols: u32,                    // Number of columns (data packets per FEC block)
+    pub rows: u32,                    // Number of rows (determines redundancy: rows/cols = % overhead)
+    pub arq_level: Option<u32>,       // ARQ level: None (default), Some(0) (never), Some(1) (onreq), Some(2) (always)
+    pub staircase: bool,              // Use staircase layout for better burst loss recovery
+}
+
 #[derive(Serialize,Deserialize, Debug, Clone, Default)]
 pub struct SrtCommonConfig {
     pub latency_ms: Option<i32>,
     pub stream_id: Option<String>,
     pub passphrase: Option<String>,
     pub expected_bitrate_kbps: Option<u32>,  // Expected bitrate in Kbps for automatic buffer sizing
+    pub fec: Option<FecConfig>,       // Optional FEC configuration
 }
 
 // Buffer sizes calculated from bitrate and latency
@@ -177,6 +187,18 @@ impl SrtCommonConfig {
                 b = b.set_udp_receive_buffer(buffers.udp_rcv_buf);
                 b = b.set_udp_send_buffer(buffers.udp_snd_buf);
             }
+        }
+
+        // Apply FEC configuration if specified
+        if let Some(ref fec) = self.fec {
+            println!("SRT FEC configuration: cols={}, rows={}, arq_level={:?}, staircase={}",
+                     fec.cols, fec.rows, fec.arq_level, fec.staircase);
+
+            // Calculate FEC overhead percentage
+            let overhead_pct = (fec.rows as f64 / fec.cols as f64) * 100.0;
+            println!("  FEC overhead: {:.1}%", overhead_pct);
+
+            b = b.set_fec_config(fec.cols, fec.rows, fec.arq_level, fec.staircase);
         }
 
         b = b.set_stream_id(self.stream_id.clone());
@@ -404,6 +426,8 @@ pub enum UpdateSrtInputConfig {
         stream_id: Option<Option<String>>,
         #[serde(default)]
         expected_bitrate_kbps: Option<u32>,
+        #[serde(default)]
+        fec: Option<FecConfig>,
     },
     #[serde(rename = "caller")]
     Caller {
@@ -421,6 +445,8 @@ pub enum UpdateSrtInputConfig {
         stream_id: Option<Option<String>>,
         #[serde(default)]
         expected_bitrate_kbps: Option<u32>,
+        #[serde(default)]
+        fec: Option<FecConfig>,
     },
 }
 
@@ -468,6 +494,8 @@ pub enum UpdateSrtOutputConfig {
         stream_id: Option<Option<String>>,
         #[serde(default)]
         expected_bitrate_kbps: Option<u32>,
+        #[serde(default)]
+        fec: Option<FecConfig>,
     },
     #[serde(rename = "caller")]
     Caller {
@@ -485,6 +513,8 @@ pub enum UpdateSrtOutputConfig {
         stream_id: Option<Option<String>>,
         #[serde(default)]
         expected_bitrate_kbps: Option<u32>,
+        #[serde(default)]
+        fec: Option<FecConfig>,
     },
 }
 
