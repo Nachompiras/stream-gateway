@@ -529,6 +529,8 @@ pub struct InputResponse {
     pub source_address: Option<String>, // Address of connected source (for SRT listeners)
     pub bitrate_bps: Option<u64>, // Bitrate in bits per second
     pub error_message: Option<String>, // Error message if stream is in error state
+    pub expected_bitrate_kbps: Option<u32>, // Expected bitrate in Kbps (for SRT streams)
+    pub fec_config: Option<FecConfig>, // FEC configuration (for SRT streams)
 }
 
 #[derive(Serialize)]
@@ -544,6 +546,8 @@ pub struct OutputResponse {
     pub peer_address: Option<String>, // Address of connected peer (for SRT listeners)
     pub bitrate_bps: Option<u64>, // Bitrate in bits per second
     pub error_message: Option<String>, // Error message if output is in error state
+    pub expected_bitrate_kbps: Option<u32>, // Expected bitrate in Kbps (for SRT streams)
+    pub fec_config: Option<FecConfig>, // FEC configuration (for SRT streams)
 }
 
 // New response models for CRUD endpoints
@@ -558,6 +562,8 @@ pub struct InputListResponse {
     pub uptime_seconds: Option<u64>, // Uptime in seconds, None if stopped
     pub source_address: Option<String>, // Address of connected source (for SRT listeners)
     pub error_message: Option<String>, // Error message if stream is in error state
+    pub expected_bitrate_kbps: Option<u32>, // Expected bitrate in Kbps (for SRT streams)
+    pub fec_config: Option<FecConfig>, // FEC configuration (for SRT streams)
 }
 
 #[derive(Serialize)]
@@ -572,6 +578,8 @@ pub struct InputDetailResponse {
     pub source_address: Option<String>, // Address of connected source (for SRT listeners)
     pub config: Option<String>, // Full configuration JSON from database
     pub error_message: Option<String>, // Error message if stream is in error state
+    pub expected_bitrate_kbps: Option<u32>, // Expected bitrate in Kbps (for SRT streams)
+    pub fec_config: Option<FecConfig>, // FEC configuration (for SRT streams)
 }
 
 #[derive(Serialize)]
@@ -587,6 +595,8 @@ pub struct OutputDetailResponse {
     pub uptime_seconds: Option<u64>, // Uptime in seconds, None if stopped
     pub peer_address: Option<String>, // Address of connected peer (for SRT listeners)
     pub error_message: Option<String>, // Error message if output is in error state
+    pub expected_bitrate_kbps: Option<u32>, // Expected bitrate in Kbps (for SRT streams)
+    pub fec_config: Option<FecConfig>, // FEC configuration (for SRT streams)
 }
 
 #[derive(Serialize)]
@@ -603,6 +613,8 @@ pub struct OutputListResponse {
     pub peer_address: Option<String>, // Address of connected peer (for SRT listeners)
     pub error_message: Option<String>, // Error message if output is in error state
     pub config: Option<String>, // Full configuration JSON from database
+    pub expected_bitrate_kbps: Option<u32>, // Expected bitrate in Kbps (for SRT streams)
+    pub fec_config: Option<FecConfig>, // FEC configuration (for SRT streams)
 }
 
 /* SRT models */
@@ -800,6 +812,24 @@ impl CreateInputRequest {
             CreateInputRequest::Spts { .. } => None, // SPTS inputs don't have remote ports
         }
     }
+
+    /// Get expected bitrate for SRT streams
+    pub fn get_expected_bitrate_kbps(&self) -> Option<u32> {
+        match self {
+            CreateInputRequest::Udp { .. } => None, // UDP inputs don't have bitrate config
+            CreateInputRequest::Srt { config, .. } => config.get_expected_bitrate_kbps(),
+            CreateInputRequest::Spts { .. } => None, // SPTS inputs don't have bitrate config
+        }
+    }
+
+    /// Get FEC configuration for SRT streams
+    pub fn get_fec_config(&self) -> Option<FecConfig> {
+        match self {
+            CreateInputRequest::Udp { .. } => None, // UDP inputs don't have FEC
+            CreateInputRequest::Srt { config, .. } => config.get_fec_config(),
+            CreateInputRequest::Spts { .. } => None, // SPTS inputs don't have FEC
+        }
+    }
 }
 
 impl SrtInputConfig {
@@ -894,6 +924,22 @@ impl SrtInputConfig {
             },
         }
     }
+
+    /// Get expected bitrate for SRT streams
+    pub fn get_expected_bitrate_kbps(&self) -> Option<u32> {
+        match self {
+            SrtInputConfig::Listener { common, .. } => common.expected_bitrate_kbps,
+            SrtInputConfig::Caller { common, .. } => common.expected_bitrate_kbps,
+        }
+    }
+
+    /// Get FEC configuration for SRT streams
+    pub fn get_fec_config(&self) -> Option<FecConfig> {
+        match self {
+            SrtInputConfig::Listener { common, .. } => common.fec.clone(),
+            SrtInputConfig::Caller { common, .. } => common.fec.clone(),
+        }
+    }
 }
 
 impl CreateOutputRequest {
@@ -971,6 +1017,22 @@ impl CreateOutputRequest {
         match self {
             CreateOutputRequest::Udp { bind_host, .. } => bind_host.clone(), // UDP outputs can bind to specific interface
             CreateOutputRequest::Srt { config, .. } => config.get_bind_host(),
+        }
+    }
+
+    /// Get expected bitrate for SRT streams
+    pub fn get_expected_bitrate_kbps(&self) -> Option<u32> {
+        match self {
+            CreateOutputRequest::Udp { .. } => None, // UDP outputs don't have bitrate config
+            CreateOutputRequest::Srt { config, .. } => config.get_expected_bitrate_kbps(),
+        }
+    }
+
+    /// Get FEC configuration for SRT streams
+    pub fn get_fec_config(&self) -> Option<FecConfig> {
+        match self {
+            CreateOutputRequest::Udp { .. } => None, // UDP outputs don't have FEC
+            CreateOutputRequest::Srt { config, .. } => config.get_fec_config(),
         }
     }
 }
@@ -1064,6 +1126,22 @@ impl SrtOutputConfig {
                 Some(bind_host.clone().unwrap_or_else(|| "0.0.0.0".to_string()))
             },
             SrtOutputConfig::Caller { .. } => None,
+        }
+    }
+
+    /// Get expected bitrate for SRT streams
+    pub fn get_expected_bitrate_kbps(&self) -> Option<u32> {
+        match self {
+            SrtOutputConfig::Listener { common, .. } => common.expected_bitrate_kbps,
+            SrtOutputConfig::Caller { common, .. } => common.expected_bitrate_kbps,
+        }
+    }
+
+    /// Get FEC configuration for SRT streams
+    pub fn get_fec_config(&self) -> Option<FecConfig> {
+        match self {
+            SrtOutputConfig::Listener { common, .. } => common.fec.clone(),
+            SrtOutputConfig::Caller { common, .. } => common.fec.clone(),
         }
     }
 }

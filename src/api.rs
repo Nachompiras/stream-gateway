@@ -25,8 +25,8 @@ use std::net::{IpAddr};
 pub type InputsMap = std::collections::HashMap<i64, InputInfo>;
 
 // Type alias for input snapshot data used in list_inputs endpoint
-// Represents: (id, name, kind, output_count, status, assigned_port, connected_at, source_address, error_message)
-type InputSnapshot = (i64, Option<String>, String, usize, StreamStatus, Option<u16>, Option<SystemTime>, Option<String>, Option<String>);
+// Represents: (id, name, kind, output_count, status, assigned_port, connected_at, source_address, error_message, expected_bitrate_kbps, fec_config)
+type InputSnapshot = (i64, Option<String>, String, usize, StreamStatus, Option<u16>, Option<SystemTime>, Option<String>, Option<String>, Option<u32>, Option<FecConfig>);
 
 pub struct AppState {
     pub pool: sqlx::SqlitePool,
@@ -792,13 +792,15 @@ pub async fn list_inputs(_state: web::Data<AppState>) -> ActixResult<impl Respon
                 input_info.connected_at,
                 input_info.source_address.clone(),
                 input_info.error_message.clone(),
+                input_info.config.get_expected_bitrate_kbps(),
+                input_info.config.get_fec_config(),
             )
         }).collect()
     }; // Lock released here
 
     let mut response: Vec<InputListResponse> = Vec::new();
 
-    for (input_id, name, kind, output_count, status, assigned_port, connected_at, source_address, error_message) in inputs_snapshot {
+    for (input_id, name, kind, output_count, status, assigned_port, connected_at, source_address, error_message, expected_bitrate_kbps, fec_config) in inputs_snapshot {
         let input_type = input_type_display_string(&kind).to_string();
 
         response.push(InputListResponse {
@@ -811,6 +813,8 @@ pub async fn list_inputs(_state: web::Data<AppState>) -> ActixResult<impl Respon
             uptime_seconds: calculate_connection_uptime(&status, connected_at),
             source_address,
             error_message,
+            expected_bitrate_kbps,
+            fec_config,
         });
     }
 
@@ -866,6 +870,8 @@ pub async fn get_input(
                 uptime_seconds: calculate_connection_uptime(&output_info.status, output_info.connected_at),
                 peer_address: output_info.peer_address.clone(),
                 error_message: output_info.error_message.clone(),
+                expected_bitrate_kbps: output_info.config.get_expected_bitrate_kbps(),
+                fec_config: output_info.config.get_fec_config(),
             });
         }
 
@@ -914,6 +920,8 @@ pub async fn get_input(
                 uptime_seconds: None,
                 peer_address: None,
                 error_message: None,
+                expected_bitrate_kbps: output_config.get_expected_bitrate_kbps(),
+                fec_config: output_config.get_fec_config(),
             });
         }
 
@@ -939,6 +947,8 @@ pub async fn get_input(
             source_address: input_info.source_address.clone(),
             config: config_json,
             error_message: input_info.error_message.clone(),
+            expected_bitrate_kbps: input_info.config.get_expected_bitrate_kbps(),
+            fec_config: input_info.config.get_fec_config(),
         };
 
         Ok(HttpResponse::Ok().json(response))
@@ -969,6 +979,8 @@ pub async fn list_outputs(_state: web::Data<AppState>) -> ActixResult<impl Respo
                     connected_at: output_info.connected_at,
                     peer_address: output_info.peer_address.clone(),
                     error_message: output_info.error_message.clone(),
+                    expected_bitrate_kbps: output_info.config.get_expected_bitrate_kbps(),
+                    fec_config: output_info.config.get_fec_config(),
                 });
             }
 
@@ -1001,6 +1013,8 @@ pub async fn list_outputs(_state: web::Data<AppState>) -> ActixResult<impl Respo
                 connected_at,
                 peer_address,
                 error_message,
+                expected_bitrate_kbps,
+                fec_config,
             } => {
                 response.push(OutputListResponse {
                     id,
@@ -1015,6 +1029,8 @@ pub async fn list_outputs(_state: web::Data<AppState>) -> ActixResult<impl Respo
                     peer_address,
                     error_message,
                     config: None, // We'll skip DB lookup for performance
+                    expected_bitrate_kbps,
+                    fec_config,
                 });
             }
             OutputSnapshotData::Stopped {
@@ -1064,6 +1080,8 @@ pub async fn list_outputs(_state: web::Data<AppState>) -> ActixResult<impl Respo
                     peer_address: None,
                     error_message: None,
                     config: config_json,
+                    expected_bitrate_kbps: config.get_expected_bitrate_kbps(),
+                    fec_config: config.get_fec_config(),
                 });
             }
         }
@@ -1086,6 +1104,8 @@ enum OutputSnapshotData {
         connected_at: Option<SystemTime>,
         peer_address: Option<String>,
         error_message: Option<String>,
+        expected_bitrate_kbps: Option<u32>,
+        fec_config: Option<FecConfig>,
     },
     Stopped {
         id: i64,
@@ -1135,6 +1155,8 @@ pub async fn get_output(
                 uptime_seconds: calculate_connection_uptime(&output_info.status, output_info.connected_at),
                 peer_address: output_info.peer_address.clone(),
                 error_message: output_info.error_message.clone(),
+                expected_bitrate_kbps: output_info.config.get_expected_bitrate_kbps(),
+                fec_config: output_info.config.get_fec_config(),
             };
 
             return Ok(HttpResponse::Ok().json(response));
@@ -1185,6 +1207,8 @@ pub async fn get_input_outputs(
                 uptime_seconds: calculate_connection_uptime(&output_info.status, output_info.connected_at),
                 peer_address: output_info.peer_address.clone(),
                 error_message: output_info.error_message.clone(),
+                expected_bitrate_kbps: output_info.config.get_expected_bitrate_kbps(),
+                fec_config: output_info.config.get_fec_config(),
             });
         }
 
@@ -1233,6 +1257,8 @@ pub async fn get_input_outputs(
                 uptime_seconds: None,
                 peer_address: None,
                 error_message: None,
+                expected_bitrate_kbps: output_config.get_expected_bitrate_kbps(),
+                fec_config: output_config.get_fec_config(),
             });
         }
 
@@ -1568,6 +1594,8 @@ pub async fn get_status(_state: web::Data<AppState>) -> ActixResult<impl Respond
                 peer_address: output_info.peer_address.clone(),
                 bitrate_bps,
                 error_message: output_info.error_message.clone(),
+                expected_bitrate_kbps: output_info.config.get_expected_bitrate_kbps(),
+                fec_config: output_info.config.get_fec_config(),
             });
         }
 
@@ -1616,6 +1644,8 @@ pub async fn get_status(_state: web::Data<AppState>) -> ActixResult<impl Respond
                 peer_address: None,
                 bitrate_bps: None, // No bitrate for stopped outputs
                 error_message: None,
+                expected_bitrate_kbps: output_config.get_expected_bitrate_kbps(),
+                fec_config: output_config.get_fec_config(),
             });
         }
 
@@ -1642,6 +1672,8 @@ pub async fn get_status(_state: web::Data<AppState>) -> ActixResult<impl Respond
             source_address: input_info.source_address.clone(),
             bitrate_bps,
             error_message: input_info.error_message.clone(),
+            expected_bitrate_kbps: input_info.config.get_expected_bitrate_kbps(),
+            fec_config: input_info.config.get_fec_config(),
         });
     }
 
